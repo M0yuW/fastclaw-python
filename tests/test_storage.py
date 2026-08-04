@@ -86,6 +86,8 @@ async def test_sqlite_defaults_and_repository_round_trip(tmp_path: Path) -> None
                 ConfigRecord(
                     id="config-1",
                     kind="provider",
+                    scope="agent",
+                    scope_id="agent-1",
                     user_id="user-1",
                     agent_id="agent-1",
                     name="primary",
