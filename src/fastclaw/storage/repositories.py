@@ -191,13 +191,18 @@ class SQLAlchemyStore:
     async def list_configs(
         self, *, kind: str, user_id: str, agent_id: str
     ) -> Sequence[ConfigRecord]:
+        if agent_id:
+            scope_filter = (ConfigModel.scope == "agent", ConfigModel.scope_id == agent_id)
+        elif user_id:
+            scope_filter = (ConfigModel.scope == "user", ConfigModel.scope_id == user_id)
+        else:
+            scope_filter = (ConfigModel.scope == "system", ConfigModel.scope_id == "")
         models = (
             await self.session.scalars(
                 select(ConfigModel)
                 .where(
                     ConfigModel.kind == kind,
-                    ConfigModel.user_id == user_id,
-                    ConfigModel.agent_id == agent_id,
+                    *scope_filter,
                 )
                 .order_by(ConfigModel.name)
             )
@@ -268,10 +273,13 @@ class SQLAlchemyStore:
         return ConfigRecord(
             id=model.id,
             kind=model.kind,
+            scope=model.scope,
+            scope_id=model.scope_id,
             user_id=model.user_id,
             agent_id=model.agent_id,
             name=model.name,
             enabled=model.enabled,
+            credential_key=model.credential_key,
             data=model.data,
             created_at=model.created_at,
             updated_at=model.updated_at,

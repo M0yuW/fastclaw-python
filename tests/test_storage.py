@@ -38,6 +38,9 @@ async def test_sqlite_defaults_and_repository_round_trip(tmp_path: Path) -> None
 
     try:
         async with database.session() as session:
+            assert await session.scalar(text("SELECT version_num FROM alembic_version")) == (
+                "20260805_01"
+            )
             assert await session.scalar(text("PRAGMA journal_mode")) == "wal"
             assert await session.scalar(text("PRAGMA foreign_keys")) == 1
             assert await session.scalar(text("PRAGMA busy_timeout")) == 5000
@@ -86,6 +89,8 @@ async def test_sqlite_defaults_and_repository_round_trip(tmp_path: Path) -> None
                 ConfigRecord(
                     id="config-1",
                     kind="provider",
+                    scope="agent",
+                    scope_id="agent-1",
                     user_id="user-1",
                     agent_id="agent-1",
                     name="primary",

@@ -116,14 +116,17 @@ class AgentFileModel(Base):
 
 class ConfigModel(Base):
     __tablename__ = "configs"
-    __table_args__ = (UniqueConstraint("kind", "user_id", "agent_id", "name"),)
+    __table_args__ = (UniqueConstraint("kind", "scope", "scope_id", "name"),)
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
     kind: Mapped[str] = mapped_column(String, index=True)
+    scope: Mapped[str] = mapped_column(String, default="system", index=True)
+    scope_id: Mapped[str] = mapped_column(String, default="", index=True)
     user_id: Mapped[str] = mapped_column(String, default="", index=True)
     agent_id: Mapped[str] = mapped_column(String, default="", index=True)
     name: Mapped[str] = mapped_column(String)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    credential_key: Mapped[str] = mapped_column(String, default="", index=True)
     data: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))

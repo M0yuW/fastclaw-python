@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 import anyio
 import httpx
 import pytest
 from pydantic import ValidationError
 
-from fastclaw.agent import AgentEventType, AgentRunner, AgentRunRequest
+from fastclaw.agent import (
+    AgentEventType,
+    AgentRunner,
+    AgentRunRequest,
+    DatabaseSessionPersistence,
+)
 from fastclaw.execution import ExecutionContext
+from fastclaw.migration import import_go_database
 from fastclaw.providers import (
     ChatRequest,
     ChatResponse,
@@ -19,7 +26,7 @@ from fastclaw.providers import (
     ToolDefinition,
     ToolFunction,
 )
-from fastclaw.storage import SessionRecord
+from fastclaw.storage import Database, SessionRecord
 from fastclaw.tools import ToolRegistry, ToolResult
 
 
@@ -145,7 +152,7 @@ async def test_react_loop_calls_provider_once_per_round_and_persists_final_histo
         AgentEventType.DONE,
     ]
     assert events[0].tool_call is not None
-    assert events[0].tool_call.id == "tool-live-0-0"
+    assert events[0].tool_call.id == "tool-call-0"
     assert events[1].tool_result == "user-1:hello"
     assert len(persistence.saved) == 1
     saved = persistence.saved[0]
@@ -248,3 +255,35 @@ async def test_tool_timeout_is_visible_and_does_not_hang_the_turn() -> None:
     timeout_event = next(event for event in events if event.type is AgentEventType.TOOL_RESULT)
     assert timeout_event.is_error
     assert "timed out" in timeout_event.tool_result
+
+
+@pytest.mark.asyncio
+async def test_locked_go_session_can_continue_and_preserve_raw_thinking(tmp_path: Path) -> None:
+    fixture = Path(__file__).parent / "fixtures" / "go792" / "fastclaw-go.db"
+    source = tmp_path / "go.db"
+    source.write_bytes(fixture.read_bytes())
+    target_url = f"sqlite+aiosqlite:///{tmp_path / 'python.db'}"
+    await import_go_database(source=source, target_url=target_url)
+    database = Database(target_url)
+    provider = ScriptedProvider([final_round()])
+    runner = AgentRunner(provider, ToolRegistry(), DatabaseSessionPersistence(database))
+    context = ExecutionContext(
+        user_id="u_go_fixture",
+        agent_id="agt_go_fixture",
+        session_id="web_go_fixture",
+        root_execution_id="run-go-fixture",
+        call_path=("agt_go_fixture",),
+    )
+    try:
+        response = await runner.chat(
+            AgentRunRequest(model="fixture", message="continue"),
+            context,
+        )
+    finally:
+        await database.close()
+
+    assert response.content == "finished"
+    imported_assistant = provider.requests[0].messages[1]
+    assert imported_assistant.raw_assistant is not None
+    raw_content = cast(list[dict[str, Any]], imported_assistant.raw_assistant["content"])
+    assert raw_content[0]["signature"] == "fixture-signature"
