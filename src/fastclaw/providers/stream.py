@@ -64,7 +64,7 @@ class ResponseAccumulator:
     def response(self) -> ChatResponse:
         if not self._done:
             raise ProviderStreamError("provider stream has not completed")
-        tool_calls = tuple(
+        accumulated_calls = tuple(
             ToolCall(
                 id=str(call["id"]),
                 function=FunctionCall(name=str(call["name"]), arguments="".join(call["arguments"])),
@@ -74,12 +74,18 @@ class ResponseAccumulator:
         content = "".join(self._content)
         thinking = "".join(self._thinking)
         signature = "".join(self._thinking_signature)
-        raw = self._raw_assistant or self._build_raw_assistant(
-            content=content,
-            thinking=thinking,
-            signature=signature,
-            tool_calls=tool_calls,
-        )
+        if self._raw_assistant is None:
+            tool_calls = self._normalize_local_tool_calls(accumulated_calls)
+            raw = self._build_raw_assistant(
+                content=content,
+                thinking=thinking,
+                signature=signature,
+                tool_calls=tool_calls,
+            )
+        else:
+            tool_calls = accumulated_calls
+            self._validate_authoritative_raw(self._raw_assistant, tool_calls)
+            raw = self._raw_assistant
         return ChatResponse(
             content=content,
             tool_calls=tool_calls,
@@ -89,6 +95,49 @@ class ResponseAccumulator:
             usage=self._usage,
             finish_reason=self._finish_reason,
         )
+
+    @staticmethod
+    def _normalize_local_tool_calls(tool_calls: tuple[ToolCall, ...]) -> tuple[ToolCall, ...]:
+        normalized: list[ToolCall] = []
+        used: set[str] = set()
+        for index, call in enumerate(tool_calls):
+            call_id = call.id
+            if not call_id or call_id in used:
+                call_id = f"tool-call-{index}"
+                suffix = 1
+                while call_id in used:
+                    call_id = f"tool-call-{index}-{suffix}"
+                    suffix += 1
+                call = call.model_copy(update={"id": call_id})
+            used.add(call_id)
+            normalized.append(call)
+        return tuple(normalized)
+
+    @staticmethod
+    def _validate_authoritative_raw(raw: dict[str, Any], tool_calls: tuple[ToolCall, ...]) -> None:
+        raw_ids: list[str] = []
+        raw_tool_calls = raw.get("tool_calls")
+        if isinstance(raw_tool_calls, list):
+            raw_ids.extend(
+                str(call.get("id") or "") for call in raw_tool_calls if isinstance(call, dict)
+            )
+        raw_content = raw.get("content")
+        if isinstance(raw_content, list):
+            raw_ids.extend(
+                str(block.get("id") or "")
+                for block in raw_content
+                if isinstance(block, dict) and block.get("type") == "tool_use"
+            )
+
+        structured_ids = [call.id for call in tool_calls]
+        if any(not call_id for call_id in (*raw_ids, *structured_ids)):
+            raise ProviderStreamError("provider raw assistant contains an empty tool call id")
+        if len(set(raw_ids)) != len(raw_ids) or len(set(structured_ids)) != len(structured_ids):
+            raise ProviderStreamError("provider raw assistant contains duplicate tool call ids")
+        if raw_ids != structured_ids:
+            raise ProviderStreamError(
+                "provider raw assistant tool call ids do not match accumulated tool calls"
+            )
 
     @staticmethod
     def _build_raw_assistant(
