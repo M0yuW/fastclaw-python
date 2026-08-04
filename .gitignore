@@ -9,3 +9,6 @@ build/
 dist/
 *.egg-info/
 *.py[cod]
+*.db
+*.db-shm
+*.db-wal

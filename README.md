@@ -12,6 +12,8 @@ The initial runtime provides:
 - a shared HTTPX async client for providers;
 - FastAPI `/healthz` and `/readyz` endpoints;
 - Pydantic v2 response models; and
+- SQLAlchemy 2 async repositories with Alembic migrations;
+- isolated, read-only Go SQLite import; and
 - pytest, Ruff, mypy, and GitHub Actions checks.
 
 ## Development
@@ -82,6 +84,34 @@ app = create_app(runtime)
 
 Providers start in registration order and stop in reverse order. If one fails
 during startup, previously started providers are rolled back automatically.
+
+## Database and Go import
+
+FastClaw Python uses its own database. Never point it at the Go runtime's
+SQLite file. Create or upgrade a Python database with Alembic:
+
+```bash
+FASTCLAW_DATABASE_URL=sqlite+aiosqlite:////Users/you/.fastclaw-python/fastclaw.db \
+  alembic -c alembic.ini upgrade head
+```
+
+Preview a one-way import without writing a target:
+
+```bash
+fastclaw migrate import-go \
+  --source ~/.fastclaw/fastclaw.db \
+  --target sqlite+aiosqlite:////Users/you/.fastclaw-python/fastclaw.db \
+  --dry-run
+```
+
+Remove `--dry-run` after checking the redacted report. The source is opened
+read-only and verified by SHA-256 before and after import. Repeating an import
+of the same source snapshot is a no-op. Go web sessions and plaintext secrets
+are deliberately not imported, so users must log in and configure credentials
+again.
+
+See [the phase 2 migration record](docs/migration/phase-2-data-identity.md) for
+the schema mapping, validation commands, and rollback boundary.
 
 ## License
 
