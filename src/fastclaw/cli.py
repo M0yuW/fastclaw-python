@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 
@@ -23,8 +23,19 @@ def import_go(
     dry_run: Annotated[
         bool, typer.Option(help="Inspect without creating or updating the target.")
     ] = False,
+    orphan_policy: Annotated[
+        Literal["reject", "quarantine"],
+        typer.Option(help="Reject orphan rows or quarantine their identifiers."),
+    ] = "reject",
 ) -> None:
     """Import a Go FastClaw SQLite database into an independent target."""
 
-    report = asyncio.run(import_go_database(source=source, target_url=target, dry_run=dry_run))
+    report = asyncio.run(
+        import_go_database(
+            source=source,
+            target_url=target,
+            dry_run=dry_run,
+            orphan_policy=orphan_policy,
+        )
+    )
     typer.echo(json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True))

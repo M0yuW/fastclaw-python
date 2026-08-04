@@ -32,3 +32,10 @@ jobs:
         run: mypy
       - name: Tests
         run: pytest
+      - name: Alembic schema drift
+        if: matrix.python-version == '3.12'
+        env:
+          FASTCLAW_DATABASE_URL: sqlite+aiosqlite:///${{ runner.temp }}/alembic-check.db
+        run: |
+          alembic upgrade head
+          alembic check

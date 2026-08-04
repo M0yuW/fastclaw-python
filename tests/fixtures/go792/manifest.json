@@ -1,0 +1,10 @@
+{
+  "agentId": "agt_go_fixture",
+  "apiKeyId": "k_go_fixture",
+  "channelConfigId": "cfg_go_channel",
+  "fixtureAPIKey": "fc_fixture_cross_language_token",
+  "fixturePassword": "fixture-password",
+  "referenceCommit": "792417b86b5c12af1b99364865217a74f4d52f38",
+  "sessionKey": "web_go_fixture",
+  "userId": "u_go_fixture"
+}

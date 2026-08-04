@@ -54,6 +54,10 @@ Repository = "https://github.com/M0yuW/fastclaw-python"
 [tool.hatch.build.targets.wheel]
 packages = ["src/fastclaw"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"alembic.ini" = "fastclaw/alembic.ini"
+"migrations" = "fastclaw/migrations"
+
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
 asyncio_mode = "auto"

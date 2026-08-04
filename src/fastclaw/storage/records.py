@@ -82,10 +82,13 @@ class AgentFileRecord(Record):
 class ConfigRecord(Record):
     id: str
     kind: str
+    scope: str = "system"
+    scope_id: str = ""
     user_id: str = ""
     agent_id: str = ""
     name: str
     enabled: bool = True
+    credential_key: str = ""
     data: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)

@@ -2,9 +2,9 @@
 
 ## Contract
 
-This phase introduces SQLAlchemy 2 async repositories and an Alembic baseline
-for users, agents, sessions, configurations, API-key ACLs, agent files, and cron
-jobs. SQLite connections enable foreign keys, WAL, and a 5-second busy timeout.
+This phase introduces SQLAlchemy 2 async repositories for users, agents,
+sessions, configurations, API-key ACLs, agent files, and cron jobs. SQLite
+connections enable foreign keys, WAL, and a 5-second busy timeout.
 The model is PostgreSQL-ready through the same repository interfaces and the
 `asyncpg` driver.
 
@@ -15,19 +15,22 @@ explicitly read-only.
 
 ## Import boundary
 
-`fastclaw migrate import-go` opens the Go SQLite database with `mode=ro` and
-imports into a different target URL. It records the source SHA-256 and refuses
-to import into a populated target without a matching import record. A repeated
-import of the same snapshot returns the stored report without duplicating rows.
+Stop the Go runtime before running `fastclaw migrate import-go`. The importer
+copies the database and any `-wal`/`-shm` sidecars into a temporary directory,
+verifies that source manifest did not change, and uses SQLite's backup API on
+the staged copy. It never opens the source with `immutable=1`, never writes the
+source, and imports only into a different target URL.
 
 The report includes source and target row counts, foreign-key results, and
 SHA-256 values for agent files. It never includes credential values. Existing
-web sessions are counted but skipped, and secret-looking configuration values
-are blanked so credentials can be rotated and entered again.
+web sessions are counted but skipped. Configuration is migrated through a
+kind/namespace-specific allowlist; unknown fields are cleared rather than
+guessed. Migrated channels have tokens and `credential_key` cleared, and the
+report lists their IDs under `channels_require_reconfiguration`.
 
-Both the current `user_id`/`agent_id` configuration ownership schema and the
-legacy `scope`/`scope_id` representation are accepted. Current routing,
-chatter, public-agent, and API-key type fields are preserved.
+The target preserves Go's `(kind, scope, scope_id, name)` identity. Legacy
+`user_id`/`agent_id` rows are accepted only as an inbound compatibility shape.
+Current routing, chatter, public-agent, and API-key type fields are preserved.
 
 ## Validation
 
@@ -36,8 +39,6 @@ ruff check .
 ruff format --check .
 mypy
 pytest
-FASTCLAW_DATABASE_URL=sqlite+aiosqlite:////tmp/fastclaw-python.db \
-  alembic -c alembic.ini upgrade head
 ```
 
 Automated tests verify SQLite pragmas, repository transactions, bcrypt and API
