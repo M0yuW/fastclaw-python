@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
+import anyio
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -13,8 +17,6 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-
-from fastclaw.storage.models import Base
 
 
 class Database:
@@ -40,8 +42,22 @@ class Database:
                 cursor.close()
 
     async def create_schema(self) -> None:
-        async with self.engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
+        await anyio.to_thread.run_sync(self._upgrade_schema)
+
+    def _upgrade_schema(self) -> None:
+        checkout_root = Path(__file__).resolve().parents[3]
+        checkout_config = checkout_root / "alembic.ini"
+        if checkout_config.is_file():
+            configuration_path = checkout_config
+            script_location = checkout_root / "migrations"
+        else:
+            package_root = Path(__file__).resolve().parents[1]
+            configuration_path = package_root / "alembic.ini"
+            script_location = package_root / "migrations"
+        configuration = Config(configuration_path)
+        configuration.set_main_option("script_location", str(script_location))
+        configuration.set_main_option("sqlalchemy.url", self.url)
+        command.upgrade(configuration, "head")
 
     @asynccontextmanager
     async def session(self) -> AsyncIterator[AsyncSession]:
