@@ -1,0 +1,70 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fastclaw"
+version = "0.1.0"
+description = "A Python runtime for FastClaw"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [
+  { name = "FastClaw contributors" },
+]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Framework :: FastAPI",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Typing :: Typed",
+]
+dependencies = [
+  "fastapi>=0.116,<1.0",
+  "httpx>=0.28,<1.0",
+  "pydantic>=2.11,<3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.17,<2.0",
+  "pytest>=8.4,<10.0",
+  "pytest-asyncio>=1.1,<2.0",
+  "ruff>=0.12,<1.0",
+]
+server = [
+  "uvicorn>=0.35,<1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/M0yuW/fastclaw-python"
+Issues = "https://github.com/M0yuW/fastclaw-python/issues"
+Repository = "https://github.com/M0yuW/fastclaw-python"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fastclaw"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["ASYNC", "B", "E", "F", "I", "RUF", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ASYNC230"]
+
+[tool.mypy]
+python_version = "3.12"
+plugins = ["pydantic.mypy"]
+strict = true
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = "uvicorn"
+ignore_missing_imports = true
