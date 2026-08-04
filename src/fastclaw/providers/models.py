@@ -94,11 +94,17 @@ class Usage(ProviderModel):
 class ChatMessage(ProviderModel):
     role: MessageRole
     content: str | tuple[ContentPart, ...] | None = None
+    content_parts: tuple[ContentPart, ...] = ()
     tool_calls: tuple[ToolCall, ...] = ()
     tool_call_id: str | None = None
     name: str | None = None
     thinking: str | None = None
     thinking_signature: str | None = None
+    timestamp: int = 0
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+    origin: str = ""
+    provider: str = ""
+    model: str = ""
     raw_assistant: dict[str, JsonValue] | None = Field(default=None, alias="_raw")
 
 

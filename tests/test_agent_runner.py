@@ -1,0 +1,250 @@
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from typing import Any
+
+import anyio
+import httpx
+import pytest
+from pydantic import ValidationError
+
+from fastclaw.agent import AgentEventType, AgentRunner, AgentRunRequest
+from fastclaw.execution import ExecutionContext
+from fastclaw.providers import (
+    ChatRequest,
+    ChatResponse,
+    ProviderEvent,
+    ProviderEventType,
+    ProviderStream,
+    ToolDefinition,
+    ToolFunction,
+)
+from fastclaw.storage import SessionRecord
+from fastclaw.tools import ToolRegistry, ToolResult
+
+
+class StubPersistence:
+    def __init__(self, stored: SessionRecord | None = None) -> None:
+        self.stored = stored
+        self.saved: list[SessionRecord] = []
+
+    async def load(self, user_id: str, agent_id: str, session_id: str) -> SessionRecord | None:
+        del user_id, agent_id, session_id
+        return self.stored
+
+    async def save(self, session: SessionRecord) -> None:
+        self.saved.append(session)
+
+
+class EchoTool:
+    definition = ToolDefinition(
+        function=ToolFunction(
+            name="echo",
+            parameters={
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+        )
+    )
+
+    async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
+        return ToolResult(content=f"{context.user_id}:{arguments['text']}")
+
+
+def run_context() -> ExecutionContext:
+    return ExecutionContext(
+        user_id="user-1",
+        agent_id="agent-1",
+        session_id="session-1",
+        root_execution_id="run-1",
+        call_path=("agent-1",),
+    )
+
+
+class ScriptedProvider:
+    name = "scripted"
+
+    def __init__(self, scripts: list[tuple[ProviderEvent, ...]]) -> None:
+        self.scripts = scripts
+        self.requests: list[ChatRequest] = []
+
+    async def start(self, client: httpx.AsyncClient) -> None:
+        del client
+
+    async def stop(self) -> None:
+        pass
+
+    async def ready(self) -> bool:
+        return True
+
+    async def chat(self, request: ChatRequest) -> ChatResponse:
+        stream = self.stream(request)
+        async for _ in stream:
+            pass
+        return stream.result()
+
+    def stream(self, request: ChatRequest) -> ProviderStream:
+        self.requests.append(request)
+        script = self.scripts[len(self.requests) - 1]
+
+        async def source() -> AsyncIterator[ProviderEvent]:
+            for event in script:
+                yield event
+
+        return ProviderStream(source())
+
+
+def tool_round() -> tuple[ProviderEvent, ...]:
+    return (
+        ProviderEvent(
+            type=ProviderEventType.TOOL_CALL_DELTA,
+            tool_index=0,
+            tool_name="echo",
+            tool_arguments='{"text":"hello"}',
+        ),
+        ProviderEvent(type=ProviderEventType.DONE, finish_reason="tool_calls"),
+    )
+
+
+def final_round() -> tuple[ProviderEvent, ...]:
+    return (
+        ProviderEvent(type=ProviderEventType.CONTENT_DELTA, content="finished"),
+        ProviderEvent(type=ProviderEventType.DONE, finish_reason="stop"),
+    )
+
+
+def test_chat_request_cannot_carry_tenant_identity() -> None:
+    with pytest.raises(ValidationError, match="userId"):
+        AgentRunRequest.model_validate({"model": "fixture", "message": "hello", "userId": "forged"})
+
+
+@pytest.mark.asyncio
+async def test_react_loop_calls_provider_once_per_round_and_persists_final_history() -> None:
+    provider = ScriptedProvider([tool_round(), final_round()])
+    persistence = StubPersistence()
+    runner = AgentRunner(provider, ToolRegistry([EchoTool()]), persistence)
+
+    stream = runner.stream(
+        AgentRunRequest(
+            model="fixture",
+            message="start",
+        ),
+        run_context(),
+    )
+    events = [event async for event in stream]
+
+    assert stream.result().content == "finished"
+    assert len(provider.requests) == 2
+    assert [event.seq for event in events] == list(range(len(events)))
+    assert [event.type for event in events] == [
+        AgentEventType.TOOL_CALL,
+        AgentEventType.TOOL_RESULT,
+        AgentEventType.CONTENT_DELTA,
+        AgentEventType.CONTENT,
+        AgentEventType.DONE,
+    ]
+    assert events[0].tool_call is not None
+    assert events[0].tool_call.id == "tool-live-0-0"
+    assert events[1].tool_result == "user-1:hello"
+    assert len(persistence.saved) == 1
+    saved = persistence.saved[0]
+    assert [message["role"] for message in saved.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert saved.messages[1]["_raw"]["tool_calls"][0]["function"]["name"] == "echo"
+
+
+class BlockingProvider(ScriptedProvider):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.closed = False
+
+    def stream(self, request: ChatRequest) -> ProviderStream:
+        self.requests.append(request)
+
+        async def source() -> AsyncIterator[ProviderEvent]:
+            try:
+                yield ProviderEvent(type=ProviderEventType.CONTENT_DELTA, content="partial")
+                await anyio.sleep_forever()
+            finally:
+                self.closed = True
+
+        return ProviderStream(source())
+
+
+@pytest.mark.asyncio
+async def test_stop_closes_provider_stream_and_does_not_persist_partial_assistant() -> None:
+    provider = BlockingProvider()
+    persistence = StubPersistence()
+    stream = AgentRunner(provider, ToolRegistry(), persistence).stream(
+        AgentRunRequest(
+            model="fixture",
+            message="start",
+        ),
+        run_context(),
+    )
+
+    assert (await anext(stream)).content == "partial"
+    await stream.aclose()
+
+    assert provider.closed
+    assert persistence.saved == []
+
+
+class FailingTool(EchoTool):
+    async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
+        del arguments, context
+        raise OSError("fixture failure")
+
+
+class SlowTool(EchoTool):
+    async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
+        del arguments, context
+        await anyio.sleep_forever()
+        raise AssertionError("sleep_forever returned")
+
+
+@pytest.mark.asyncio
+async def test_tool_exceptions_are_visible_to_model_and_event_stream() -> None:
+    provider = ScriptedProvider([tool_round(), final_round()])
+    persistence = StubPersistence()
+    runner = AgentRunner(provider, ToolRegistry([FailingTool()]), persistence)
+
+    stream = runner.stream(
+        AgentRunRequest(
+            model="fixture",
+            message="start",
+        ),
+        run_context(),
+    )
+    events = [event async for event in stream]
+
+    tool_result = next(event for event in events if event.type is AgentEventType.TOOL_RESULT)
+    assert tool_result.is_error
+    assert "OSError: fixture failure" in tool_result.tool_result
+    second_request_tool = provider.requests[1].messages[-1]
+    assert "OSError: fixture failure" in str(second_request_tool.content)
+
+
+@pytest.mark.asyncio
+async def test_tool_timeout_is_visible_and_does_not_hang_the_turn() -> None:
+    provider = ScriptedProvider([tool_round(), final_round()])
+    runner = AgentRunner(provider, ToolRegistry([SlowTool()]), StubPersistence())
+
+    stream = runner.stream(
+        AgentRunRequest(
+            model="fixture",
+            message="start",
+            tool_timeout=0.01,
+        ),
+        run_context(),
+    )
+    events = [event async for event in stream]
+
+    timeout_event = next(event for event in events if event.type is AgentEventType.TOOL_RESULT)
+    assert timeout_event.is_error
+    assert "timed out" in timeout_event.tool_result

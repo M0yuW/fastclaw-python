@@ -13,7 +13,8 @@ The initial runtime provides:
 - FastAPI `/healthz` and `/readyz` endpoints;
 - Pydantic v2 response models; and
 - SQLAlchemy 2 async repositories with Alembic migrations;
-- isolated, read-only Go SQLite import; and
+- isolated, read-only Go SQLite import;
+- a cancellable single-agent ReAct loop with policy-scoped tools and SSE v2 events; and
 - pytest, Ruff, mypy, and GitHub Actions checks.
 
 ## Development
@@ -112,6 +113,20 @@ again.
 
 See [the phase 2 migration record](docs/migration/phase-2-data-identity.md) for
 the schema mapping, validation commands, and rollback boundary.
+
+## Single-agent runtime
+
+`fastclaw.agent.AgentRunner` normalizes imported session history, streams one
+provider request per round, executes registered tools under a trusted execution
+context, and commits the final history only after a complete assistant reply.
+Closing its `AgentStream` immediately closes the active provider stream and
+does not persist partial assistant output.
+
+Built-in tools provide workspace-confined file reads, allow-listed execution
+without a shell, and bounded HTTP(S) fetches. Tool policy denials, malformed
+arguments, timeouts, and exceptions are returned as visible tool results.
+
+See [the phase 3 migration record](docs/migration/phase-3-single-agent.md).
 
 ## License
 

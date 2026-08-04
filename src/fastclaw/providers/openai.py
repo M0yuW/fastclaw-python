@@ -164,8 +164,11 @@ class OpenAIProvider:
         if message.role is MessageRole.ASSISTANT and message.raw_assistant is not None:
             return dict(message.raw_assistant)
         payload: dict[str, Any] = {"role": message.role.value}
-        if isinstance(message.content, tuple):
-            payload["content"] = [part.model_dump(exclude_none=True) for part in message.content]
+        multipart = message.content_parts or (
+            message.content if isinstance(message.content, tuple) else ()
+        )
+        if multipart:
+            payload["content"] = [part.model_dump(exclude_none=True) for part in multipart]
         elif message.content is not None:
             payload["content"] = message.content
         if message.tool_calls:
