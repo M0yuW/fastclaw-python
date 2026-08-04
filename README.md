@@ -44,10 +44,14 @@ Then inspect `http://127.0.0.1:8000/healthz` and
 
 ## Implementing a provider
 
-A provider has a stable name and three asynchronous lifecycle methods:
+A provider has a stable name, asynchronous lifecycle methods, and complete and
+streaming chat operations. Provider requests and results use Pydantic models so
+OpenAI-compatible and Anthropic adapters preserve the same runtime contract:
 
 ```python
 import httpx
+
+from fastclaw.providers import ChatRequest, ChatResponse, ProviderStream
 
 
 class ExampleProvider:
@@ -58,6 +62,10 @@ class ExampleProvider:
 
     async def ready(self) -> bool:
         return True
+
+    async def chat(self, request: ChatRequest) -> ChatResponse: ...
+
+    def stream(self, request: ChatRequest) -> ProviderStream: ...
 
     async def stop(self) -> None:
         pass

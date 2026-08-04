@@ -5,6 +5,8 @@ import httpx
 from fastapi import FastAPI
 
 from fastclaw.app import create_app
+from fastclaw.providers import ChatRequest, ChatResponse, ProviderEvent, ProviderEventType
+from fastclaw.providers.stream import ProviderStream
 from fastclaw.runtime import Runtime, RuntimeState
 
 
@@ -23,6 +25,15 @@ class ProbeProvider:
 
     async def ready(self) -> bool:
         return self.started and self.ready_value
+
+    async def chat(self, request: ChatRequest) -> ChatResponse:
+        return ChatResponse()
+
+    def stream(self, request: ChatRequest) -> ProviderStream:
+        async def events() -> AsyncIterator[ProviderEvent]:
+            yield ProviderEvent(type=ProviderEventType.DONE)
+
+        return ProviderStream(events())
 
 
 @asynccontextmanager

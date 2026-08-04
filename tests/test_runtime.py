@@ -1,8 +1,11 @@
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
 import httpx
 import pytest
 
+from fastclaw.providers import ChatRequest, ChatResponse, ProviderEvent, ProviderEventType
+from fastclaw.providers.stream import ProviderStream
 from fastclaw.runtime import Runtime, RuntimeStartupError, RuntimeState, RuntimeStateError
 
 
@@ -25,6 +28,15 @@ class FakeProvider:
     async def ready(self) -> bool:
         self.events.append(f"ready:{self.name}")
         return self.ready_value
+
+    async def chat(self, request: ChatRequest) -> ChatResponse:
+        return ChatResponse()
+
+    def stream(self, request: ChatRequest) -> ProviderStream:
+        async def events() -> AsyncIterator[ProviderEvent]:
+            yield ProviderEvent(type=ProviderEventType.DONE)
+
+        return ProviderStream(events())
 
 
 def assert_runtime_state(runtime: Runtime, expected: RuntimeState) -> None:
