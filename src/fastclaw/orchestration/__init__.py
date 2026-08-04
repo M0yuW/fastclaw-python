@@ -3,6 +3,9 @@
 from fastclaw.orchestration.bus import (
     CrossTenantError,
     DelegationCycleError,
+    DelegationError,
+    DelegationErrorCode,
+    DelegationOutcome,
     DelegationRequest,
     InProcessMessageBus,
     MessageBus,
@@ -16,6 +19,7 @@ from fastclaw.orchestration.queue import (
     QueueShutdownError,
     TaskQueue,
     TaskResult,
+    WaitTicket,
 )
 from fastclaw.orchestration.tool import SpawnSubagentTool
 
@@ -24,6 +28,9 @@ __all__ = [
     "BackpressureError",
     "CrossTenantError",
     "DelegationCycleError",
+    "DelegationError",
+    "DelegationErrorCode",
+    "DelegationOutcome",
     "DelegationRequest",
     "InProcessMessageBus",
     "MessageBus",
@@ -34,4 +41,5 @@ __all__ = [
     "TaskQueue",
     "TaskResult",
     "UnknownAgentError",
+    "WaitTicket",
 ]

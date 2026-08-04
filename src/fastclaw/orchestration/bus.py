@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from typing import Protocol
 from uuid import uuid4
 
 from fastclaw.execution import ExecutionContext
-from fastclaw.orchestration.queue import AsyncTaskQueue, TaskQueue, TaskResult
+from fastclaw.orchestration.queue import (
+    AsyncTaskQueue,
+    BackpressureError,
+    QueueShutdownError,
+    TaskQueue,
+    TaskResult,
+    WaitTicket,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class MessageBusError(RuntimeError):
@@ -28,6 +39,23 @@ class DelegationCycleError(MessageBusError):
     pass
 
 
+class DelegatedTaskError(MessageBusError):
+    def __init__(self, correlation_id: str) -> None:
+        self.correlation_id = correlation_id
+        super().__init__("delegated task failed")
+
+
+class DelegationErrorCode(StrEnum):
+    UNKNOWN_AGENT = "unknown_agent"
+    CROSS_TENANT = "cross_tenant"
+    CYCLE = "cycle"
+    BACKPRESSURE = "backpressure"
+    SHUTDOWN = "shutdown"
+    CANCELLED = "cancelled"
+    TIMEOUT = "timeout"
+    HANDLER_ERROR = "handler_error"
+
+
 AgentHandler = Callable[[str, ExecutionContext], Awaitable[str]]
 WaitNode = tuple[str, str]
 
@@ -38,6 +66,24 @@ class DelegationRequest:
     task: str
 
 
+@dataclass(frozen=True, slots=True)
+class DelegationError:
+    code: DelegationErrorCode
+    message: str
+    correlation_id: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class DelegationOutcome:
+    request: DelegationRequest
+    result: TaskResult | None = None
+    error: DelegationError | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return self.result is not None
+
+
 class MessageBus(Protocol):
     async def request(
         self, context: ExecutionContext, target_agent_id: str, task: str
@@ -45,8 +91,9 @@ class MessageBus(Protocol):
 
     async def batch(
         self, context: ExecutionContext, requests: Iterable[DelegationRequest]
-    ) -> tuple[TaskResult, ...]: ...
+    ) -> tuple[DelegationOutcome, ...]: ...
 
+    async def cancel_root(self, root_execution_id: str) -> None: ...
     async def shutdown(self) -> None: ...
 
 
@@ -94,34 +141,55 @@ class InProcessMessageBus:
         )
 
         async def run() -> TaskResult:
-            value = await handler(task, child_context)
+            try:
+                value = await handler(task, child_context)
+            except asyncio.CancelledError:
+                raise
+            except MessageBusError:
+                raise
+            except Exception as exc:
+                logger.exception("delegated task %s failed", correlation_id)
+                raise DelegatedTaskError(correlation_id) from exc
             return TaskResult(correlation_id=correlation_id, value=value)
 
+        ticket: WaitTicket | None = None
         try:
-            future = await self._queue.submit(
+            ticket = await self._queue.submit(
                 target=(context.user_id, target_agent_id),
-                dedup_key=(context.root_execution_id, target_agent_id, task),
+                dedup_key=(context.user_id, context.root_execution_id, target_agent_id, task),
                 root_execution_id=context.root_execution_id,
                 inherit_slot=bool(context.call_path),
                 handler=run,
             )
             try:
-                return await asyncio.shield(future)
+                return await ticket.result()
             except asyncio.CancelledError:
-                await self._queue.cancel_root(context.root_execution_id)
+                await ticket.release(cancel=True)
                 raise
         finally:
+            if ticket is not None:
+                await ticket.release()
             if source_node is not None:
                 await self._remove_wait(source_node, target_node)
 
     async def batch(
         self, context: ExecutionContext, requests: Iterable[DelegationRequest]
-    ) -> tuple[TaskResult, ...]:
-        return tuple(
-            await asyncio.gather(
-                *(self.request(context, item.agent_id, item.task) for item in requests)
-            )
+    ) -> tuple[DelegationOutcome, ...]:
+        items = tuple(requests)
+        results = await asyncio.gather(
+            *(self.request(context, item.agent_id, item.task) for item in items),
+            return_exceptions=True,
         )
+        outcomes: list[DelegationOutcome] = []
+        for item, result in zip(items, results, strict=True):
+            if isinstance(result, BaseException):
+                outcomes.append(DelegationOutcome(request=item, error=self._safe_error(result)))
+            else:
+                outcomes.append(DelegationOutcome(request=item, result=result))
+        return tuple(outcomes)
+
+    async def cancel_root(self, root_execution_id: str) -> None:
+        await self._queue.cancel_root(root_execution_id)
 
     async def shutdown(self) -> None:
         if self._closing:
@@ -130,6 +198,33 @@ class InProcessMessageBus:
         await self._queue.shutdown()
         async with self._wait_lock:
             self._wait_graph.clear()
+
+    @staticmethod
+    def _safe_error(error: BaseException) -> DelegationError:
+        if isinstance(error, UnknownAgentError):
+            return DelegationError(DelegationErrorCode.UNKNOWN_AGENT, "target agent is unavailable")
+        if isinstance(error, CrossTenantError):
+            return DelegationError(
+                DelegationErrorCode.CROSS_TENANT, "target agent is not accessible"
+            )
+        if isinstance(error, DelegationCycleError):
+            return DelegationError(DelegationErrorCode.CYCLE, "delegation cycle rejected")
+        if isinstance(error, BackpressureError):
+            return DelegationError(DelegationErrorCode.BACKPRESSURE, "delegation queue is full")
+        if isinstance(error, QueueShutdownError):
+            return DelegationError(
+                DelegationErrorCode.SHUTDOWN, "delegation service is shutting down"
+            )
+        if isinstance(error, asyncio.CancelledError):
+            return DelegationError(DelegationErrorCode.CANCELLED, "delegation was cancelled")
+        if isinstance(error, TimeoutError):
+            return DelegationError(DelegationErrorCode.TIMEOUT, "delegation timed out")
+        correlation_id = error.correlation_id if isinstance(error, DelegatedTaskError) else ""
+        return DelegationError(
+            DelegationErrorCode.HANDLER_ERROR,
+            "delegated task failed",
+            correlation_id=correlation_id,
+        )
 
     async def _add_wait(self, source: WaitNode, target: WaitNode) -> None:
         async with self._wait_lock:

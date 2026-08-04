@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_validator,
+    model_validator,
+)
 
 
 def _to_camel(value: str) -> str:
@@ -100,12 +109,36 @@ class ChatMessage(ProviderModel):
     name: str | None = None
     thinking: str | None = None
     thinking_signature: str | None = None
-    timestamp: int = 0
+    timestamp: datetime = Field(default_factory=lambda: datetime.fromtimestamp(0, UTC))
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
     origin: str = ""
     provider: str = ""
     model: str = ""
-    raw_assistant: dict[str, JsonValue] | None = Field(default=None, alias="_raw")
+    raw_assistant: dict[str, JsonValue] | None = Field(
+        default=None,
+        validation_alias=AliasChoices("_raw", "rawAssistant"),
+        serialization_alias="_raw",
+    )
+
+    @field_validator("timestamp", mode="before")
+    @classmethod
+    def normalize_timestamp(cls, value: object) -> object:
+        """Accept Go DB RFC3339 values and provider-wire Unix milliseconds."""
+
+        if isinstance(value, bool):
+            raise ValueError("timestamp must be RFC3339 or Unix milliseconds")
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value / 1000, UTC)
+        if isinstance(value, str):
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return value
+
+    @field_validator("timestamp")
+    @classmethod
+    def require_utc_timestamp(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("timestamp must include a timezone")
+        return value.astimezone(UTC)
 
 
 class ChatRequest(ProviderModel):

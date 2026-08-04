@@ -121,7 +121,8 @@ class AgentRunner:
             history.append(ChatMessage(role=MessageRole.USER, content=request.message))
             history = list(normalize_messages(tuple(history)))
             with use_execution(context):
-                for round_index in range(request.max_rounds):
+                for current_round in range(request.max_rounds):
+                    round_index = current_round
                     provider_stream = self._provider.stream(
                         ChatRequest(
                             messages=tuple(history),
@@ -140,7 +141,7 @@ class AgentRunner:
                     assistant = ChatMessage(
                         role=MessageRole.ASSISTANT,
                         content=response.content,
-                        tool_calls=self._normalize_live_calls(response.tool_calls, round_index),
+                        tool_calls=response.tool_calls,
                         thinking=response.thinking or None,
                         thinking_signature=response.thinking_signature or None,
                         raw_assistant=response.raw_assistant,
@@ -210,20 +211,6 @@ class AgentRunner:
         if stored is None:
             return []
         return [ChatMessage.model_validate(message) for message in stored.messages]
-
-    @staticmethod
-    def _normalize_live_calls(
-        calls: tuple[ToolCall, ...], round_index: int
-    ) -> tuple[ToolCall, ...]:
-        seen: set[str] = set()
-        normalized: list[ToolCall] = []
-        for index, call in enumerate(calls):
-            call_id = call.id
-            if not call_id or call_id in seen:
-                call_id = f"tool-live-{round_index}-{index}"
-            seen.add(call_id)
-            normalized.append(call.model_copy(update={"id": call_id}))
-        return tuple(normalized)
 
     @staticmethod
     def _parse_arguments(call: ToolCall) -> tuple[dict[str, Any], str]:

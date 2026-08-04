@@ -22,16 +22,23 @@ or tool-call history is committed.
 The normalizer gives empty or duplicate tool-call IDs deterministic IDs,
 removes orphan, late, and duplicate tool results, and inserts a structured
 failure result for every unanswered tool call. Current Go message fields such
-as `content_parts`, `_raw`, metadata, origin, provider, and model are accepted
-and preserved for replay.
+as `contentParts`, metadata, origin, provider, and model are accepted. Go
+`rawAssistant` is an inbound compatibility alias; Python persists the canonical
+`_raw` name for replay and never writes conversation data back to the Go store.
 
 ## Tool safety
 
 Tools run behind a registry and explicit allow policy. The first built-ins are:
 
 - `read_file`, confined to a configured workspace root with a size limit;
-- `exec`, using an executable allow-list, argument arrays, and no shell; and
-- `web_fetch`, restricted to HTTP(S) with a response size limit.
+- `exec`, using immutable absolute executable identities, a bounded output
+  stream, process-group cancellation, argument arrays, and no shell; and
+- `web_fetch`, restricted to public HTTP(S) destinations with per-redirect DNS
+  validation and a response size limit.
+
+DNS can still change between validation and the HTTP transport's connection.
+Production deployments should additionally enforce an egress proxy or sandbox
+network policy; that residual is tracked for the sandbox phase.
 
 Tool exceptions, malformed arguments, denials, and timeouts are visible to both
 the model and event consumer. Cancellation is never converted into a tool
