@@ -46,6 +46,6 @@ def test_go_session_message_fields_are_accepted_without_loss() -> None:
     )
 
     assert message.content_parts[0].text == "fixture"
-    assert message.timestamp == 1_754_265_600_000
+    assert message.timestamp.isoformat() == "2025-08-04T00:00:00+00:00"
     assert message.metadata == {"sandbox": True}
     assert message.origin == "goal_context"
