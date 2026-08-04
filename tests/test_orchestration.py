@@ -11,6 +11,7 @@ from fastclaw.orchestration import (
     BackpressureError,
     CrossTenantError,
     DelegationCycleError,
+    DelegationErrorCode,
     DelegationRequest,
     InProcessMessageBus,
     QueueShutdownError,
@@ -124,8 +125,10 @@ async def test_batch_deduplicates_exact_agent_and_task_within_root() -> None:
     )
 
     assert calls == 2
-    assert results[0] == results[1]
-    assert results[2].value == "DIFFERENT"
+    assert results[0].result == results[1].result
+    assert results[0].succeeded
+    assert results[2].result is not None
+    assert results[2].result.value == "DIFFERENT"
     await bus.shutdown()
 
 
@@ -261,3 +264,155 @@ async def test_shutdown_completes_waiters_once_and_is_idempotent() -> None:
 
     with pytest.raises(QueueShutdownError):
         await request
+
+
+def test_duplicate_agent_registration_is_rejected() -> None:
+    bus = InProcessMessageBus()
+
+    async def handler(task: str, child: ExecutionContext) -> str:
+        del task, child
+        return "done"
+
+    bus.register(user_id="user-1", agent_id="global-agent-id", handler=handler)
+    with pytest.raises(ValueError, match="already registered"):
+        bus.register(user_id="user-1", agent_id="global-agent-id", handler=handler)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_one_shared_waiter_does_not_cancel_the_job() -> None:
+    bus = InProcessMessageBus()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def handler(task: str, child: ExecutionContext) -> str:
+        nonlocal calls
+        del task, child
+        calls += 1
+        started.set()
+        await release.wait()
+        return "shared-result"
+
+    bus.register(user_id="user-1", agent_id="worker", handler=handler)
+    first = asyncio.create_task(bus.request(context(), "worker", "same"))
+    second = asyncio.create_task(bus.request(context(), "worker", "same"))
+    await started.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    release.set()
+
+    assert (await second).value == "shared-result"
+    assert calls == 1
+    await bus.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_one_root_branch_does_not_cancel_its_sibling() -> None:
+    bus = InProcessMessageBus()
+    started = {"left": asyncio.Event(), "right": asyncio.Event()}
+    release_right = asyncio.Event()
+
+    def make_handler(name: str) -> Callable[[str, ExecutionContext], Awaitable[str]]:
+        async def handler(task: str, child: ExecutionContext) -> str:
+            del task, child
+            started[name].set()
+            if name == "right":
+                await release_right.wait()
+            else:
+                await asyncio.Event().wait()
+            return name
+
+        return handler
+
+    bus.register(user_id="user-1", agent_id="left", handler=make_handler("left"))
+    bus.register(user_id="user-1", agent_id="right", handler=make_handler("right"))
+    left = asyncio.create_task(bus.request(context(), "left", "task"))
+    right = asyncio.create_task(bus.request(context(), "right", "task"))
+    await asyncio.gather(started["left"].wait(), started["right"].wait())
+    left.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await left
+    release_right.set()
+
+    assert (await right).value == "right"
+    await bus.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_new_submit_does_not_attach_to_a_cancelling_dedup_job() -> None:
+    bus = InProcessMessageBus()
+    started = asyncio.Event()
+    cleaning = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    calls = 0
+
+    async def handler(task: str, child: ExecutionContext) -> str:
+        nonlocal calls
+        del task, child
+        calls += 1
+        if calls == 1:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaning.set()
+                await release_cleanup.wait()
+        return f"run-{calls}"
+
+    bus.register(user_id="user-1", agent_id="worker", handler=handler)
+    first = asyncio.create_task(bus.request(context(), "worker", "same"))
+    await started.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    await cleaning.wait()
+    replacement = asyncio.create_task(bus.request(context(), "worker", "same"))
+    await asyncio.sleep(0)
+    release_cleanup.set()
+
+    assert (await replacement).value == "run-2"
+    assert calls == 2
+    await bus.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_batch_returns_all_results_in_order_and_redacts_errors() -> None:
+    bus = InProcessMessageBus()
+
+    async def success(task: str, child: ExecutionContext) -> str:
+        del child
+        await asyncio.sleep(0)
+        return task.upper()
+
+    async def failure(task: str, child: ExecutionContext) -> str:
+        del task, child
+        raise RuntimeError("database /private/secret.db on internal.example failed")
+
+    bus.register(user_id="user-1", agent_id="success", handler=success)
+    bus.register(user_id="user-1", agent_id="failure", handler=failure)
+    outcomes = await bus.batch(
+        context(),
+        (
+            DelegationRequest("success", "first"),
+            DelegationRequest("failure", "second"),
+            DelegationRequest("missing", "third"),
+            DelegationRequest("success", "fourth"),
+        ),
+    )
+
+    assert [outcome.request.task for outcome in outcomes] == [
+        "first",
+        "second",
+        "third",
+        "fourth",
+    ]
+    assert outcomes[0].result is not None and outcomes[0].result.value == "FIRST"
+    assert outcomes[1].error is not None
+    assert outcomes[1].error.code is DelegationErrorCode.HANDLER_ERROR
+    assert "/private" not in outcomes[1].error.message
+    assert "internal.example" not in outcomes[1].error.message
+    assert outcomes[2].error is not None
+    assert outcomes[2].error.code is DelegationErrorCode.UNKNOWN_AGENT
+    assert outcomes[3].result is not None and outcomes[3].result.value == "FOURTH"
+    await bus.shutdown()

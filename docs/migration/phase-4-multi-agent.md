@@ -22,18 +22,25 @@ from the trusted `ExecutionContext`.
 - Pending work is capped at 256 by default and fails immediately with a
   backpressure error when saturated.
 - Exact `(agent_id, task)` requests within the same root execution share one
-  correlation Future. Tenant and root are also part of the internal key to
+  Job. Tenant and root are also part of the internal key to
   prevent cross-request result or cancellation leakage.
 - Call paths reject direct recursion and a reference-counted wait graph rejects
   cycles formed by concurrent waits.
 
 ## Cancellation and shutdown
 
-Cancelling a request cancels queued and running work for its root execution.
-Shared dedup Futures are shielded from an individual waiter until root
-cancellation is propagated. Shutdown rejects new work, completes every pending
-Future exactly once with a shutdown error, cancels executions, drains workers,
-and is idempotent.
+Each submit returns a waiter ticket. Cancelling one ticket releases only that
+waiter; the underlying Job is cancelled only when its final waiter leaves.
+Dedup lookup and waiter attachment are atomic. The final release first moves the
+Job to `cancelling` and removes it from the dedup table, so a concurrent submit
+creates a new Job instead of attaching to doomed work. Root cancellation is an
+explicit owner-only operation. Shutdown rejects new work, completes every
+pending waiter exactly once, cancels executions, drains workers, and is
+idempotent.
+
+Batch delegation returns one ordered `DelegationOutcome` per input. Handler
+errors are reduced to stable categories and safe messages before becoming
+model-visible; detailed exceptions remain in correlation-ID server logs.
 
 ## Acceptance evidence
 
