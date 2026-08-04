@@ -1,0 +1,868 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Badge } from "@/components/ui/badge";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import { Brain, Plus, Pencil, Trash2, Check, Cpu, Loader2 } from "lucide-react";
+import {
+  getConfig,
+  updateConfig,
+  testProvider,
+  testStoredProvider,
+  listProviders,
+  createProvider,
+  updateProvider,
+  deleteProvider,
+  type ModelEntry,
+  type ProviderRow,
+} from "@/lib/api";
+
+// Keep these maps in sync with onboard's ProviderStep so the two flows
+// look and behave identically — same preset set, same labels, same
+// SelectValue render-children pattern.
+const PROVIDER_PRESETS: Record<
+  string,
+  { apiBase: string; apiType: string; authType: string }
+> = {
+  openai: { apiBase: "https://api.openai.com/v1", apiType: "openai-chat", authType: "bearer-token" },
+  openrouter: { apiBase: "https://openrouter.ai/api/v1", apiType: "openai-chat", authType: "bearer-token" },
+  anthropic: { apiBase: "https://api.anthropic.com", apiType: "anthropic-messages", authType: "api-key" },
+  ollama: { apiBase: "http://localhost:11434/v1", apiType: "openai-chat", authType: "bearer-token" },
+  custom: { apiBase: "", apiType: "openai-chat", authType: "bearer-token" },
+};
+
+const PROVIDER_LABELS: Record<string, string> = {
+  openai: "OpenAI",
+  openrouter: "OpenRouter",
+  anthropic: "Anthropic",
+  ollama: "Ollama",
+  custom: "Custom",
+};
+
+const API_TYPE_LABELS: Record<string, string> = {
+  "openai-chat": "OpenAI Chat Completions",
+  "anthropic-messages": "Anthropic Messages",
+};
+
+const AUTH_TYPE_LABELS: Record<string, string> = {
+  "bearer-token": "Bearer Token",
+  "api-key": "API Key Header",
+};
+
+interface ProviderEntry {
+  id: string;          // configs row id — required for PUT/DELETE
+  name: string;
+  apiBase: string;
+  apiKey: string;      // unmasked draft (only set while editing)
+  maskedKey: string;   // server-returned masked key for display
+  apiType: string;
+  authType: string;
+  models: ModelEntry[];
+}
+
+function emptyModel(): ModelEntry {
+  return {
+    id: "",
+    name: "",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 200000,
+    maxTokens: 8192,
+  };
+}
+
+export default function ModelsPage() {
+  const [providers, setProviders] = useState<ProviderEntry[]>([]);
+  const [model, setModel] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  // Dialog state
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [editingName, setEditingName] = useState<string | null>(null);
+  const [formPreset, setFormPreset] = useState("openrouter");
+  const [formName, setFormName] = useState("");
+  const [formApiBase, setFormApiBase] = useState("");
+  const [formApiKey, setFormApiKey] = useState("");
+  const [formApiType, setFormApi] = useState("openai-chat");
+  const [formAuthType, setFormAuthType] = useState("api-key");
+  const [formModels, setFormModels] = useState<ModelEntry[]>([]);
+  // Per-model test results keyed by model index in formModels. We test
+  // every configured model so the user sees which model IDs the provider
+  // actually exposes — a single "ping the base URL" check would mask
+  // typos in any individual model id.
+  type ModelTestResult = { status: "idle" | "testing" | "success" | "error"; error?: string };
+  const [modelTests, setModelTests] = useState<Record<number, ModelTestResult>>({});
+  const [batchTesting, setBatchTesting] = useState(false);
+
+  // Add/Update is gated on every non-empty model having a green test
+  // result. Empty model rows are ignored (they get filtered out at
+  // save), an explicit "no models configured" provider is allowed
+  // through (rare but legal — e.g. seeding before the catalog is known).
+  const cleanModelRows = formModels
+    .map((m, idx) => ({ idx, id: m.id.trim() }))
+    .filter((t) => t.id);
+  const allModelsPassed =
+    cleanModelRows.length === 0 ||
+    cleanModelRows.every((t) => modelTests[t.idx]?.status === "success");
+
+  // Collect all provider/model options for default model dropdown
+  const allModelOptions: { value: string; label: string }[] = [];
+  for (const p of providers) {
+    for (const m of p.models) {
+      allModelOptions.push({
+        value: `${p.name}/${m.id}`,
+        label: `${p.name}/${m.name || m.id}`,
+      });
+    }
+  }
+
+  // Providers are stored in the configs table and only round-trip through
+  // the dedicated /api/providers endpoints — POST /api/config silently
+  // ignores the providers map. agents.defaults.model is read off the
+  // merged /api/config response (so it picks up system+user overlay) but
+  // written back through the same endpoint. Keep the two writes split so
+  // an empty default-model field doesn't blow away provider rows, and a
+  // provider mutation doesn't accidentally clear the default model.
+  const requestGenerationRef = useRef(0);
+  const fetchConfig = useCallback(async (signal?: AbortSignal) => {
+    const generation = ++requestGenerationRef.current;
+    try {
+      const [cfg, prov] = await Promise.all([
+        getConfig(signal).catch(() => null),
+        listProviders("system", "", signal).catch(() => null),
+      ]);
+      if (signal?.aborted || requestGenerationRef.current !== generation) return;
+      const rows: ProviderRow[] = (prov && Array.isArray(prov.providers))
+        ? (prov.providers as ProviderRow[])
+        : [];
+      const entries: ProviderEntry[] = rows.map((r) => ({
+        id: r.id,
+        name: r.name,
+        apiBase: r.apiBase || "",
+        apiKey: "",
+        maskedKey: r.apiKey || "",
+        apiType: r.apiType || "openai-chat",
+        authType: r.authType || "bearer-token",
+        models: r.models || [],
+      }));
+      setProviders(entries);
+      setModel(cfg?.agents?.defaults?.model || "");
+    } finally {
+      if (!signal?.aborted && requestGenerationRef.current === generation) {
+        setLoading(false);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchConfig(controller.signal);
+    return () => controller.abort();
+  }, [fetchConfig]);
+
+  const openAddDialog = () => {
+    setEditingName(null);
+    setFormPreset("openai");
+    setFormName("openai");
+    setFormApiBase(PROVIDER_PRESETS["openai"].apiBase);
+    setFormApi(PROVIDER_PRESETS["openai"].apiType);
+    setFormAuthType(PROVIDER_PRESETS["openai"].authType);
+    setFormApiKey("");
+    setFormModels([]);
+    setModelTests({});
+    setDialogOpen(true);
+  };
+
+  const openEditDialog = (provider: ProviderEntry) => {
+    setEditingName(provider.name);
+    const preset = Object.keys(PROVIDER_PRESETS).includes(provider.name) ? provider.name : "custom";
+    setFormPreset(preset);
+    setFormName(provider.name);
+    setFormApiBase(provider.apiBase);
+    setFormApi(provider.apiType);
+    setFormAuthType(provider.authType || "bearer-token");
+    setFormApiKey("");
+    // Saved providers may have models persisted before we shipped the
+    // full ModelEntry schema (no cost block, no input array). Layer
+    // emptyModel() defaults under the saved data so the dialog always
+    // has well-formed objects to edit.
+    setFormModels(
+      (provider.models || []).map((m) => {
+        const base = emptyModel();
+        return {
+          ...base,
+          ...m,
+          cost: { ...base.cost, ...(m.cost || {}) },
+          input: m.input && m.input.length > 0 ? [...m.input] : base.input,
+        };
+      }),
+    );
+    // Pre-mark every model in an editing session as "success" so the
+    // user isn't forced to re-test every existing model just to change
+    // a display name. Editing the model id, hitting Test, or removing /
+    // re-adding rows will reset their status as expected.
+    setModelTests(
+      provider.models
+        ? Object.fromEntries(
+            provider.models.map((_m, idx) => [idx, { status: "success" as const }]),
+          )
+        : {},
+    );
+    setDialogOpen(true);
+  };
+
+  // Match onboard's handleProviderChange: pre-fill api base + api type from
+  // the preset, keep provider name editable (auto-set to preset key, but
+  // user can rename — e.g. "openai" → "production"), reset test status.
+  const handlePresetChange = (preset: string) => {
+    setFormPreset(preset);
+    const cfg = PROVIDER_PRESETS[preset];
+    if (cfg) {
+      setFormApiBase(cfg.apiBase);
+      setFormApi(cfg.apiType);
+      setFormAuthType(cfg.authType);
+    }
+    setFormName(preset === "custom" ? "" : preset);
+    setModelTests({});
+  };
+
+  // Test every configured model in turn. We hit one /chat/completions
+  // (or /v1/messages) per model id so a typo in any single model surfaces
+  // distinctly — a single "ping" with model="" can return 200 and still
+  // leave a broken model id silently undetected.
+  //
+  // When editing an existing row, the user typically hasn't re-typed the
+  // API key (the field is empty + masked-only displays), so we route the
+  // test through the saved provider row server-side. If they DID type a
+  // fresh key, we honor it and use the inline-test path so the new key
+  // gets exercised before they save.
+  const handleTestConnection = async () => {
+    const targets = formModels
+      .map((m, idx) => ({ idx, id: m.id.trim() }))
+      .filter((t) => t.id);
+    if (targets.length === 0) return;
+    const editingRow = editingName
+      ? providers.find((p) => p.name === editingName)
+      : undefined;
+    const useStoredKey = !!editingRow && !formApiKey.trim();
+    setBatchTesting(true);
+    setModelTests((prev) => {
+      const next = { ...prev };
+      for (const t of targets) next[t.idx] = { status: "testing" };
+      return next;
+    });
+    await Promise.all(
+      targets.map(async ({ idx, id }) => {
+        try {
+          const result = useStoredKey && editingRow
+            ? await testStoredProvider(editingRow.id, id)
+            : await testProvider({
+                apiBase: formApiBase,
+                apiKey: formApiKey,
+                model: id,
+                apiType: formApiType,
+                authType: formAuthType,
+              });
+          setModelTests((prev) => ({
+            ...prev,
+            [idx]: result.ok
+              ? { status: "success" }
+              : { status: "error", error: result.error || "Connection failed" },
+          }));
+        } catch {
+          setModelTests((prev) => ({
+            ...prev,
+            [idx]: { status: "error", error: "Connection failed" },
+          }));
+        }
+      }),
+    );
+    setBatchTesting(false);
+  };
+
+  const handleAddModel = () => {
+    setFormModels((prev) => [...prev, emptyModel()]);
+  };
+
+  const handleUpdateModel = (index: number, field: string, value: unknown) => {
+    setFormModels((prev) => {
+      const updated = [...prev];
+      const m = { ...updated[index], cost: { ...updated[index].cost }, input: [...updated[index].input] };
+      if (field === "id") m.id = value as string;
+      else if (field === "name") m.name = value as string;
+      else if (field === "reasoning") m.reasoning = value as boolean;
+      else if (field === "contextWindow") m.contextWindow = Number(value) || 0;
+      else if (field === "maxTokens") m.maxTokens = Number(value) || 0;
+      updated[index] = m;
+      return updated;
+    });
+    if (field === "id") {
+      // Editing the model id invalidates the previous test result for
+      // that row — clear the badge so a stale "connected" doesn't
+      // mislead after a typo.
+      setModelTests((prev) => {
+        if (prev[index] === undefined) return prev;
+        const { [index]: _drop, ...rest } = prev;
+        void _drop;
+        return rest;
+      });
+    }
+  };
+
+  const handleRemoveModel = (index: number) => {
+    setFormModels((prev) => prev.filter((_, i) => i !== index));
+    // Reindex modelTests: rows after the removed index shift down by 1.
+    setModelTests((prev) => {
+      const next: Record<number, ModelTestResult> = {};
+      for (const [k, v] of Object.entries(prev)) {
+        const i = Number(k);
+        if (i === index) continue;
+        next[i > index ? i - 1 : i] = v;
+      }
+      return next;
+    });
+  };
+
+  const flashSaved = () => {
+    setSaved(true);
+    setTimeout(() => setSaved(false), 2000);
+  };
+
+  const handleSaveProvider = async () => {
+    const name = formName.toLowerCase().trim().replace(/\s+/g, "-");
+    if (!name) return;
+    const cleanedModels = formModels.filter((m) => m.id.trim());
+    const editingRow = editingName
+      ? providers.find((p) => p.name === editingName)
+      : undefined;
+
+    setSaving(true);
+    try {
+      if (editingRow) {
+        await updateProvider(editingRow.id, {
+          apiBase: formApiBase,
+          // Empty key on edit means "keep existing"; the backend treats
+          // empty/masked-sentinel values as a no-op.
+          apiKey: formApiKey || undefined,
+          apiType: formApiType,
+          authType: formAuthType,
+          models: cleanedModels,
+        });
+      } else {
+        await createProvider({
+          scope: "system",
+          scopeId: "",
+          name,
+          apiBase: formApiBase,
+          apiKey: formApiKey,
+          apiType: formApiType,
+          authType: formAuthType,
+          models: cleanedModels,
+        });
+      }
+      flashSaved();
+    } finally {
+      setSaving(false);
+    }
+    setDialogOpen(false);
+    await fetchConfig();
+  };
+
+  const handleDeleteProvider = async (name: string) => {
+    const row = providers.find((p) => p.name === name);
+    if (!row) return;
+    setSaving(true);
+    try {
+      await deleteProvider(row.id);
+      flashSaved();
+    } finally {
+      setSaving(false);
+    }
+    await fetchConfig();
+  };
+
+  // Save button at the top only persists the default-model setting. We
+  // skip the write when the field is empty so users who never touched it
+  // don't accidentally clear an existing system-scoped value.
+  const handleSaveAll = async () => {
+    if (!model.trim()) {
+      flashSaved();
+      return;
+    }
+    setSaving(true);
+    try {
+      await updateConfig({ agents: { defaults: { model: model.trim() } } });
+      flashSaved();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleDefaultModelChange = async (value: string) => {
+    setModel(value);
+    if (!value.trim()) return;
+    setSaving(true);
+    try {
+      await updateConfig({ agents: { defaults: { model: value.trim() } } });
+      flashSaved();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="p-6 space-y-6 max-w-5xl mx-auto">
+        <Skeleton className="h-10 w-48" />
+        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+          {[1, 2, 3].map((i) => (
+            <Skeleton key={i} className="h-48" />
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-6 space-y-6 max-w-5xl mx-auto">
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-2xl font-semibold tracking-tight">Models</h2>
+          <p className="text-sm text-muted-foreground mt-1">
+            Manage LLM providers and default model
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Button variant="outline" onClick={openAddDialog}>
+            <Plus className="h-4 w-4 mr-2" />
+            Add Provider
+          </Button>
+          <Button
+            onClick={handleSaveAll}
+            disabled={saving}
+            variant={saved ? "outline" : "default"}
+            className={saved ? "border-emerald-500/30 text-emerald-600 dark:text-emerald-400" : ""}
+          >
+            {saved ? (
+              <>
+                <Check className="h-4 w-4 mr-2" />
+                Saved
+              </>
+            ) : (
+              saving ? "Saving..." : "Save"
+            )}
+          </Button>
+        </div>
+      </div>
+
+      {/* Default Model */}
+      <div className="rounded-lg border border-border bg-card p-5">
+        <div className="flex items-center gap-2 mb-3">
+          <Cpu className="h-4 w-4 text-primary" />
+          <h3 className="font-medium">Default Model</h3>
+        </div>
+        {allModelOptions.length > 0 ? (
+          <Select value={model} onValueChange={(v: string | null) => v && handleDefaultModelChange(v)}>
+            <SelectTrigger className="font-mono text-sm max-w-md">
+              <SelectValue placeholder="Select a model" />
+            </SelectTrigger>
+            {/* Default `w-(--anchor-width)` locks the popup to the
+                trigger's max-w-md. Long ids like
+                openrouter/xiaomi/mimo-v2-flash get clipped. Let it grow
+                to fit content instead, while still staying at least as
+                wide as the trigger. */}
+            <SelectContent className="!w-auto !min-w-[var(--anchor-width)] !overflow-x-visible">
+              {allModelOptions.map((opt) => (
+                <SelectItem key={opt.value} value={opt.value}>
+                  <span className="font-mono text-sm whitespace-nowrap">{opt.value}</span>
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        ) : (
+          <Input
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            placeholder="e.g. openai/gpt-4o"
+            className="font-mono text-sm max-w-md"
+          />
+        )}
+        <p className="text-xs text-muted-foreground mt-2">
+          Used by agents unless overridden in agent config
+        </p>
+      </div>
+
+      {/* Providers Grid */}
+      {providers.length === 0 ? (
+        <div className="rounded-lg border border-border bg-card">
+          <div className="flex flex-col items-center justify-center py-16">
+            <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-amber-500/10 mb-4">
+              <Brain className="h-7 w-7 text-amber-500" />
+            </div>
+            <p className="text-sm text-muted-foreground mb-1">No providers configured</p>
+            <p className="text-xs text-muted-foreground/60 mb-4">
+              Add an LLM provider to get started
+            </p>
+            <Button variant="outline" size="sm" onClick={openAddDialog}>
+              <Plus className="h-4 w-4 mr-2" />
+              Add Provider
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div className="rounded-lg border border-border bg-card overflow-hidden">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Name</TableHead>
+                <TableHead>API Base</TableHead>
+                <TableHead>API Key</TableHead>
+                <TableHead>Models</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead className="text-right">Actions</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {providers.map((provider) => (
+                <TableRow key={provider.name}>
+                  <TableCell className="font-medium">{provider.name}</TableCell>
+                  <TableCell>
+                    <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">
+                      {provider.apiBase || "—"}
+                    </code>
+                  </TableCell>
+                  <TableCell>
+                    <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-xs">
+                      {provider.maskedKey || "—"}
+                    </code>
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {provider.models.length}
+                  </TableCell>
+                  <TableCell>
+                    <Badge
+                      variant="outline"
+                      className="bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20"
+                    >
+                      <span className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                      Active
+                    </Badge>
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <div className="flex justify-end gap-1">
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        onClick={() => openEditDialog(provider)}
+                        title="Edit"
+                      >
+                        <Pencil className="size-4" />
+                      </Button>
+                      <Button
+                        size="icon"
+                        variant="ghost"
+                        className="text-destructive hover:text-destructive"
+                        onClick={() => handleDeleteProvider(provider.name)}
+                        title="Remove"
+                      >
+                        <Trash2 className="size-4" />
+                      </Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+
+      {/* Add/Edit Provider Dialog */}
+      <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+        <DialogContent className="sm:max-w-2xl max-h-[85vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>
+              {editingName ? "Edit Provider" : "Add Provider"}
+            </DialogTitle>
+            <DialogDescription>
+              Configure LLM provider connection and models
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            {/* Provider + Provider Name (mirrors onboard's 2-col grid). */}
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label>Provider</Label>
+                <Select
+                  value={formPreset}
+                  onValueChange={(v: string | null) => v && handlePresetChange(v)}
+                  disabled={!!editingName}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue>
+                      {(v: unknown) => PROVIDER_LABELS[v as string] ?? (v as string) ?? ""}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {Object.keys(PROVIDER_PRESETS).map((p) => (
+                      <SelectItem key={p} value={p}>
+                        {PROVIDER_LABELS[p] ?? p}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label>Provider Name</Label>
+                <Input
+                  value={formName}
+                  onChange={(e) => setFormName(e.target.value)}
+                  placeholder="openai"
+                  className="font-mono text-sm"
+                  disabled={!!editingName}
+                />
+              </div>
+            </div>
+
+            {/* API Base URL */}
+            <div className="space-y-1.5">
+              <Label>API Base URL</Label>
+              <Input
+                value={formApiBase}
+                onChange={(e) => setFormApiBase(e.target.value)}
+                placeholder="https://api.openai.com/v1"
+                className="font-mono text-sm"
+              />
+            </div>
+
+            {/* API Key — on edit we never receive the unmasked key from
+                the server, so show the masked key as the placeholder so
+                the operator can see one is configured. Leave the value
+                empty so they can type a replacement; Test connection
+                falls back to the stored key when the field is blank. */}
+            <div className="space-y-1.5">
+              <Label>API Key</Label>
+              <Input
+                type={editingName && !formApiKey ? "text" : "password"}
+                value={formApiKey}
+                onChange={(e) => setFormApiKey(e.target.value)}
+                placeholder={
+                  editingName
+                    ? (() => {
+                        const row = providers.find((p) => p.name === editingName);
+                        return row?.maskedKey || "sk-…";
+                      })()
+                    : "sk-…"
+                }
+                className="font-mono text-sm placeholder:text-muted-foreground/70"
+              />
+              {editingName && (
+                <p className="text-[11px] text-muted-foreground/60">
+                  Leave empty to keep existing key. Test connection uses the saved key.
+                </p>
+              )}
+            </div>
+
+            {/* API Type & Auth Type */}
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label>API Type</Label>
+                <Select value={formApiType} onValueChange={(v: string | null) => v && setFormApi(v)}>
+                  <SelectTrigger className="w-full">
+                    <SelectValue>
+                      {(v: unknown) => API_TYPE_LABELS[v as string] ?? (v as string) ?? ""}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="openai-chat">OpenAI Chat Completions</SelectItem>
+                    <SelectItem value="anthropic-messages">Anthropic Messages</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label>Auth Type</Label>
+                <Select value={formAuthType} onValueChange={(v: string | null) => v && setFormAuthType(v)}>
+                  <SelectTrigger className="w-full">
+                    <SelectValue>
+                      {(v: unknown) => AUTH_TYPE_LABELS[v as string] ?? (v as string) ?? ""}
+                    </SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="bearer-token">Bearer Token</SelectItem>
+                    <SelectItem value="api-key">API Key Header</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            {/* Models Section */}
+            <div className="space-y-3 pt-2 border-t border-border">
+              <div className="flex items-center justify-between">
+                <Label className="text-base">Models</Label>
+                <Button variant="outline" size="sm" onClick={handleAddModel}>
+                  <Plus className="h-3 w-3 mr-1.5" />
+                  Add Model
+                </Button>
+              </div>
+
+              {formModels.length === 0 && (
+                <p className="text-sm text-muted-foreground/60 text-center py-4">
+                  No models configured. Add models to use with this provider.
+                </p>
+              )}
+
+              {formModels.map((m, idx) => {
+                const t = modelTests[idx];
+                return (
+                <div key={idx} className="rounded-lg border border-border bg-muted/30 p-4 space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="text-sm font-medium text-muted-foreground">
+                        Model {idx + 1}
+                      </span>
+                      {t?.status === "testing" && (
+                        <Badge variant="outline" className="text-[10px]">
+                          <Loader2 className="mr-1 size-3 animate-spin" /> testing
+                        </Badge>
+                      )}
+                      {t?.status === "success" && (
+                        <Badge className="bg-emerald-500/15 text-emerald-700 hover:bg-emerald-500/15 text-[10px]">
+                          <Check className="mr-1 size-3" /> connected
+                        </Badge>
+                      )}
+                      {t?.status === "error" && (
+                        <Badge variant="outline" className="border-destructive/40 text-destructive text-[10px]" title={t.error}>
+                          failed
+                        </Badge>
+                      )}
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-7 text-xs text-destructive hover:text-destructive"
+                      onClick={() => handleRemoveModel(idx)}
+                    >
+                      <Trash2 className="h-3 w-3 mr-1" />
+                      Remove
+                    </Button>
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="space-y-1">
+                      <Label className="text-xs">Model ID</Label>
+                      <Input
+                        value={m.id}
+                        onChange={(e) => handleUpdateModel(idx, "id", e.target.value)}
+                        placeholder="e.g. gpt-4o"
+                        className="font-mono text-xs h-8"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label className="text-xs">Display Name</Label>
+                      <Input
+                        value={m.name}
+                        onChange={(e) => handleUpdateModel(idx, "name", e.target.value)}
+                        placeholder="e.g. GPT-4o"
+                        className="text-xs h-8"
+                      />
+                    </div>
+                  </div>
+                </div>
+                );
+              })}
+
+              {/* Test connection runs against every configured model so
+                  a typo in any single model id is surfaced per-row, not
+                  hidden behind a single green pass/fail. Always visible
+                  — Add/Update is gated on every model passing. */}
+              <div className="flex flex-col gap-2 pt-2">
+                <div className="flex items-center gap-3">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={handleTestConnection}
+                    disabled={
+                      batchTesting ||
+                      !formApiBase ||
+                      cleanModelRows.length === 0
+                    }
+                  >
+                    {batchTesting ? (
+                      <>
+                        <Loader2 className="mr-1 size-4 animate-spin" /> Testing
+                      </>
+                    ) : (
+                      "Test connection"
+                    )}
+                  </Button>
+                  <span className="text-xs text-muted-foreground">
+                    {cleanModelRows.length === 0
+                      ? "Add at least one model with an id, then test."
+                      : "Pings every model above; results show next to each row."}
+                  </span>
+                </div>
+                {Object.values(modelTests).some((t) => t.status === "error") && (
+                  <ul className="space-y-0.5">
+                    {formModels.map((m, idx) => {
+                      const t = modelTests[idx];
+                      if (!t || t.status !== "error" || !m.id.trim()) return null;
+                      return (
+                        <li key={idx} className="text-xs text-destructive break-all">
+                          <code className="font-mono">{m.id}</code>: {t.error}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </div>
+            </div>
+          </div>
+          <DialogFooter className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            {!allModelsPassed && (
+              <span className="text-xs text-muted-foreground sm:mr-auto">
+                Test every model first — Add/Update unlocks once they all pass.
+              </span>
+            )}
+            <Button variant="outline" onClick={() => setDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={handleSaveProvider}
+              disabled={!formName.trim() || saving || !allModelsPassed}
+            >
+              {editingName ? "Update" : "Add"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
