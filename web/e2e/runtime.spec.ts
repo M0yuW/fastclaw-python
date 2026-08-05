@@ -14,7 +14,9 @@ test("login, Agent, chat, Stop, history, files and skills", async ({ page, reque
       agentName: "E2E Analyst",
     },
   });
-  expect(onboard.ok()).toBeTruthy();
+  // A Playwright retry reuses the same disposable Gateway process. The first
+  // attempt may already have completed the one-time onboarding transaction.
+  expect(onboard.ok() || onboard.status() === 409).toBeTruthy();
 
   await page.goto("/");
   await page.getByPlaceholder("username or email").fill("admin");
@@ -38,16 +40,17 @@ test("login, Agent, chat, Stop, history, files and skills", async ({ page, reque
   const composer = page.locator("textarea");
   await composer.fill("hello");
   await page.getByRole("button", { name: "Send message" }).click();
-  await expect(page.getByText("hello world", { exact: true })).toBeVisible();
+  const assistantReply = page.getByRole("paragraph").filter({ hasText: /^hello world$/ });
+  await expect(assistantReply).toBeVisible();
   const historyUrl = page.url();
   expect(historyUrl).toContain("session=");
   await page.reload();
-  await expect(page.getByText("hello world", { exact: true })).toBeVisible();
+  await expect(assistantReply).toBeVisible();
 
   await composer.fill("slow response");
   await page.getByRole("button", { name: "Send message" }).click();
   const stop = page.getByRole("button", { name: "Stop generating" });
   await expect(stop).toBeVisible();
   await stop.click();
-  await expect(page.getByText("(Stopped)", { exact: true })).toBeVisible();
+  await expect(page.getByRole("paragraph").filter({ hasText: /^\(Stopped\)$/ })).toBeVisible();
 });
