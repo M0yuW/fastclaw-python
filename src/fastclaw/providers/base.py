@@ -1,8 +1,11 @@
-"""Interfaces implemented by FastClaw providers."""
+"""Interfaces implemented by FastClaw LLM providers."""
 
 from typing import Protocol, runtime_checkable
 
 import httpx
+
+from fastclaw.providers.models import ChatRequest, ChatResponse
+from fastclaw.providers.stream import ProviderStream
 
 
 @runtime_checkable
@@ -32,5 +35,15 @@ class Provider(Protocol):
 
     async def ready(self) -> bool:
         """Return whether the provider can currently serve requests."""
+
+        ...
+
+    async def chat(self, request: ChatRequest) -> ChatResponse:
+        """Run a chat request and return its complete response."""
+
+        ...
+
+    def stream(self, request: ChatRequest) -> ProviderStream:
+        """Start a lazily-executed streaming chat request."""
 
         ...
