@@ -1,0 +1,51 @@
+{
+  "id": "finance-tools",
+  "name": "Finance Tools",
+  "version": "0.3.0",
+  "description": "Typed financial research tools with tenant-isolated theses, watchlists, and deduplicated event alerts",
+  "type": "tool",
+  "command": "python3 plugin.py",
+  "capabilities": ["tool"],
+  "config": {
+    "finskillsPath": {
+      "type": "string",
+      "required": false,
+      "default": "~/finskills"
+    },
+    "serenitySkillPath": {
+      "type": "string",
+      "required": false,
+      "default": ""
+    },
+    "pythonBin": {
+      "type": "string",
+      "required": false,
+      "default": "python3"
+    },
+    "usPythonBin": {
+      "type": "string",
+      "required": false,
+      "default": ""
+    },
+    "cnPythonBin": {
+      "type": "string",
+      "required": false,
+      "default": ""
+    },
+    "serenityPythonBin": {
+      "type": "string",
+      "required": false,
+      "default": ""
+    },
+    "stateDbPath": {
+      "type": "string",
+      "required": false,
+      "default": ""
+    },
+    "timeoutSeconds": {
+      "type": "number",
+      "required": false,
+      "default": "45"
+    }
+  }
+}

@@ -72,6 +72,12 @@ class StoredProviderTest(WireModel):
     model: str
 
 
+class PluginUpdate(WireModel):
+    enabled: bool | None = None
+    config: dict[str, Any] | None = None
+    restart: bool = False
+
+
 class ChatInput(WireModel):
     agent_id: str
     session_id: str

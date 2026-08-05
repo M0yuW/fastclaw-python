@@ -31,6 +31,7 @@ from fastclaw.gateway.models import (
     OnboardRequest,
     OpenAIChatInput,
     PasswordReset,
+    PluginUpdate,
     ProviderTest,
     ProviderUpdate,
     ProviderWrite,
@@ -1336,7 +1337,6 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         ("GET", "/api/scoped-channels", "channels"),
         ("POST", "/api/scoped-channels", "channels"),
         ("GET", "/api/channels", "channels"),
-        ("GET", "/api/plugins", "plugins"),
         ("GET", "/api/cron", "cron"),
         ("POST", "/api/cron", "cron"),
         ("GET", "/api/agent-bindings", "agent bindings"),
@@ -1363,12 +1363,87 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         del channel_id, auth
         return unsupported("channels")
 
-    @router.put("/api/plugins/{plugin_id}", response_model=None)
-    async def update_unsupported_plugin(
-        plugin_id: str, auth: AuthContext = auth_dependency
-    ) -> Response:
-        del plugin_id, auth
-        return unsupported("plugins")
+    def plugin_json(instance: Any) -> dict[str, Any]:
+        return {
+            "id": instance.manifest.id,
+            "type": instance.manifest.type,
+            "version": instance.manifest.version,
+            "status": "running"
+            if instance.process.running
+            else ("error" if instance.error else "stopped"),
+            "enabled": instance.enabled,
+            "config": {"timeoutSeconds": int(instance.config.get("timeoutSeconds") or 45)},
+            "error": instance.error,
+        }
+
+    @router.get("/api/plugins")
+    async def list_plugins(auth: AuthContext = auth_dependency) -> list[dict[str, Any]]:
+        del auth
+        return [
+            plugin_json(instance) for instance in gateway.agent_manager.plugin_manager.instances
+        ]
+
+    @router.put("/api/plugins/{plugin_id}")
+    async def update_plugin(
+        plugin_id: str,
+        payload: PluginUpdate,
+        auth: AuthContext = auth_dependency,
+    ) -> dict[str, Any]:
+        require_mutation(auth, admin=True)
+        current = next(
+            (
+                instance
+                for instance in gateway.agent_manager.plugin_manager.instances
+                if instance.manifest.id == plugin_id
+            ),
+            None,
+        )
+        if current is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "plugin not found")
+        config = dict(current.config)
+        if payload.config is not None:
+            unknown = set(payload.config) - {"timeoutSeconds"}
+            if unknown:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST,
+                    "bundled plugin paths and interpreters are Runtime-managed",
+                )
+            try:
+                timeout_seconds = int(payload.config.get("timeoutSeconds", 45))
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST, "timeoutSeconds must be an integer"
+                ) from exc
+            if not 1 <= timeout_seconds <= 300:
+                raise HTTPException(
+                    status.HTTP_400_BAD_REQUEST, "timeoutSeconds must be from 1 to 300"
+                )
+            config["timeoutSeconds"] = timeout_seconds
+        instance = await gateway.agent_manager.plugin_manager.configure(
+            plugin_id,
+            enabled=payload.enabled,
+            config=config if payload.config is not None else None,
+            restart=payload.restart,
+        )
+        now = datetime.now(UTC)
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            record = await store.find_config(
+                kind="plugin", scope="system", scope_id="", name=plugin_id
+            )
+            await store.save_config(
+                ConfigRecord(
+                    id=record.id if record else f"cfg_plugin_{secrets.token_hex(8)}",
+                    kind="plugin",
+                    scope="system",
+                    name=plugin_id,
+                    enabled=instance.enabled,
+                    data={"timeoutSeconds": int(instance.config.get("timeoutSeconds") or 45)},
+                    created_at=record.created_at if record else now,
+                    updated_at=now,
+                )
+            )
+        return {"ok": True, "plugin": plugin_json(instance)}
 
     @router.put("/api/cron/{job_id}", response_model=None)
     @router.delete("/api/cron/{job_id}", response_model=None)

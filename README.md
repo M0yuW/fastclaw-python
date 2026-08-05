@@ -196,6 +196,17 @@ The Next.js application under `web/` is a source-attributed snapshot of the Go
 project at the locked compatibility baseline. Its Git history was not copied.
 See [web/SOURCE.md](web/SOURCE.md) for the exact source commit and license.
 
+## JSON-RPC plugins and finance tools
+
+The application lifecycle discovers and supervises bounded JSON-RPC plugin
+processes. Trusted tenant and execution identity is injected separately from
+model arguments, failed state mutations are never replayed, and plugin crashes
+do not terminate the Gateway. The bundled `finance-tools` port uses the
+prepared finance Skill environments and stores new tenant-isolated state only
+under `~/.fastclaw-python/data`.
+
+See [the plugin and finance migration record](docs/migration/phase-8-plugins-finance.md).
+
 ## License
 
 See [LICENSE](LICENSE).
