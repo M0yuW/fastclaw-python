@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -37,6 +38,12 @@ def mask_secret(value: str) -> str:
 class AuthContext:
     identity: Identity
     user: UserRecord
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRuntimeProfile:
+    agent: AgentRecord
+    system_prompt: str
 
 
 class GatewayService:
@@ -125,6 +132,51 @@ class GatewayService:
         if not identity.can_access_agent(agent.id):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
         return agent
+
+    async def agent_runtime_profile(self, agent: AgentRecord) -> AgentRuntimeProfile:
+        """Resolve Go-compatible agent.json and identity files from the database."""
+        async with UnitOfWork(self.database) as unit:
+            records = await unit.require_store().list_agent_files(agent.id, agent.user_id)
+        files = {record.filename: record.data for record in records}
+
+        file_config: dict[str, Any] = {}
+        raw_config = files.get("agent.json")
+        if raw_config:
+            try:
+                parsed = json.loads(raw_config)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                file_config = parsed
+
+        # Explicit database config remains authoritative. Imported Go agents often
+        # keep these settings in agent.json while their agents.config value is null.
+        effective_config = {**file_config, **agent.config}
+        prompt_parts: list[str] = []
+        for filename in ("SOUL.md", "IDENTITY.md", "USER.md", "MEMORY.md"):
+            raw = files.get(filename)
+            if not raw:
+                continue
+            try:
+                content = raw.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                continue
+            if content:
+                prompt_parts.append(f"## {filename}\n\n{content}")
+
+        configured_soul = str(effective_config.get("soul") or "").strip()
+        if configured_soul and "SOUL.md" not in files:
+            prompt_parts.insert(0, f"## SOUL.md\n\n{configured_soul}")
+        elif not configured_soul and files.get("SOUL.md"):
+            try:
+                effective_config["soul"] = files["SOUL.md"].decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+
+        return AgentRuntimeProfile(
+            agent=agent.model_copy(update={"config": effective_config}),
+            system_prompt="\n\n".join(prompt_parts),
+        )
 
     async def provider_selection(
         self, auth: AuthContext, agent: AgentRecord, requested_model: str = ""

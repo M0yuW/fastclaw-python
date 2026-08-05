@@ -13,7 +13,7 @@ from fastclaw.app import create_app
 from fastclaw.gateway import GatewaySettings
 from fastclaw.identity import hash_api_key
 from fastclaw.runtime import Runtime
-from fastclaw.storage import AgentRecord, APIKeyRecord, Database, UnitOfWork
+from fastclaw.storage import AgentFileRecord, AgentRecord, APIKeyRecord, Database, UnitOfWork
 
 
 @asynccontextmanager
@@ -156,11 +156,15 @@ async def test_bearer_api_key_enforces_agent_acl(tmp_path: Path) -> None:
 
 
 async def test_chat_stream_and_history_use_configured_provider(tmp_path: Path) -> None:
+    imported_prompts: list[str] = []
+
     async def provider_handler(request: httpx.Request) -> httpx.Response:
         assert request.url == "https://llm.test/v1/chat/completions"
         assert request.headers["authorization"] == "Bearer provider-secret"
         payload = json.loads(request.content)
         assert payload["model"] == "model-1"
+        if payload["messages"][0]["role"] == "system":
+            imported_prompts.append(payload["messages"][0]["content"])
         body = (
             'data: {"choices":[{"index":0,"delta":{"content":"hello "},'
             '"finish_reason":null}]}\n\n'
@@ -171,7 +175,7 @@ async def test_chat_stream_and_history_use_configured_provider(tmp_path: Path) -
         return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
 
     transport = httpx.MockTransport(provider_handler)
-    async with gateway_client(tmp_path / "chat.db", transport=transport) as (client, _):
+    async with gateway_client(tmp_path / "chat.db", transport=transport) as (client, database):
         tested = await client.post(
             "/api/test-provider",
             json={
@@ -182,6 +186,35 @@ async def test_chat_stream_and_history_use_configured_provider(tmp_path: Path) -
             },
         )
         created = await onboard(client)
+        async with UnitOfWork(database) as unit:
+            store = unit.require_store()
+            agent = await store.get_agent(created["agentId"])
+            assert agent is not None
+            await store.save_agent(agent.model_copy(update={"config": {}}))
+            await store.save_agent_file(
+                AgentFileRecord(
+                    agent_id=agent.id,
+                    user_id=agent.user_id,
+                    filename="agent.json",
+                    data=b'{"model":"fixture/model-1","maxToolIterations":4}',
+                )
+            )
+            await store.save_agent_file(
+                AgentFileRecord(
+                    agent_id=agent.id,
+                    user_id=agent.user_id,
+                    filename="SOUL.md",
+                    data=b"You are the imported analyst.",
+                )
+            )
+            await store.save_agent_file(
+                AgentFileRecord(
+                    agent_id=agent.id,
+                    user_id=agent.user_id,
+                    filename="IDENTITY.md",
+                    data=b"Name: Imported Analyst",
+                )
+            )
         await login(client)
         provider_list = await client.get("/api/providers", params={"scope": "user"})
         provider_id = provider_list.json()["providers"][0]["id"]
@@ -204,6 +237,9 @@ async def test_chat_stream_and_history_use_configured_provider(tmp_path: Path) -
         assert tested.json() == {"ok": True}
         assert stored_test.json() == {"ok": True}
         assert response.status_code == 200
+        assert len(imported_prompts) == 1
+        assert "You are the imported analyst." in imported_prompts[0]
+        assert "Name: Imported Analyst" in imported_prompts[0]
         events = [
             json.loads(line.removeprefix("data: "))
             for line in response.text.splitlines()
@@ -217,5 +253,6 @@ async def test_chat_stream_and_history_use_configured_provider(tmp_path: Path) -
         ]
         assert events[-1]["data"]["seq"] == 3
         messages = history.json()["history"]
-        assert [message["role"] for message in messages] == ["user", "assistant"]
+        assert [message["role"] for message in messages] == ["system", "user", "assistant"]
+        assert "You are the imported analyst." in messages[0]["content"]
         assert messages[-1]["content"] == "hello world"

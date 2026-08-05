@@ -150,10 +150,11 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                 if auth is not None
                 else ()
             )
+        resolved_agents = [(await service.agent_runtime_profile(agent)).agent for agent in agents]
         provider: dict[str, Any] | None = None
-        if auth is not None and agents:
+        if auth is not None and resolved_agents:
             try:
-                selected = await service.provider_selection(auth, agents[0])
+                selected = await service.provider_selection(auth, resolved_agents[0])
             except HTTPException:
                 selected = None
             if selected is not None:
@@ -169,7 +170,7 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             "port": gateway.settings.port,
             "mode": "self-hosted",
             "uptime": str(datetime.now(UTC) - service.started_at).split(".", 1)[0],
-            "agents": [_agent_json(agent) for agent in agents],
+            "agents": [_agent_json(agent) for agent in resolved_agents],
             "channels": [],
             "provider": provider,
         }
@@ -304,7 +305,8 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         async with UnitOfWork(gateway.database) as unit:
             agents = await unit.require_store().list_agents(auth.identity.effective_user_id)
         visible = [agent for agent in agents if auth.identity.can_access_agent(agent.id)]
-        return {"agents": [_agent_json(agent) for agent in visible]}
+        resolved = [(await service.agent_runtime_profile(agent)).agent for agent in visible]
+        return {"agents": [_agent_json(agent) for agent in resolved]}
 
     @router.post("/api/agents", status_code=status.HTTP_201_CREATED)
     async def create_agent(
@@ -327,7 +329,8 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
 
     @router.get("/api/agents/{agent_id}")
     async def get_agent(agent_id: str, auth: AuthContext = auth_dependency) -> dict[str, Any]:
-        return {"agent": _agent_json(await service.require_agent(auth, agent_id))}
+        agent = await service.require_agent(auth, agent_id)
+        return {"agent": _agent_json((await service.agent_runtime_profile(agent)).agent)}
 
     async def require_owned_api_key(auth: AuthContext, api_key_id: str) -> APIKeyRecord:
         if auth.identity.auth_method == "apikey" or auth.identity.read_only:
@@ -661,6 +664,8 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         auth: AuthContext, agent_id: str, session_id: str, requested_model: str = ""
     ) -> tuple[Any, AgentRunner, AgentRunRequest, ExecutionContext]:
         agent = await service.require_agent(auth, agent_id)
+        profile = await service.agent_runtime_profile(agent)
+        agent = profile.agent
         selection = await service.provider_selection(auth, agent, requested_model)
         provider = await service.create_provider(selection)
         runner = AgentRunner(
@@ -671,7 +676,7 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         request = AgentRunRequest(
             model=selection.model,
             message="",
-            system_prompt=str(agent.config.get("soul") or ""),
+            system_prompt=profile.system_prompt or str(agent.config.get("soul") or ""),
             max_rounds=int(agent.config.get("maxToolIterations") or 8),
         )
         context = ExecutionContext(
