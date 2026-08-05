@@ -14,7 +14,8 @@ The initial runtime provides:
 - Pydantic v2 response models; and
 - SQLAlchemy 2 async repositories with Alembic migrations;
 - isolated, read-only Go SQLite import;
-- a cancellable single-agent ReAct loop with policy-scoped tools and SSE v2 events; and
+- a cancellable single-agent ReAct loop with policy-scoped tools and SSE v2 events;
+- a bounded, tenant-safe in-process MessageBus/TaskQueue for multi-Agent delegation; and
 - pytest, Ruff, mypy, and GitHub Actions checks.
 
 ## Development
@@ -127,6 +128,21 @@ without a shell, and bounded HTTP(S) fetches. Tool policy denials, malformed
 arguments, timeouts, and exceptions are returned as visible tool results.
 
 See [the phase 3 migration record](docs/migration/phase-3-single-agent.md).
+
+## Multi-Agent orchestration
+
+`fastclaw.orchestration.InProcessMessageBus` routes correlated delegation
+requests through a bounded `AsyncTaskQueue`. Work is FIFO per target Agent,
+parallel across targets up to the configured global limit, and deduplicated by
+exact target/task within one root execution. Nested delegation inherits its
+root execution slot, so `max_concurrent=1` cannot deadlock.
+
+Tenant ownership, call-path and wait-graph cycles, backpressure, cancellation,
+and shutdown completion are enforced before results reach an Agent. The
+`spawn_subagent` tool accepts only target and task arguments; tenant identity is
+always taken from the trusted execution context.
+
+See [the phase 4 migration record](docs/migration/phase-4-multi-agent.md).
 
 ## License
 
