@@ -742,6 +742,10 @@ def _config_scope(row: Mapping[str, Any]) -> tuple[str, str]:
 
 def _json_object(value: Any) -> dict[str, Any]:
     parsed = _json(value)
+    # Go's nil map is serialized as JSON null. Treat it as the empty
+    # configuration it represents instead of rejecting otherwise valid rows.
+    if parsed is None:
+        return {}
     if not isinstance(parsed, dict):
         raise ValueError("expected a JSON object")
     return parsed

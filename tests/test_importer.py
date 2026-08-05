@@ -211,6 +211,29 @@ async def test_import_rejects_shared_source_and_target(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_import_treats_go_nil_agent_config_as_empty_object(tmp_path: Path) -> None:
+    source = tmp_path / "nil-config.db"
+    target_url = f"sqlite+aiosqlite:///{tmp_path / 'target.db'}"
+    _create_go_fixture(source)
+    connection = sqlite3.connect(source)
+    connection.execute("UPDATE agents SET config = 'null' WHERE id = 'agent-1'")
+    connection.commit()
+    connection.close()
+
+    report = await import_go_database(source=source, target_url=target_url)
+
+    assert report.source_counts["agents"] == 1
+    database = Database(target_url)
+    try:
+        async with UnitOfWork(database) as unit:
+            agent = await unit.require_store().get_agent("agent-1")
+            assert agent is not None
+            assert agent.config == {}
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_imports_locked_go_fixture_with_credentials_acl_and_replay(tmp_path: Path) -> None:
     source = tmp_path / "go.db"
     source.write_bytes((GO_FIXTURE_ROOT / "fastclaw-go.db").read_bytes())
