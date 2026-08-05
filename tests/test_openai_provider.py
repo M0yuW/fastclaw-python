@@ -113,6 +113,65 @@ async def test_openai_chat_uses_one_stream_and_accumulates_response() -> None:
     assert response.usage.cache_read_tokens == 8
 
 
+async def test_openai_preserves_reasoning_content_for_replay() -> None:
+    requests: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=sse(
+                {
+                    "choices": [
+                        {
+                            "delta": {"reasoning_content": "private chain", "content": "answer"},
+                            "finish_reason": "stop",
+                        }
+                    ]
+                },
+                "[DONE]",
+            ),
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = OpenAIProvider(name="deepseek", api_key="secret", api_base="https://llm/v1")
+    await provider.start(client)
+    try:
+        first = await provider.chat(
+            ChatRequest(
+                model="deepseek/model",
+                messages=(ChatMessage(role=MessageRole.USER, content="first"),),
+            )
+        )
+        await provider.chat(
+            ChatRequest(
+                model="deepseek/model",
+                messages=(
+                    ChatMessage(
+                        role=MessageRole.ASSISTANT,
+                        content=first.content,
+                        raw_assistant=first.raw_assistant,
+                    ),
+                    ChatMessage(role=MessageRole.USER, content="continue"),
+                ),
+            )
+        )
+    finally:
+        await provider.stop()
+        await client.aclose()
+
+    assert first.thinking == "private chain"
+    assert first.raw_assistant == {
+        "role": "assistant",
+        "content": "answer",
+        "reasoning_content": "private chain",
+    }
+    replayed = requests[1]["messages"][0]  # type: ignore[index]
+    assert replayed == first.raw_assistant
+    assert "thinking" not in replayed
+
+
 async def test_openai_rejects_use_before_start_and_http_errors() -> None:
     provider = OpenAIProvider(name="openai", api_key="secret")
     request = ChatRequest(
