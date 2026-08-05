@@ -37,14 +37,41 @@ mypy
 pytest
 ```
 
-Start the development server:
+Build the attributed Web snapshot and start the development server on the
+Python migration port:
 
 ```bash
-uvicorn fastclaw.app:app --reload
+cd web
+pnpm install --frozen-lockfile
+pnpm build
+cd ..
+
+mkdir -p ~/.fastclaw-python
+FASTCLAW_DATABASE_URL="sqlite+aiosqlite:///$HOME/.fastclaw-python/fastclaw.db" \
+FASTCLAW_PORT=18954 \
+uvicorn fastclaw.app:app --host 127.0.0.1 --port 18954
 ```
 
-Then inspect `http://127.0.0.1:8000/healthz` and
-`http://127.0.0.1:8000/readyz`.
+Open `http://127.0.0.1:18954/`. On a new database the Web UI redirects to
+`/onboard/`, where the first administrator, Provider, default model, and Agent
+are created atomically. Health and readiness probes remain available at
+`/healthz` and `/readyz`.
+
+The same Provider can instead be supplied by environment variables:
+
+```bash
+FASTCLAW_PROVIDER_NAME=openai \
+FASTCLAW_PROVIDER_API_BASE=https://api.openai.com/v1 \
+FASTCLAW_PROVIDER_API_KEY=... \
+FASTCLAW_DEFAULT_MODEL=openai/gpt-5.5 \
+uvicorn fastclaw.app:app --host 127.0.0.1 --port 18954
+```
+
+Cookie sessions are used by the Web UI. Programmatic clients can use a
+SHA-256-backed `Bearer fc_...` API key created under `/apikeys`; agent-type keys
+can access only their explicit Agent ACL. Provider secrets are masked by all
+read APIs and are only accepted on create/update or through the process
+environment.
 
 ## Implementing a provider
 

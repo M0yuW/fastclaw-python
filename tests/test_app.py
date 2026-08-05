@@ -1,13 +1,16 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI
 
 from fastclaw.app import create_app
+from fastclaw.gateway import GatewaySettings
 from fastclaw.providers import ChatRequest, ChatResponse, ProviderEvent, ProviderEventType
 from fastclaw.providers.stream import ProviderStream
 from fastclaw.runtime import Runtime, RuntimeState
+from fastclaw.storage import Database
 
 
 class ProbeProvider:
@@ -44,9 +47,14 @@ async def app_client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
             yield client
 
 
-async def test_healthz_and_readyz_when_runtime_is_ready() -> None:
+def gateway_settings(path: Path) -> GatewaySettings:
+    return GatewaySettings(database_url=f"sqlite+aiosqlite:///{path}")
+
+
+async def test_healthz_and_readyz_when_runtime_is_ready(tmp_path: Path) -> None:
     runtime = Runtime((ProbeProvider(ready=True),))
-    app = create_app(runtime)
+    settings = gateway_settings(tmp_path / "ready.db")
+    app = create_app(runtime, settings=settings, database=Database(settings.database_url))
 
     async with app_client(app) as client:
         health = await client.get("/healthz")
@@ -63,8 +71,13 @@ async def test_healthz_and_readyz_when_runtime_is_ready() -> None:
     assert runtime.state is RuntimeState.STOPPED
 
 
-async def test_readyz_returns_503_when_a_provider_is_not_ready() -> None:
-    app = create_app(Runtime((ProbeProvider(ready=False),)))
+async def test_readyz_returns_503_when_a_provider_is_not_ready(tmp_path: Path) -> None:
+    settings = gateway_settings(tmp_path / "not-ready.db")
+    app = create_app(
+        Runtime((ProbeProvider(ready=False),)),
+        settings=settings,
+        database=Database(settings.database_url),
+    )
 
     async with app_client(app) as client:
         response = await client.get("/readyz")
