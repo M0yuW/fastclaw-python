@@ -202,6 +202,9 @@ def _web_event(event: AgentEvent) -> dict[str, Any]:
         )
     elif event.type is AgentEventType.TOOL_RESULT:
         data["result"] = event.tool_result
+        if event.tool_call is not None:
+            data["id"] = event.tool_call.id
+            data["name"] = event.tool_call.function.name
     elif event.type is AgentEventType.ERROR:
         data["message"] = event.error
     return {"version": 2, "type": event.type.value, "data": data}

@@ -70,7 +70,15 @@ async def test_differential_validates_sse_order_and_tool_pairing() -> None:
         {
             "version": 2,
             "type": "tool_result",
-            "data": {"turnId": "t", "messageId": "m", "round": 0, "seq": 1, "result": "ok"},
+            "data": {
+                "turnId": "t",
+                "messageId": "m",
+                "round": 0,
+                "seq": 1,
+                "id": "c",
+                "name": "echo",
+                "result": "ok",
+            },
         },
         {
             "version": 2,
@@ -110,7 +118,7 @@ def test_differential_rejects_missing_tool_result_and_contract_drift() -> None:
             ]
         )
     )
-    with pytest.raises(DifferentialMismatch, match="counts differ"):
+    with pytest.raises(DifferentialMismatch, match="no matching ToolResult"):
         validate_sse(incomplete)
 
     with pytest.raises(DifferentialMismatch, match="non-terminal"):

@@ -9,9 +9,12 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI
 
+from fastclaw.agent import AgentEvent, AgentEventType
 from fastclaw.app import create_app
 from fastclaw.gateway import GatewaySettings
+from fastclaw.gateway.router import _web_event
 from fastclaw.identity import hash_api_key, hash_password
+from fastclaw.providers import FunctionCall, ToolCall
 from fastclaw.runtime import Runtime
 from fastclaw.storage import (
     AgentFileRecord,
@@ -80,6 +83,25 @@ async def login(client: httpx.AsyncClient) -> None:
     assert response.status_code == 200
     assert "password_hash" not in response.json()["user"]
     assert client.cookies.get("fastclaw_session")
+
+
+def test_sse_tool_result_preserves_call_identity_for_pairing() -> None:
+    call = ToolCall(id="call-1", function=FunctionCall(name="read_file", arguments="{}"))
+    payload = _web_event(
+        AgentEvent(
+            type=AgentEventType.TOOL_RESULT,
+            turn_id="turn-1",
+            message_id="message-1",
+            round=0,
+            seq=1,
+            tool_call=call,
+            tool_result="content",
+        )
+    )
+
+    assert payload["data"]["id"] == "call-1"
+    assert payload["data"]["name"] == "read_file"
+    assert payload["data"]["result"] == "content"
 
 
 async def test_onboard_cookie_auth_status_agents_and_masked_provider(tmp_path: Path) -> None:

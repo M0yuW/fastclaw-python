@@ -80,8 +80,7 @@ def validate_sse(events: tuple[dict[str, Any], ...]) -> None:
     if not events or events[-1].get("type") != "done":
         raise DifferentialMismatch("SSE stream has no terminal done event")
     previous_seq = -1
-    tool_calls = 0
-    tool_results = 0
+    pending_tool_calls: set[str] = set()
     for event in events:
         data = event.get("data")
         if not isinstance(data, dict):
@@ -91,15 +90,19 @@ def validate_sse(events: tuple[dict[str, Any], ...]) -> None:
             raise DifferentialMismatch("SSE seq must be strictly increasing")
         previous_seq = seq
         if event.get("type") == "tool_call":
-            tool_calls += 1
-            if not data.get("id") or not data.get("name"):
+            call_id = str(data.get("id") or "")
+            if not call_id or not data.get("name"):
                 raise DifferentialMismatch("tool_call has no stable id or name")
+            if call_id in pending_tool_calls:
+                raise DifferentialMismatch("tool_call id is duplicated")
+            pending_tool_calls.add(call_id)
         elif event.get("type") == "tool_result":
-            tool_results += 1
-            if tool_results > tool_calls:
-                raise DifferentialMismatch("tool_result appears before its tool_call")
-    if tool_results != tool_calls:
-        raise DifferentialMismatch("ToolCall and ToolResult counts differ")
+            call_id = str(data.get("id") or "")
+            if call_id not in pending_tool_calls:
+                raise DifferentialMismatch("tool_result has no matching tool_call")
+            pending_tool_calls.remove(call_id)
+    if pending_tool_calls:
+        raise DifferentialMismatch("ToolCall has no matching ToolResult")
 
 
 def require_terminal_tasks(payload: Any) -> None:
