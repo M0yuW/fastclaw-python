@@ -15,6 +15,7 @@ class ToolResult(BaseModel):
 
     content: str
     is_error: bool = False
+    direct_return: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

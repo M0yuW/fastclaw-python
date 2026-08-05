@@ -67,6 +67,12 @@ async def test_healthz_and_readyz_when_runtime_is_ready(tmp_path: Path) -> None:
         "status": "ready",
         "state": "running",
         "providers": {"probe": True},
+        "checks": {
+            "database": True,
+            "agent_manager": True,
+            "providers": True,
+            "skills": True,
+        },
     }
     assert runtime.state is RuntimeState.STOPPED
 
@@ -87,4 +93,21 @@ async def test_readyz_returns_503_when_a_provider_is_not_ready(tmp_path: Path) -
         "status": "not_ready",
         "state": "running",
         "providers": {"probe": False},
+        "checks": {
+            "database": True,
+            "agent_manager": True,
+            "providers": False,
+            "skills": True,
+        },
     }
+
+
+async def test_readyz_rejects_running_runtime_without_any_usable_provider(tmp_path: Path) -> None:
+    settings = gateway_settings(tmp_path / "empty-provider.db")
+    app = create_app(Runtime(), settings=settings, database=Database(settings.database_url))
+
+    async with app_client(app) as client:
+        response = await client.get("/readyz")
+
+    assert response.status_code == 503
+    assert response.json()["checks"]["providers"] is False

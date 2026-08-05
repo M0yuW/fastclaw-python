@@ -10,6 +10,7 @@ from pathlib import Path
 @dataclass(frozen=True, slots=True)
 class GatewaySettings:
     database_url: str
+    data_root: Path = Path.home() / ".fastclaw-python"
     port: int = 18954
     session_ttl_seconds: int = 60 * 60 * 24 * 30
     secure_cookies: bool = False
@@ -30,6 +31,9 @@ class GatewaySettings:
             database_url=os.environ.get(
                 "FASTCLAW_DATABASE_URL", f"sqlite+aiosqlite:///{default_db}"
             ),
+            data_root=Path(
+                os.environ.get("FASTCLAW_DATA_ROOT", str(Path.home() / ".fastclaw-python"))
+            ).expanduser(),
             port=int(os.environ.get("FASTCLAW_PORT", "18954")),
             session_ttl_seconds=int(
                 os.environ.get("FASTCLAW_SESSION_TTL_SECONDS", str(60 * 60 * 24 * 30))

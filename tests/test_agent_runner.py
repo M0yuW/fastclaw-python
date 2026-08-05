@@ -215,6 +215,34 @@ class SlowTool(EchoTool):
         raise AssertionError("sleep_forever returned")
 
 
+class DirectReturnTool(EchoTool):
+    async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
+        del arguments, context
+        return ToolResult(content="authoritative report", direct_return=True)
+
+
+@pytest.mark.asyncio
+async def test_direct_return_finishes_without_a_second_model_request() -> None:
+    provider = ScriptedProvider([tool_round()])
+    persistence = StubPersistence()
+    stream = AgentRunner(provider, ToolRegistry([DirectReturnTool()]), persistence).stream(
+        AgentRunRequest(model="fixture", message="report"),
+        run_context(),
+    )
+
+    events = [event async for event in stream]
+
+    assert stream.result().content == "authoritative report"
+    assert len(provider.requests) == 1
+    assert [event.type for event in events] == [
+        AgentEventType.TOOL_CALL,
+        AgentEventType.TOOL_RESULT,
+        AgentEventType.CONTENT,
+        AgentEventType.DONE,
+    ]
+    assert persistence.saved[0].messages[-1]["content"] == "authoritative report"
+
+
 @pytest.mark.asyncio
 async def test_tool_exceptions_are_visible_to_model_and_event_stream() -> None:
     provider = ScriptedProvider([tool_round(), final_round()])
@@ -232,9 +260,10 @@ async def test_tool_exceptions_are_visible_to_model_and_event_stream() -> None:
 
     tool_result = next(event for event in events if event.type is AgentEventType.TOOL_RESULT)
     assert tool_result.is_error
-    assert "OSError: fixture failure" in tool_result.tool_result
+    assert "tool 'echo' failed (reference " in tool_result.tool_result
     second_request_tool = provider.requests[1].messages[-1]
-    assert "OSError: fixture failure" in str(second_request_tool.content)
+    assert "tool 'echo' failed (reference " in str(second_request_tool.content)
+    assert "fixture failure" not in str(second_request_tool.content)
 
 
 @pytest.mark.asyncio

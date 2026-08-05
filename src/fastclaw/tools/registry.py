@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from typing import Any
+from uuid import uuid4
 
 import anyio
 
 from fastclaw.execution import ExecutionContext
 from fastclaw.providers import ToolDefinition
 from fastclaw.tools.base import Tool, ToolResult
+
+logger = logging.getLogger(__name__)
 
 
 class ToolRegistry:
@@ -50,8 +54,11 @@ class ToolRegistry:
                 return await tool.execute(arguments, context)
         except TimeoutError:
             return ToolResult(content=f"tool {name!r} timed out", is_error=True)
-        except Exception as exc:
+        except Exception:
+            correlation_id = str(uuid4())
+            logger.exception("tool %s failed (correlation_id=%s)", name, correlation_id)
             return ToolResult(
-                content=f"tool {name!r} failed: {type(exc).__name__}: {exc}",
+                content=f"tool {name!r} failed (reference {correlation_id})",
                 is_error=True,
+                metadata={"correlationId": correlation_id},
             )

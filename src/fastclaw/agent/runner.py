@@ -176,6 +176,9 @@ class AgentRunner:
                             )
                             result_content = result.content
                             is_error = result.is_error
+                            direct_return = result.direct_return
+                        if parse_error:
+                            direct_return = False
                         history.append(
                             ChatMessage(
                                 role=MessageRole.TOOL,
@@ -190,6 +193,22 @@ class AgentRunner:
                             tool_result=result_content,
                             is_error=is_error,
                         )
+                        if direct_return and not is_error:
+                            final = ChatMessage(
+                                role=MessageRole.ASSISTANT,
+                                content=result_content,
+                            )
+                            history.append(final)
+                            await self._persistence.save(
+                                self._session_record(request, context, history, stored)
+                            )
+                            yield event(
+                                AgentEventType.CONTENT,
+                                content=result_content,
+                                message=final,
+                            )
+                            yield event(AgentEventType.DONE, message=final)
+                            return
 
             raise AgentRunError(f"agent exceeded {request.max_rounds} rounds")
         except AgentRunError as exc:

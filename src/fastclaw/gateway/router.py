@@ -13,9 +13,8 @@ from uuid import uuid4
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from fastclaw.agent import AgentEvent, AgentEventType, AgentRunner, AgentRunRequest
-from fastclaw.agent.persistence import DatabaseSessionPersistence
-from fastclaw.execution import ExecutionContext
+from fastclaw.agent import AgentEvent, AgentEventType
+from fastclaw.agent.manager import AgentRuntimeManager
 from fastclaw.gateway.models import (
     AgentCreate,
     APIKeyAgents,
@@ -47,7 +46,6 @@ from fastclaw.storage import (
     UnitOfWork,
     UserRecord,
 )
-from fastclaw.tools import ToolRegistry
 
 
 class Gateway:
@@ -56,10 +54,12 @@ class Gateway:
         settings: GatewaySettings,
         database: Database,
         runtime: Runtime,
+        agent_manager: AgentRuntimeManager,
     ) -> None:
         self.settings = settings
         self.database = database
-        self.service = GatewayService(settings, database, runtime)
+        self.agent_manager = agent_manager
+        self.service = GatewayService(settings, database, runtime, agent_manager)
 
 
 def _agent_json(agent: AgentRecord) -> dict[str, Any]:
@@ -660,33 +660,6 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             "hooks": {"enabled": False},
         }
 
-    async def prepare_runner(
-        auth: AuthContext, agent_id: str, session_id: str, requested_model: str = ""
-    ) -> tuple[Any, AgentRunner, AgentRunRequest, ExecutionContext]:
-        agent = await service.require_agent(auth, agent_id)
-        profile = await service.agent_runtime_profile(agent)
-        agent = profile.agent
-        selection = await service.provider_selection(auth, agent, requested_model)
-        provider = await service.create_provider(selection)
-        runner = AgentRunner(
-            provider,
-            ToolRegistry(),
-            DatabaseSessionPersistence(gateway.database),
-        )
-        request = AgentRunRequest(
-            model=selection.model,
-            message="",
-            system_prompt=profile.system_prompt or str(agent.config.get("soul") or ""),
-            max_rounds=int(agent.config.get("maxToolIterations") or 8),
-        )
-        context = ExecutionContext(
-            user_id=auth.identity.effective_user_id,
-            agent_id=agent.id,
-            session_id=session_id,
-            root_execution_id=f"run_{uuid4().hex}",
-        )
-        return provider, runner, request, context
-
     @router.get("/api/chat/history")
     async def chat_history(
         agentId: str,
@@ -729,35 +702,33 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
 
     @router.post("/api/chat")
     async def chat(payload: ChatInput, auth: AuthContext = auth_dependency) -> dict[str, str]:
-        provider, runner, template, context = await prepare_runner(
-            auth, payload.agent_id, payload.session_id
+        await service.require_agent(auth, payload.agent_id)
+        message = await gateway.agent_manager.chat(
+            user_id=auth.identity.effective_user_id,
+            agent_id=payload.agent_id,
+            session_id=payload.session_id,
+            message=payload.message,
         )
-        try:
-            message = await runner.chat(
-                template.model_copy(update={"message": payload.message}), context
-            )
-            return {"response": str(message.content or "")}
-        finally:
-            await provider.stop()
+        return {"response": str(message.content or "")}
 
     @router.post("/api/chat/stream")
     async def chat_stream(
         payload: ChatInput, auth: AuthContext = auth_dependency
     ) -> StreamingResponse:
-        provider, runner, template, context = await prepare_runner(
-            auth, payload.agent_id, payload.session_id
+        await service.require_agent(auth, payload.agent_id)
+        stream = await gateway.agent_manager.stream(
+            user_id=auth.identity.effective_user_id,
+            agent_id=payload.agent_id,
+            session_id=payload.session_id,
+            message=payload.message,
         )
 
         async def events() -> AsyncIterator[str]:
-            stream = runner.stream(
-                template.model_copy(update={"message": payload.message}), context
-            )
             try:
                 async for event in stream:
                     yield _sse(_web_event(event))
             finally:
                 await stream.aclose()
-                await provider.stop()
 
         return StreamingResponse(events(), media_type="text/event-stream")
 
@@ -787,14 +758,18 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         if not agent_id:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
         session_id = request.headers.get("x-fastclaw-session-key") or f"api-{uuid4().hex}"
-        provider, runner, template, context = await prepare_runner(
-            auth, agent_id, session_id, payload.model
+        await service.require_agent(auth, agent_id)
+        stream = await gateway.agent_manager.stream(
+            user_id=auth.identity.effective_user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            message=message,
+            requested_model=payload.model,
         )
         completion_id = f"chatcmpl-{uuid4().hex}"
         if payload.stream:
 
             async def chunks() -> AsyncIterator[str]:
-                stream = runner.stream(template.model_copy(update={"message": message}), context)
                 try:
                     async for event in stream:
                         if event.type is AgentEventType.CONTENT_DELTA:
@@ -803,7 +778,7 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                                     "id": completion_id,
                                     "object": "chat.completion.chunk",
                                     "created": int(time.time()),
-                                    "model": template.model,
+                                    "model": stream.model,
                                     "choices": [
                                         {
                                             "index": 0,
@@ -816,19 +791,20 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                     yield "data: [DONE]\n\n"
                 finally:
                     await stream.aclose()
-                    await provider.stop()
 
             return StreamingResponse(chunks(), media_type="text/event-stream")
         try:
-            result = await runner.chat(template.model_copy(update={"message": message}), context)
+            async for _ in stream:
+                pass
+            result = stream.result()
         finally:
-            await provider.stop()
+            await stream.aclose()
         return JSONResponse(
             {
                 "id": completion_id,
                 "object": "chat.completion",
                 "created": int(time.time()),
-                "model": template.model,
+                "model": stream.model,
                 "choices": [
                     {
                         "index": 0,

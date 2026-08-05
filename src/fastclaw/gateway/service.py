@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import secrets
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -11,12 +10,13 @@ from typing import Any
 
 from fastapi import HTTPException, Request, status
 
+from fastclaw.agent.manager import AgentRuntimeManager, AgentRuntimeProfile
 from fastclaw.gateway.models import ProviderSelection
 from fastclaw.gateway.settings import GatewaySettings
 from fastclaw.identity import Identity, hash_api_key, verify_password
 from fastclaw.providers import Provider, create_provider
 from fastclaw.runtime import Runtime
-from fastclaw.storage import AgentRecord, ConfigRecord, Database, UnitOfWork, UserRecord
+from fastclaw.storage import AgentRecord, Database, UnitOfWork, UserRecord
 from fastclaw.storage.records import WebSessionRecord
 
 SESSION_COOKIE = "fastclaw_session"
@@ -40,17 +40,18 @@ class AuthContext:
     user: UserRecord
 
 
-@dataclass(frozen=True, slots=True)
-class AgentRuntimeProfile:
-    agent: AgentRecord
-    system_prompt: str
-
-
 class GatewayService:
-    def __init__(self, settings: GatewaySettings, database: Database, runtime: Runtime) -> None:
+    def __init__(
+        self,
+        settings: GatewaySettings,
+        database: Database,
+        runtime: Runtime,
+        agent_manager: AgentRuntimeManager,
+    ) -> None:
         self.settings = settings
         self.database = database
         self.runtime = runtime
+        self.agent_manager = agent_manager
         self.started_at = datetime.now(UTC)
         self.onboard_lock = asyncio.Lock()
 
@@ -134,107 +135,27 @@ class GatewayService:
         return agent
 
     async def agent_runtime_profile(self, agent: AgentRecord) -> AgentRuntimeProfile:
-        """Resolve Go-compatible agent.json and identity files from the database."""
-        async with UnitOfWork(self.database) as unit:
-            records = await unit.require_store().list_agent_files(agent.id, agent.user_id)
-        files = {record.filename: record.data for record in records}
-
-        file_config: dict[str, Any] = {}
-        raw_config = files.get("agent.json")
-        if raw_config:
-            try:
-                parsed = json.loads(raw_config)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                parsed = None
-            if isinstance(parsed, dict):
-                file_config = parsed
-
-        # Explicit database config remains authoritative. Imported Go agents often
-        # keep these settings in agent.json while their agents.config value is null.
-        effective_config = {**file_config, **agent.config}
-        prompt_parts: list[str] = []
-        for filename in ("SOUL.md", "IDENTITY.md", "USER.md", "MEMORY.md"):
-            raw = files.get(filename)
-            if not raw:
-                continue
-            try:
-                content = raw.decode("utf-8").strip()
-            except UnicodeDecodeError:
-                continue
-            if content:
-                prompt_parts.append(f"## {filename}\n\n{content}")
-
-        configured_soul = str(effective_config.get("soul") or "").strip()
-        if configured_soul and "SOUL.md" not in files:
-            prompt_parts.insert(0, f"## SOUL.md\n\n{configured_soul}")
-        elif not configured_soul and files.get("SOUL.md"):
-            try:
-                effective_config["soul"] = files["SOUL.md"].decode("utf-8")
-            except UnicodeDecodeError:
-                pass
-
-        return AgentRuntimeProfile(
-            agent=agent.model_copy(update={"config": effective_config}),
-            system_prompt="\n\n".join(prompt_parts),
-        )
+        """Resolve the same profile used by live Agent execution."""
+        return await self.agent_manager.ensure_profile(agent)
 
     async def provider_selection(
         self, auth: AuthContext, agent: AgentRecord, requested_model: str = ""
     ) -> ProviderSelection:
-        model = requested_model or str(agent.config.get("model") or self.settings.default_model)
-        provider_name = model.split("/", 1)[0] if "/" in model else self.settings.provider_name
-        async with UnitOfWork(self.database) as unit:
-            store = unit.require_store()
-            layers = [
-                await store.list_configs(kind="provider", user_id="", agent_id=""),
-                await store.list_configs(
-                    kind="provider", user_id=auth.identity.effective_user_id, agent_id=""
-                ),
-                await store.list_configs(
-                    kind="provider",
-                    user_id=auth.identity.effective_user_id,
-                    agent_id=agent.id,
-                ),
-            ]
-        configs: dict[str, ConfigRecord] = {}
-        for layer in layers:
-            configs.update({item.name: item for item in layer if item.enabled})
-        selected = configs.get(provider_name)
-        if selected is not None:
-            data = selected.data
-            api_key = str(data.get("apiKey") or "")
-            api_base = str(data.get("apiBase") or "")
-            api_type = str(data.get("apiType") or "openai-compatible")
-            configured_model = str(data.get("model") or "")
-            model = model or configured_model
-            if api_key and api_base and model:
-                return ProviderSelection(
-                    name=selected.name,
-                    api_key=api_key,
-                    api_base=api_base,
-                    api_type=api_type,
-                    model=model,
-                    source=selected.scope,
-                    config_id=selected.id,
-                )
-        if (
-            self.settings.provider_name
-            and self.settings.provider_api_key
-            and self.settings.provider_api_base
-            and model
-            and (not provider_name or provider_name == self.settings.provider_name)
-        ):
-            return ProviderSelection(
-                name=self.settings.provider_name,
-                api_key=self.settings.provider_api_key,
-                api_base=self.settings.provider_api_base,
-                api_type=self.settings.provider_api_type,
-                model=model,
-                source="environment",
-            )
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "no usable provider is configured for this agent",
+        if agent.user_id != auth.identity.effective_user_id:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found")
+        profile = await self.agent_manager.ensure_profile(agent)
+        try:
+            selected = await self.agent_manager.provider_selection(profile, requested_model)
+        except RuntimeError as exc:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+        return ProviderSelection(
+            name=selected.name,
+            api_key=selected.api_key,
+            api_base=selected.api_base,
+            api_type=selected.api_type,
+            model=selected.model,
+            source=selected.source,
+            config_id=selected.config_id,
         )
 
     async def create_provider(self, selection: ProviderSelection) -> Provider:
