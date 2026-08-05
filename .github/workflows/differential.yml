@@ -1,0 +1,45 @@
+name: Go to Python differential smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      go-base:
+        description: Independent Go Runtime URL
+        required: true
+        default: http://127.0.0.1:18953
+      python-base:
+        description: Independent Python Runtime URL
+        required: true
+        default: http://127.0.0.1:18954
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    # The operator-owned runner holds two separately configured Runtime data
+    # roots. Hosted runners must never create a shared SQLite shortcut.
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install differential client
+        run: python -m pip install -e .
+      - name: Compare locked fixtures
+        env:
+          FASTCLAW_DIFFERENTIAL_GO_TOKEN: ${{ secrets.FASTCLAW_DIFFERENTIAL_GO_TOKEN }}
+          FASTCLAW_DIFFERENTIAL_PYTHON_TOKEN: ${{ secrets.FASTCLAW_DIFFERENTIAL_PYTHON_TOKEN }}
+        run: >-
+          python scripts/differential_smoke.py
+          --go-base '${{ inputs['go-base'] }}'
+          --python-base '${{ inputs['python-base'] }}'
+          --output differential-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: differential-report
+          path: differential-report.json
+          if-no-files-found: warn

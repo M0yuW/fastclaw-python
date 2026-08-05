@@ -207,6 +207,13 @@ under `~/.fastclaw-python/data`.
 
 See [the plugin and finance migration record](docs/migration/phase-8-plugins-finance.md).
 
+## Release image and differential smoke
+
+`Dockerfile` produces a non-root Linux image with a read-only application
+layer and `/data` as the only persistent volume. The manual differential
+workflow compares independent Go 18953 and Python 18954 instances without ever
+sharing SQLite. See [the release and cutover record](docs/migration/phase-9-release-cutover.md).
+
 ## License
 
 See [LICENSE](LICENSE).

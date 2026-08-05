@@ -19,6 +19,7 @@ from fastclaw.orchestration.queue import (
     QueueShutdownError,
     TaskQueue,
     TaskResult,
+    TaskSnapshot,
     WaitTicket,
 )
 from fastclaw.orchestration.tool import SpawnSubagentTool
@@ -40,6 +41,7 @@ __all__ = [
     "SpawnSubagentTool",
     "TaskQueue",
     "TaskResult",
+    "TaskSnapshot",
     "UnknownAgentError",
     "WaitTicket",
 ]

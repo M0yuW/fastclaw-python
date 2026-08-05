@@ -1,0 +1,16 @@
+{
+  "source": "M0yuW/fastclaw@m0yuw-project:792417b",
+  "cases": [
+    {
+      "name": "health",
+      "method": "GET",
+      "path": "/healthz",
+      "comparison": "status"
+    },
+    {
+      "name": "agents",
+      "method": "GET",
+      "path": "/v1/agents"
+    }
+  ]
+}

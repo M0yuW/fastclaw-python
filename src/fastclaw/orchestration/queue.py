@@ -6,6 +6,7 @@ import asyncio
 from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Protocol
 
@@ -40,6 +41,18 @@ class JobState(StrEnum):
     FINISHED = "finished"
 
 
+@dataclass(frozen=True, slots=True)
+class TaskSnapshot:
+    id: str
+    agent_id: str
+    chat_key: str
+    status: str
+    created_at: datetime
+    started_at: datetime | None = None
+    done_at: datetime | None = None
+    error: str = ""
+
+
 class TaskQueue(Protocol):
     async def submit(
         self,
@@ -67,6 +80,9 @@ class _Job:
     state: JobState = JobState.QUEUED
     waiters: set[int] = field(default_factory=set)
     execution: asyncio.Task[TaskResult] | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    started_at: datetime | None = None
+    archived: bool = False
 
 
 class WaitTicket:
@@ -105,10 +121,18 @@ class AsyncTaskQueue:
         self._closing = False
         self._next_waiter = 0
         self._next_generation = 0
+        self._history: deque[TaskSnapshot] = deque(maxlen=50)
 
     @property
     def pending_count(self) -> int:
         return len(self._jobs)
+
+    def recent_tasks(self, limit: int = 50) -> tuple[TaskSnapshot, ...]:
+        active = tuple(
+            self._snapshot(job, job.state.value)
+            for job in sorted(self._jobs.values(), key=lambda item: item.generation, reverse=True)
+        )
+        return (*active, *tuple(self._history))[: max(0, min(limit, 50))]
 
     async def submit(
         self,
@@ -170,6 +194,7 @@ class AsyncTaskQueue:
                 if not job.future.done():
                     job.future.cancel()
                 execution = job.execution
+                self._archive_locked(job, "cancelled")
         if execution is not None and not execution.done():
             execution.cancel()
 
@@ -190,6 +215,7 @@ class AsyncTaskQueue:
                     job.future.cancel()
                 if job.execution is not None and not job.execution.done():
                     executions.append(job.execution)
+                self._archive_locked(job, "cancelled")
         for execution in executions:
             execution.cancel()
 
@@ -203,6 +229,7 @@ class AsyncTaskQueue:
                         job.future.set_exception(QueueShutdownError("task queue shut down"))
                     if job.execution is not None and not job.execution.done():
                         job.execution.cancel()
+                    self._archive_locked(job, "cancelled")
                 self._jobs.clear()
             workers = tuple(self._workers.values())
             for worker in workers:
@@ -224,8 +251,10 @@ class AsyncTaskQueue:
                         return
                     job = queue.popleft()
                     if job.state is not JobState.QUEUED:
+                        self._archive_locked(job, "cancelled")
                         continue
                     job.state = JobState.RUNNING
+                    job.started_at = datetime.now(UTC)
                     job.execution = asyncio.create_task(self._execute(job))
                 try:
                     result = await job.execution
@@ -263,10 +292,42 @@ class AsyncTaskQueue:
             if self._jobs.get(job.dedup_key) is job:
                 self._jobs.pop(job.dedup_key, None)
             if job.future.done():
+                self._archive_locked(job, "cancelled" if cancelled else "completed")
                 return
             if cancelled:
                 job.future.cancel()
+                status = "cancelled"
             elif error is not None:
                 job.future.set_exception(error)
+                status = "failed"
             elif result is not None:
                 job.future.set_result(result)
+                status = "completed"
+            else:
+                status = "failed"
+            self._archive_locked(job, status, error="task failed" if error is not None else "")
+
+    def _archive_locked(self, job: _Job, status: str, *, error: str = "") -> None:
+        if job.archived:
+            return
+        job.archived = True
+        self._history.appendleft(self._snapshot(job, status, error=error, done=True))
+
+    @staticmethod
+    def _snapshot(
+        job: _Job,
+        status: str,
+        *,
+        error: str = "",
+        done: bool = False,
+    ) -> TaskSnapshot:
+        return TaskSnapshot(
+            id=f"task-{job.generation}",
+            agent_id=job.target[1],
+            chat_key=job.root_execution_id,
+            status=status,
+            created_at=job.created_at,
+            started_at=job.started_at,
+            done_at=datetime.now(UTC) if done else None,
+            error=error,
+        )

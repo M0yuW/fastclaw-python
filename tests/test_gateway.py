@@ -102,6 +102,8 @@ async def test_onboard_cookie_auth_status_agents_and_masked_provider(tmp_path: P
         me = await client.get("/api/me")
         status = await client.get("/api/status")
         agents = await client.get("/api/agents")
+        v1_agents = await client.get("/v1/agents")
+        tasks = await client.get("/api/tasks")
         providers = await client.get("/api/providers")
         config = await client.get("/api/config")
         created_key = await client.post(
@@ -135,6 +137,16 @@ async def test_onboard_cookie_auth_status_agents_and_masked_provider(tmp_path: P
         assert status.json()["running"] is True
         assert status.json()["provider"]["apiKey"] == "prov****cret"
         assert agents.json()["agents"][0]["id"] == created["agentId"]
+        assert v1_agents.json() == {
+            "agents": [
+                {
+                    "id": created["agentId"],
+                    "name": "Analyst",
+                    "model": "fixture/model-1",
+                }
+            ]
+        }
+        assert tasks.json() == []
         serialized = json.dumps([providers.json(), config.json()])
         assert "provider-secret" not in serialized
         assert created_key.status_code == 201

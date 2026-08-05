@@ -31,6 +31,7 @@ from fastclaw.orchestration import (
     InProcessMessageBus,
     SpawnSubagentTool,
     TaskResult,
+    TaskSnapshot,
     WaitTicket,
 )
 from fastclaw.plugin import PluginManager
@@ -245,7 +246,9 @@ class AgentRuntimeManager:
         self._tool_factory = tool_factory
         self._profiles: dict[str, AgentRuntimeProfile] = {}
         self.skill_catalog = SkillCatalog(config.data_root / "skills")
-        bundled_plugins = Path(__file__).resolve().parents[3] / "plugins"
+        package_plugins = Path(__file__).resolve().parents[1] / "bundled_plugins"
+        checkout_plugins = Path(__file__).resolve().parents[3] / "plugins"
+        bundled_plugins = package_plugins if package_plugins.is_dir() else checkout_plugins
         self.plugin_manager = PluginManager(
             (bundled_plugins,),
             data_root=config.data_root,
@@ -267,6 +270,9 @@ class AgentRuntimeManager:
     @property
     def pending_count(self) -> int:
         return self._queue.pending_count
+
+    def recent_tasks(self) -> tuple[TaskSnapshot, ...]:
+        return self._queue.recent_tasks()
 
     @property
     def profiles(self) -> Mapping[str, AgentRuntimeProfile]:
