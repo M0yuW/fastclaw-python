@@ -173,15 +173,22 @@ class ExecTool:
                 await self._terminate_process_group(process, process_wait)
             else:
                 limit_wait.cancel()
+                # A command may exit after forking children that keep the output
+                # pipes (and process group) alive. Never let those children escape.
+                if self._process_group_exists(process.pid):
+                    await self._terminate_process_group(process, process_wait)
             await asyncio.gather(*readers)
             await process_wait
         except BaseException:
-            await self._terminate_process_group(process, process_wait)
-            for task in readers:
-                task.cancel()
-            process_wait.cancel()
-            limit_wait.cancel()
-            await asyncio.gather(*readers, process_wait, limit_wait, return_exceptions=True)
+            # anyio cancel scopes keep delivering cancellation at checkpoints.
+            # Shield cleanup so TERM/KILL and wait() cannot be skipped midway.
+            with anyio.CancelScope(shield=True):
+                await self._terminate_process_group(process, process_wait)
+                for task in readers:
+                    task.cancel()
+                process_wait.cancel()
+                limit_wait.cancel()
+                await asyncio.gather(*readers, process_wait, limit_wait, return_exceptions=True)
             raise
         finally:
             if not limit_wait.done():
@@ -244,21 +251,35 @@ class ExecTool:
         process: asyncio.subprocess.Process,
         process_wait: asyncio.Task[int] | None = None,
     ) -> None:
-        if process.returncode is not None:
-            return
         waiter = process_wait or asyncio.create_task(process.wait())
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
-            pass
-        done, _ = await asyncio.wait({waiter}, timeout=self._termination_grace_seconds)
-        if waiter in done:
+            return
+        deadline = asyncio.get_running_loop().time() + self._termination_grace_seconds
+        while self._process_group_exists(process.pid):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.01, remaining))
+        if not self._process_group_exists(process.pid):
+            await asyncio.gather(waiter, return_exceptions=True)
             return
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        await waiter
+        await asyncio.gather(waiter, return_exceptions=True)
+
+    @staticmethod
+    def _process_group_exists(process_group_id: int) -> bool:
+        try:
+            os.killpg(process_group_id, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
 
 
 class WebFetchTool:
