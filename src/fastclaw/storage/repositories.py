@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Protocol
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from fastclaw.storage.models import (
@@ -36,6 +36,7 @@ class UserRepository(Protocol):
     async def get_user(self, user_id: str) -> UserRecord | None: ...
     async def get_user_by_login(self, login: str) -> UserRecord | None: ...
     async def list_users(self) -> Sequence[UserRecord]: ...
+    async def count_users(self) -> int: ...
 
 
 class AgentRepository(Protocol):
@@ -53,12 +54,21 @@ class SessionRepository(Protocol):
 class APIKeyRepository(Protocol):
     async def save_api_key(self, record: APIKeyRecord) -> None: ...
     async def get_api_key_by_hash(self, key_hash: str) -> APIKeyRecord | None: ...
+    async def get_api_key(self, api_key_id: str) -> APIKeyRecord | None: ...
+    async def list_api_keys(self, user_id: str) -> Sequence[APIKeyRecord]: ...
+    async def delete_api_key(self, api_key_id: str) -> None: ...
     async def set_api_key_agents(self, api_key_id: str, agent_ids: Sequence[str]) -> None: ...
     async def api_key_can_access_agent(self, api_key_id: str, agent_id: str) -> bool: ...
+    async def list_api_key_agents(self, api_key_id: str) -> Sequence[str]: ...
 
 
 class ConfigRepository(Protocol):
     async def save_config(self, record: ConfigRecord) -> None: ...
+    async def get_config(self, config_id: str) -> ConfigRecord | None: ...
+    async def find_config(
+        self, *, kind: str, scope: str, scope_id: str, name: str
+    ) -> ConfigRecord | None: ...
+    async def delete_config(self, config_id: str) -> None: ...
     async def list_configs(
         self, *, kind: str, user_id: str, agent_id: str
     ) -> Sequence[ConfigRecord]: ...
@@ -87,6 +97,9 @@ class SQLAlchemyStore:
         models = (await self.session.scalars(select(UserModel).order_by(UserModel.id))).all()
         return [self._user_record(model) for model in models]
 
+    async def count_users(self) -> int:
+        return int(await self.session.scalar(select(func.count()).select_from(UserModel)) or 0)
+
     async def save_web_session(self, record: WebSessionRecord) -> None:
         await self.session.merge(WebSessionModel(**record.model_dump()))
 
@@ -101,6 +114,9 @@ class SQLAlchemyStore:
             expires_at=model.expires_at,
         )
 
+    async def delete_web_session(self, sid: str) -> None:
+        await self.session.execute(delete(WebSessionModel).where(WebSessionModel.sid == sid))
+
     async def save_api_key(self, record: APIKeyRecord) -> None:
         await self.session.merge(APIKeyModel(**record.model_dump()))
 
@@ -109,6 +125,23 @@ class SQLAlchemyStore:
             select(APIKeyModel).where(APIKeyModel.key_hash == key_hash)
         )
         return self._api_key_record(model) if model is not None else None
+
+    async def get_api_key(self, api_key_id: str) -> APIKeyRecord | None:
+        model = await self.session.get(APIKeyModel, api_key_id)
+        return self._api_key_record(model) if model is not None else None
+
+    async def list_api_keys(self, user_id: str) -> Sequence[APIKeyRecord]:
+        models = (
+            await self.session.scalars(
+                select(APIKeyModel)
+                .where(APIKeyModel.user_id == user_id)
+                .order_by(APIKeyModel.created_at, APIKeyModel.id)
+            )
+        ).all()
+        return [self._api_key_record(model) for model in models]
+
+    async def delete_api_key(self, api_key_id: str) -> None:
+        await self.session.execute(delete(APIKeyModel).where(APIKeyModel.id == api_key_id))
 
     async def set_api_key_agents(self, api_key_id: str, agent_ids: Sequence[str]) -> None:
         await self.session.execute(
@@ -127,6 +160,17 @@ class SQLAlchemyStore:
             )
         )
         return match is not None
+
+    async def list_api_key_agents(self, api_key_id: str) -> Sequence[str]:
+        return tuple(
+            (
+                await self.session.scalars(
+                    select(APIKeyAgentModel.agent_id)
+                    .where(APIKeyAgentModel.apikey_id == api_key_id)
+                    .order_by(APIKeyAgentModel.agent_id)
+                )
+            ).all()
+        )
 
     async def save_agent(self, record: AgentRecord) -> None:
         await self.session.merge(AgentModel(**record.model_dump()))
@@ -187,6 +231,26 @@ class SQLAlchemyStore:
 
     async def save_config(self, record: ConfigRecord) -> None:
         await self.session.merge(ConfigModel(**record.model_dump()))
+
+    async def get_config(self, config_id: str) -> ConfigRecord | None:
+        model = await self.session.get(ConfigModel, config_id)
+        return self._config_record(model) if model is not None else None
+
+    async def find_config(
+        self, *, kind: str, scope: str, scope_id: str, name: str
+    ) -> ConfigRecord | None:
+        model = await self.session.scalar(
+            select(ConfigModel).where(
+                ConfigModel.kind == kind,
+                ConfigModel.scope == scope,
+                ConfigModel.scope_id == scope_id,
+                ConfigModel.name == name,
+            )
+        )
+        return self._config_record(model) if model is not None else None
+
+    async def delete_config(self, config_id: str) -> None:
+        await self.session.execute(delete(ConfigModel).where(ConfigModel.id == config_id))
 
     async def list_configs(
         self, *, kind: str, user_id: str, agent_id: str
