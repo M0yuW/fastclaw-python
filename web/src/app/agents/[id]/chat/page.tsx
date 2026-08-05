@@ -1,0 +1,1743 @@
+"use client";
+
+import { useEffect, useState, useRef, useCallback, useId, useMemo } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Button } from "@/components/ui/button";
+import { getAgent, getChatHistory, getChatSessions, listAgentFiles, renameChatSession, sendChatStream, uploadAgentFiles, getAuthToken, getSkills, type ChatHistoryMessage, type SkillInfo, type ToolResultMetadata } from "@/lib/api";
+import { createChatStreamBatcher, reduceChatStreamEvents, type StreamMessage } from "@/lib/chat-stream";
+import { useAgentIdFromURL } from "@/hooks/use-agent-id";
+import { Bot, Send, Copy, Check, Pencil, Wrench, ChevronDown, ChevronRight, Download, X, File, FileText, Image as ImageIcon, FileCode, Film, Music, Puzzle, SlidersHorizontal, ShieldCheck, Paperclip, Square } from "lucide-react";
+import Image from "next/image";
+import Link from "next/link";
+import ReactMarkdown, { defaultUrlTransform, type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
+
+const chatMarkdownComponents: Components = {
+  table: ({ children }) => (
+    <div className="my-3 w-full max-w-full overflow-x-auto overscroll-x-contain rounded-lg border border-border/60">
+      <table className="w-max min-w-full border-collapse text-sm">{children}</table>
+    </div>
+  ),
+  th: ({ children }) => (
+    <th className="whitespace-nowrap border-b border-border/70 bg-muted/40 px-3 py-2 text-left font-semibold">
+      {children}
+    </th>
+  ),
+  td: ({ children }) => (
+    <td className="max-w-72 whitespace-normal break-words border-b border-border/40 px-3 py-2 align-top">
+      {children}
+    </td>
+  ),
+  pre: ({ children }) => (
+    <pre className="max-w-full overflow-x-auto rounded-lg bg-background/80 p-3 text-sm">
+      {children}
+    </pre>
+  ),
+};
+
+// makeUrlTransform builds a urlTransform that also remaps sandbox
+// `/workspace/<name>` paths to the authenticated file API URL for the
+// active agent. Skills that produce a file return a sandbox path like
+// /workspace/img_xxx.png; the LLM puts that in `![](/workspace/...)`.
+// The docker bind-mount is session-scoped (host:
+// ~/.fastclaw/workspaces/<agent>/sessions/<sid>/ ↔ container:/workspace),
+// so the workspace.Store sees the file at sessions/<sid>/<name>. We
+// must prepend that prefix or the file API resolves against the agent
+// root and 404s.
+function makeUrlTransform(agentId: string, sessionId: string) {
+  return (url: string, key: string): string => {
+    if (key === "src") {
+      if (url.startsWith("data:image/")) return url;
+      if (url.startsWith("/workspace/")) {
+        const rel = url.slice("/workspace/".length);
+        const scoped = sessionId ? `sessions/${sessionId}/${rel}` : rel;
+        return fileUrl(agentId, scoped, false);
+      }
+    }
+    return defaultUrlTransform(url);
+  };
+}
+
+// Split a string on `![alt](data:image/...;base64,...)` markdown.
+//
+// Real-world content from models is messier than the grammar: base64
+// payloads get wrapped with newlines/spaces, the closing `)` is
+// sometimes cut off by truncation, and `]` and `(` may sit on separate
+// lines. So we look for the header with a regex but consume the URL
+// body with a hand-rolled scan that tolerates whitespace inside base64
+// and a missing trailing `)`. Returns [...{type:"text"|"image", ...}].
+function splitDataImages(s: string): Array<{ type: "text"; text: string } | { type: "image"; alt: string; src: string }> {
+  const out: Array<{ type: "text"; text: string } | { type: "image"; alt: string; src: string }> = [];
+  const headerRe = /!\[([^\]]*?)\]\s*\(\s*<?\s*(data:image\/[a-z0-9.+-]+;base64,)/gi;
+  let lastIdx = 0;
+  let m: RegExpExecArray | null;
+  while ((m = headerRe.exec(s)) !== null) {
+    const alt = m[1];
+    const dataPrefix = m[2];
+    // Consume base64 body: A–Z a–z 0–9 + / = and any whitespace.
+    let cursor = m.index + m[0].length;
+    while (cursor < s.length && /[A-Za-z0-9+/=\s]/.test(s[cursor])) cursor++;
+    const rawBody = s.slice(m.index + m[0].length, cursor);
+    const body = rawBody.replace(/\s+/g, "");
+    if (!body) continue;
+    const src = dataPrefix + body;
+    // Step past optional `>` and `)` closers (or accept truncation).
+    let after = cursor;
+    while (after < s.length && /[\s>]/.test(s[after])) after++;
+    if (s[after] === ")") after++;
+
+    if (m.index > lastIdx) out.push({ type: "text", text: s.slice(lastIdx, m.index) });
+    out.push({ type: "image", alt, src });
+    lastIdx = after;
+    headerRe.lastIndex = after;
+  }
+  if (lastIdx < s.length) out.push({ type: "text", text: s.slice(lastIdx) });
+  return out;
+}
+
+// Models sometimes emit markdown images with a line break between `]` and
+// `(`, or with very long base64 destinations that some commonmark parsers
+// give up on. Rather than fight the markdown parser, extract
+// `![alt](data:image/...)` (tolerating whitespace/newlines between `]`
+// and `(`) and render those as native <img>, letting ReactMarkdown
+// handle everything else. Returns null if no data-URL images are present
+// so the caller can fall through to a plain ReactMarkdown render.
+// When `suppressAllInlineImages` is true, every data-URL image inside
+// the content is dropped (used when the bubble has tool-output images
+// already attached at the top — the model often re-embeds an image in
+// its reply, and because LLMs can't reproduce base64 verbatim the
+// re-embedded bytes are either a duplicate we already showed or a
+// hallucination that renders as a different picture). `surfacedSrcs`
+// provides a narrower exact-src match for cases where nothing is
+// attached to this bubble but a prior bubble showed the same bytes.
+function renderContentWithDataImages(
+  content: string,
+  surfacedSrcs?: ReadonlySet<string>,
+  suppressAllInlineImages?: boolean,
+): React.ReactNode | null {
+  const parts = splitDataImages(content);
+  if (!parts.some((p) => p.type === "image")) return null;
+  return (
+    <>
+      {parts.map((p, i) => {
+        if (p.type === "image") {
+          if (suppressAllInlineImages || surfacedSrcs?.has(p.src)) return null;
+          return (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img key={i} src={p.src} alt={p.alt} className="rounded-lg max-w-full h-auto my-2" />
+          );
+        }
+        return (
+          <ReactMarkdown key={i} remarkPlugins={[remarkGfm]} components={chatMarkdownComponents}>
+            {p.text}
+          </ReactMarkdown>
+        );
+      })}
+    </>
+  );
+}
+
+import { usePageHeader } from "@/components/sidebar";
+
+interface ProducedFile {
+  path: string; // path relative to workspace
+  size?: number;
+}
+
+interface UserAttachment {
+  name: string;
+  isImage: boolean;
+  // Local blob URL for instant in-bubble preview without a server round-trip.
+  // Only set on the live-send turn; reloaded history won't carry it.
+  previewUrl?: string;
+}
+
+interface ChatMessage extends StreamMessage<ToolResultMetadata> {
+  files?: ProducedFile[];
+  attachments?: UserAttachment[];
+}
+
+// Single-segment identity filenames that route to the agent's home dir
+// (not the workspace) — exclude from the "Your files" panel.
+const SYSTEM_FILES = new Set([
+  "SOUL.md", "IDENTITY.md", "USER.md", "BOOTSTRAP.md",
+  "MEMORY.md", "HEARTBEAT.md", "AGENTS.md", "TOOLS.md", "agent.json",
+]);
+
+function isSystemFile(path: string): boolean {
+  return !path.includes("/") && SYSTEM_FILES.has(path);
+}
+
+function parseWrittenSize(result: string): number | undefined {
+  const m = result.match(/^Written (\d+) bytes/);
+  return m ? parseInt(m[1], 10) : undefined;
+}
+
+interface ChatSession {
+  id: string;
+  title?: string;
+  preview: string;
+}
+
+function generateSessionId() {
+  return `s-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Convert raw history messages into UI ChatMessages, grouping tool calls with results. */
+function buildChatMessages(history: ChatHistoryMessage[]): ChatMessage[] {
+  const msgs: ChatMessage[] = [];
+  let i = 0;
+  while (i < history.length) {
+    const h = history[i];
+    if (h.role === "user") {
+      // Surface image attachments on history-loaded user bubbles. The
+      // server emits `imageUrls` on user turns whose ContentParts had
+      // image_url blocks; map them into UserAttachment entries so the
+      // existing bubble renderer (live-send path) handles them with no
+      // additional branching.
+      const attachments: UserAttachment[] | undefined =
+        h.imageUrls && h.imageUrls.length > 0
+          ? h.imageUrls.map((url, idx) => ({
+              name: `image-${idx + 1}`,
+              isImage: true,
+              previewUrl: url,
+            }))
+          : undefined;
+      msgs.push({ id: `h-${i}`, role: "user", content: h.content || "", timestamp: 0, attachments });
+      i++;
+    } else if (h.role === "assistant" && h.toolCalls && h.toolCalls.length > 0) {
+      // Group: assistant tool_calls + following tool results + final assistant content
+      const calls = h.toolCalls.map((tc) => ({
+        ...tc,
+        result: undefined as string | undefined,
+        metadata: undefined as ToolResultMetadata | undefined,
+      }));
+      i++;
+      // Collect tool results
+      while (i < history.length && history[i].role === "tool") {
+        const toolMsg = history[i];
+        const call = calls.find((c) => c.id === toolMsg.toolCallId);
+        if (call) {
+          call.result = toolMsg.content;
+          if (toolMsg.metadata) call.metadata = toolMsg.metadata;
+        }
+        i++;
+      }
+      // Defensive: any tool_use that still has no result by the time
+      // we leave the tool-result run got orphaned (client aborted, server
+      // crashed mid-turn, persistence path raced). Mark them stopped so
+      // the UI shows a terminal state instead of spinning forever.
+      // Newer turns will have these padded server-side via
+      // padOrphanToolResults; this catches sessions that pre-date the fix.
+      for (const c of calls) {
+        if (c.result === undefined) {
+          c.result = "(stopped)";
+        }
+      }
+      // Show as tool-group
+      msgs.push({
+        id: `h-tool-${i}`,
+        role: "tool-group",
+        content: h.content || "",
+        timestamp: 0,
+        toolCalls: calls,
+      });
+      // If next is assistant with ONLY content and no tool calls (final
+      // answer), add it. Must skip when the next assistant also has tool
+      // calls — in a multi-turn conversation that's the *start of the next
+      // tool-group*, not a final answer, and consuming it here would drop
+      // its tool calls on the floor and leave subsequent tool-result
+      // messages orphaned.
+      if (
+        i < history.length &&
+        history[i].role === "assistant" &&
+        history[i].content &&
+        !(history[i].toolCalls && history[i].toolCalls!.length > 0)
+      ) {
+        msgs.push({ id: `h-${i}`, role: "agent", content: history[i].content || "", timestamp: 0 });
+        i++;
+      }
+    } else if (h.role === "assistant") {
+      msgs.push({ id: `h-${i}`, role: "agent", content: h.content || "", timestamp: 0 });
+      i++;
+    } else {
+      i++; // skip unexpected
+    }
+  }
+  return msgs;
+}
+
+export default function AgentChatPage() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const selectedAgent = useAgentIdFromURL();
+  const [agentName, setAgentName] = useState<string>("");
+  const sessionSeed = useId().replace(/[^a-zA-Z0-9_-]/g, "");
+  const [sessionSequence, setSessionSequence] = useState(0);
+  const [sessionId, setSessionId] = useState<string>(() => searchParams.get("session") || generateSessionId());
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const currentSession = sessions.find((session) => session.id === sessionId);
+  const sessionTitle = currentSession?.title || currentSession?.preview || "";
+  const [attachments, setAttachments] = useState<File[]>([]);
+  // Lightbox for clicking either an attachment thumbnail (compose box)
+  // or an inline image in a sent message bubble. `null` = closed.
+  const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
+  // Object URLs for image attachments in the compose box. Keyed by file
+  // index so we can revoke on remove without re-computing for every
+  // chip on every keystroke. Re-derived whenever `attachments` changes.
+  const attachmentPreviews = useMemo(
+    () =>
+      attachments.map((f) =>
+        f.type.startsWith("image/") ? URL.createObjectURL(f) : null,
+      ),
+    [attachments],
+  );
+  useEffect(() => {
+    return () => {
+      for (const url of attachmentPreviews) if (url) URL.revokeObjectURL(url);
+    };
+  }, [attachmentPreviews]);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const historyAbortRef = useRef<AbortController | null>(null);
+  const streamGenerationRef = useRef(0);
+  const sessionsGenerationRef = useRef(0);
+
+  const abortStream = useCallback(() => {
+    abortRef.current?.abort();
+  }, []);
+  const invalidateStream = useCallback(() => {
+    streamGenerationRef.current++;
+    abortRef.current?.abort();
+  }, []);
+
+  useEffect(() => invalidateStream, [selectedAgent, sessionId, invalidateStream]);
+
+  // Slash-command menu state. The menu opens when the textarea holds a
+  // token beginning with `/` at the caret; selecting a skill swaps that
+  // token for `/<skill-name> `, leaving the cursor after the space so the
+  // user can keep typing their prompt.
+  const [skills, setSkills] = useState<SkillInfo[]>([]);
+  const [slashOpen, setSlashOpen] = useState(false);
+  const [slashQuery, setSlashQuery] = useState("");
+  const [slashIndex, setSlashIndex] = useState(0);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    getSkills(controller.signal)
+      .then((items) => {
+        if (!controller.signal.aborted) setSkills(items);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setSkills([]);
+      });
+    return () => controller.abort();
+  }, []);
+
+  // Resolve the agent's display name once. The chat title and any
+  // future header bits should show "Chat with My Helper", not the
+  // opaque agt_xxx id. Uses /api/agents/{id} (owner or super_admin) so
+  // an admin viewing another user's agent still gets the real name —
+  // /api/agents (list) is owner-scoped and would miss it.
+  useEffect(() => {
+    if (!selectedAgent) return;
+    const controller = new AbortController();
+    getAgent(selectedAgent, controller.signal)
+      .then((agent) => {
+        if (!controller.signal.aborted) {
+          setAgentName(agent?.name || agent?.id || selectedAgent);
+        }
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setAgentName(selectedAgent);
+      });
+    return () => controller.abort();
+  }, [selectedAgent]);
+
+  // Detect whether the caret is inside a /token and, if so, what's been
+  // typed after the slash. Cheap enough to run every keystroke.
+  const slashContext = (value: string, caret: number): { start: number; query: string } | null => {
+    const before = value.slice(0, caret);
+    // Require the slash to be at start-of-message or preceded by whitespace
+    // so paths / URLs with slashes don't trigger the menu.
+    const match = /(^|\s)\/([\w-]*)$/.exec(before);
+    if (!match) return null;
+    return { start: caret - match[2].length - 1, query: match[2] };
+  };
+
+  const filteredSkills = slashOpen
+    ? skills
+        .filter((s) => {
+          const q = slashQuery.toLowerCase();
+          if (!q) return true;
+          return s.name.toLowerCase().includes(q) || (s.description || "").toLowerCase().includes(q);
+        })
+        .slice(0, 8)
+    : [];
+
+  const selectSkill = useCallback(
+    (skill: SkillInfo) => {
+      const el = textareaRef.current;
+      if (!el) return;
+      const caret = el.selectionStart ?? input.length;
+      const ctx = slashContext(input, caret);
+      if (!ctx) return;
+      const before = input.slice(0, ctx.start);
+      const after = input.slice(caret);
+      const insert = `/${skill.name} `;
+      const next = before + insert + after;
+      setInput(next);
+      setSlashOpen(false);
+      setSlashQuery("");
+      setSlashIndex(0);
+      requestAnimationFrame(() => {
+        const pos = before.length + insert.length;
+        el.focus();
+        el.setSelectionRange(pos, pos);
+      });
+    },
+    [input],
+  );
+
+  // Load sessions when agent changes
+  const loadSessions = useCallback(async (agentId: string, signal?: AbortSignal) => {
+    const generation = ++sessionsGenerationRef.current;
+    try {
+      const list = await getChatSessions(agentId, signal);
+      if (!signal?.aborted && sessionsGenerationRef.current === generation) {
+        setSessions(list || []);
+      }
+    } catch {
+      if (!signal?.aborted && sessionsGenerationRef.current === generation) {
+        setSessions([]);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!selectedAgent) return;
+    const controller = new AbortController();
+    void loadSessions(selectedAgent, controller.signal);
+    return () => controller.abort();
+  }, [selectedAgent, loadSessions]);
+
+  // Keep local state aligned with sidebar URL and agent navigation. The
+  // guarded render-time reset follows React's "store previous props" pattern
+  // and avoids an effect cascade. When the first send writes the existing
+  // local session into the URL, the IDs already match, so the stream is kept.
+  const urlSession = searchParams.get("session");
+  const [previousAgent, setPreviousAgent] = useState(selectedAgent);
+  const [previousUrlSession, setPreviousUrlSession] = useState(urlSession);
+  if (selectedAgent !== previousAgent || urlSession !== previousUrlSession) {
+    const agentChanged = selectedAgent !== previousAgent;
+    setPreviousAgent(selectedAgent);
+    setPreviousUrlSession(urlSession);
+    if (agentChanged) {
+      setSessions([]);
+      setMessages([]);
+      setAttachments([]);
+    }
+    if (urlSession && urlSession !== sessionId) {
+      setSessionId(urlSession);
+      setMessages([]);
+    } else if (!urlSession && (agentChanged || previousUrlSession)) {
+      const nextSequence = sessionSequence + 1;
+      setSessionSequence(nextSequence);
+      setSessionId(`s-${sessionSeed}-${nextSequence}`);
+      setMessages([]);
+    }
+  }
+
+  const handleRenameTitle = useCallback(
+    async (next: string) => {
+      const trimmed = next.trim();
+      if (!trimmed || !selectedAgent || trimmed === sessionTitle) return;
+      setSessions((prev) => {
+        let found = false;
+        const next = prev.map((session) => {
+          if (session.id !== sessionId) return session;
+          found = true;
+          return { ...session, title: trimmed };
+        });
+        return found ? next : [...next, { id: sessionId, title: trimmed, preview: "" }];
+      });
+      try {
+        await renameChatSession(selectedAgent, sessionId, trimmed);
+      } finally {
+        loadSessions(selectedAgent);
+        // Tell the global sidebar to refetch its Chats list so the new
+        // title shows up without a full page reload. AppSidebar's own
+        // fetch only re-runs when activeAgentId changes, which doesn't
+        // happen on rename.
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(
+            new CustomEvent("fastclaw:sessions-changed", {
+              detail: { agentId: selectedAgent },
+            }),
+          );
+        }
+      }
+    },
+    [selectedAgent, sessionId, sessionTitle, loadSessions],
+  );
+
+  // Render the editable title into the global sticky header (next to the
+  // sidebar toggle). Re-fires whenever the title changes.
+  const headerSlot = useMemo(
+    () => (
+      <ChatHeaderTitle
+        title={sessionTitle}
+        fallback={`Chat with ${agentName || selectedAgent}`}
+        onSave={handleRenameTitle}
+      />
+    ),
+    [sessionTitle, agentName, selectedAgent, handleRenameTitle],
+  );
+  usePageHeader(headerSlot, [headerSlot]);
+
+  // Load history when session changes. After rebuilding messages from
+  // server history we also re-attach this session's workspace files to
+  // the trailing assistant bubble so the "Your files" panel survives a
+  // refresh — server history doesn't carry per-turn file diffs, so we
+  // approximate by listing everything under sessions/<sid>/ once and
+  // hanging it off the last agent message.
+  useEffect(() => {
+    if (!selectedAgent || !sessionId) return;
+    const controller = new AbortController();
+    historyAbortRef.current?.abort();
+    historyAbortRef.current = controller;
+    getChatHistory(selectedAgent, sessionId, controller.signal)
+      .then(async (history) => {
+        if (controller.signal.aborted) return;
+        if (!history || history.length === 0) {
+          setMessages([]);
+          return;
+        }
+        const built = buildChatMessages(history);
+        try {
+          const allFiles = await listAgentFiles(selectedAgent, controller.signal);
+          if (controller.signal.aborted) return;
+          const sessionPrefix = `sessions/${sessionId}/`;
+          const sessionFiles: ProducedFile[] = allFiles
+            .filter((f) => f.path.startsWith(sessionPrefix) && !isSystemFile(f.path))
+            .map((f) => ({ path: f.path, size: f.size }));
+          if (sessionFiles.length > 0) {
+            for (let i = built.length - 1; i >= 0; i--) {
+              if (built[i].role === "agent" || built[i].role === "tool-group") {
+                built[i] = { ...built[i], files: sessionFiles };
+                break;
+              }
+            }
+          }
+        } catch { /* listing failed — fall back to no panel */ }
+        if (!controller.signal.aborted) setMessages(built);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setMessages([]);
+      });
+    return () => {
+      if (historyAbortRef.current === controller) historyAbortRef.current = null;
+      controller.abort();
+    };
+  }, [selectedAgent, sessionId]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (el) {
+      el.style.height = "auto";
+      el.style.height = Math.min(el.scrollHeight, 200) + "px";
+    }
+  }, [input]);
+
+  const handleNewChat = useCallback(() => {
+    const newId = generateSessionId();
+    setSessionId(newId);
+    setMessages([]);
+    router.replace(`/agents/${selectedAgent}/chat/`);
+  }, [router, selectedAgent]);
+
+  const handleSend = useCallback(async () => {
+    const text = input.trim();
+    // Allow sending with attachments only (no text), but require at least one.
+    if ((!text && attachments.length === 0) || !selectedAgent || sending) return;
+
+    historyAbortRef.current?.abort();
+
+    // Pin the sessionId into the URL on the first send so a refresh keeps
+    // the user in the same conversation. Use history.replaceState (not
+    // router.replace) to avoid Next.js remounting the page and interrupting
+    // the stream we're about to start.
+    if (typeof window !== "undefined" && !window.location.search.includes("session=")) {
+      window.history.replaceState(null, "", `/agents/${selectedAgent}/chat/?session=${sessionId}`);
+    }
+
+    // Upload attachments first so the agent can read them by name on its
+    // first turn. Files land at sessions/<sid>/<basename> in the workspace
+    // store, which is the same dir the docker sandbox bind-mounts as
+    // /workspace. We also (a) build user-bubble preview metadata so images
+    // render inline in the user's bubble without waiting on the server
+    // round-trip, and (b) read images as data URLs so vision-capable
+    // models receive them as image_url content parts.
+    const filesToUpload = attachments;
+    setAttachments([]);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const generation = ++streamGenerationRef.current;
+    setSending(true);
+    const finishSending = () => {
+      if (abortRef.current !== controller) return;
+      abortRef.current = null;
+      setSending(false);
+      textareaRef.current?.focus();
+    };
+
+    let userBubbleAttachments: UserAttachment[] = [];
+    let imageDataUrls: string[] = [];
+
+    if (filesToUpload.length > 0) {
+      userBubbleAttachments = filesToUpload.map((f) => ({
+        name: f.name,
+        isImage: f.type.startsWith("image/"),
+        previewUrl: f.type.startsWith("image/") ? URL.createObjectURL(f) : undefined,
+      }));
+
+      try {
+        await uploadAgentFiles(selectedAgent, sessionId, filesToUpload, controller.signal);
+      } catch (err) {
+        if (streamGenerationRef.current === generation) {
+          const isAbort = err instanceof DOMException && err.name === "AbortError";
+          setMessages((prev) => [
+            ...prev,
+            { id: `e-${Date.now()}`, role: "agent", content: isAbort ? "(Stopped)" : `File upload failed: ${err instanceof Error ? err.message : "unknown error"}`, timestamp: Date.now() },
+          ]);
+        }
+        finishSending();
+        return;
+      }
+      if (controller.signal.aborted || streamGenerationRef.current !== generation) {
+        finishSending();
+        return;
+      }
+
+      // Read each image as a base64 data URL. We do this AFTER upload —
+      // upload only needs the File object; data URL conversion is for the
+      // provider call. Done in parallel for snappy UX on multi-attach.
+      imageDataUrls = (
+        await Promise.all(
+          filesToUpload.map(async (f) => {
+            if (!f.type.startsWith("image/")) return null;
+            return await new Promise<string | null>((resolve) => {
+              const reader = new FileReader();
+              const abort = () => {
+                reader.abort();
+                resolve(null);
+              };
+              controller.signal.addEventListener("abort", abort, { once: true });
+              reader.onload = () => {
+                controller.signal.removeEventListener("abort", abort);
+                resolve(typeof reader.result === "string" ? reader.result : null);
+              };
+              reader.onerror = () => {
+                controller.signal.removeEventListener("abort", abort);
+                resolve(null);
+              };
+              reader.readAsDataURL(f);
+            });
+          }),
+        )
+      ).filter((s): s is string => !!s);
+      if (controller.signal.aborted || streamGenerationRef.current !== generation) {
+        finishSending();
+        return;
+      }
+    }
+    // Build the prompt actually sent to the model. Images travel as
+    // `imageUrls` for vision, but the model also needs the on-disk path
+    // for skills like image-tool that take `input: "/workspace/<file>"`.
+    // We prepend `[Attached: /workspace/<name>]` lines for that — the
+    // server's StripAttachedPrefix removes them on history read so user
+    // bubbles, page titles, and sidebar previews stay clean.
+    const attachedPaths = filesToUpload.map((f) => `/workspace/${f.name}`);
+    const breadcrumb = attachedPaths
+      .map((p) => `[Attached: ${p}]`)
+      .join("\n");
+    const fullText = breadcrumb
+      ? (text ? `${breadcrumb}\n${text}` : breadcrumb)
+      : text;
+
+    setInput("");
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: `u-${Date.now()}`,
+        role: "user",
+        content: text, // bubble shows text only; attachments rendered separately above
+        timestamp: Date.now(),
+        attachments: userBubbleAttachments.length > 0 ? userBubbleAttachments : undefined,
+      },
+    ]);
+
+    // Snapshot the workspace before the turn so we can diff at `done` and
+    // attach newly-created / modified files (PDFs, images, …) to the
+    // final reply. Fire-and-forget; if the snapshot fails we just won't
+    // surface files this turn. `path → size|modTime` key.
+    const preTurnFilesPromise = listAgentFiles(selectedAgent, controller.signal)
+      .then((items) => {
+        const m = new Map<string, string>();
+        for (const f of items) m.set(f.path, `${f.size}|${f.modTime}`);
+        return m;
+      })
+      .catch(() => new Map<string, string>());
+
+    const turnFiles: ProducedFile[] = [];
+    const seenPaths = new Set<string>();
+    const toolCalls = new Map<string, { name: string; arguments: string }>();
+    const batcher = createChatStreamBatcher((events) => {
+      if (streamGenerationRef.current !== generation) return;
+      setMessages((prev) => reduceChatStreamEvents(prev, events));
+    });
+
+    try {
+      await sendChatStream(selectedAgent, sessionId, fullText, (evt) => {
+        if (streamGenerationRef.current !== generation) return;
+        if (evt.type === "content" && evt.data?.content === "__NEW_SESSION__") {
+          handleNewChat();
+          loadSessions(selectedAgent);
+          return;
+        }
+        if (evt.type === "tool_call" && evt.data?.id) {
+          toolCalls.set(evt.data.id, {
+            name: evt.data.name ?? "",
+            arguments: evt.data.arguments ?? "{}",
+          });
+        }
+        if (evt.type === "tool_result" && evt.data?.id) {
+          const call = toolCalls.get(evt.data.id);
+          const resultText = evt.data.result ?? "";
+          if (call?.name === "write_file" && /^Written \d+ bytes/.test(resultText)) {
+            try {
+              const args = JSON.parse(call.arguments);
+              const path: string = typeof args?.path === "string" ? args.path : "";
+              if (path && !path.startsWith("/") && !isSystemFile(path) && !seenPaths.has(path)) {
+                seenPaths.add(path);
+                turnFiles.push({ path, size: parseWrittenSize(resultText) });
+              }
+            } catch { /* ignore bad args */ }
+          }
+        }
+        batcher.enqueue(evt);
+      }, controller.signal, imageDataUrls);
+      batcher.flush();
+      controller.signal.throwIfAborted();
+      // Diff the workspace against the pre-turn snapshot so files
+      // produced by *exec* (e.g. a Python script that saves PDFs) get
+      // surfaced too — `turnFiles` only catches write_file tool calls
+      // with relative, non-identity paths, which misses most real-
+      // world flows. Union both sources by path.
+      const postTurnFiles = await listAgentFiles(selectedAgent, controller.signal).catch(() => []);
+      const preSnap = await preTurnFilesPromise;
+      controller.signal.throwIfAborted();
+      const diffFiles: ProducedFile[] = [];
+      for (const f of postTurnFiles) {
+        if (isSystemFile(f.path)) continue;
+        const key = `${f.size}|${f.modTime}`;
+        if (preSnap.get(f.path) === key) continue; // unchanged
+        if (seenPaths.has(f.path)) continue;
+        diffFiles.push({ path: f.path, size: f.size });
+      }
+      const allFiles = [...turnFiles, ...diffFiles];
+      // Diagnostic: when sandbox-exec produces a file but the Files
+      // panel doesn't show, we need to know whether the API returned
+      // the file at all and where the diff dropped it. Cheap to keep.
+      if (typeof console !== "undefined") {
+        console.log("[chat] post-turn files diff", {
+          agent: selectedAgent,
+          sessionId,
+          preSnapSize: preSnap.size,
+          postTurnCount: postTurnFiles.length,
+          postTurnPaths: postTurnFiles.map((f) => f.path),
+          turnFiles,
+          diffFiles,
+          attached: allFiles.length,
+        });
+      }
+      if (allFiles.length > 0) {
+        setMessages((prev) => {
+          if (prev.length === 0) return prev;
+          const updated = [...prev];
+          let target = updated.length - 1;
+          while (target >= 0 && updated[target].role !== "agent" && updated[target].role !== "tool-group") target--;
+          if (target < 0) return prev;
+          const last = updated[target];
+          updated[target] = { ...last, files: allFiles };
+          if (typeof console !== "undefined") {
+            console.log("[chat] attached files to last message", {
+              lastId: last.id,
+              lastRole: last.role,
+              files: allFiles,
+            });
+          }
+          return updated;
+        });
+      }
+      loadSessions(selectedAgent);
+      // First-turn of a brand-new session just got persisted — tell the
+      // global sidebar to refetch its Chats list so the new title shows
+      // up without a full page reload.
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent("fastclaw:sessions-changed", {
+            detail: { agentId: selectedAgent },
+          }),
+        );
+      }
+    } catch (err) {
+      batcher.flush();
+      if (streamGenerationRef.current !== generation) return;
+      // AbortError from the user clicking Stop is expected — surface a
+      // brief "Stopped" line so they see the cancellation took effect,
+      // not a generic failure message.
+      const isAbort = err instanceof DOMException && err.name === "AbortError";
+      // Surface the underlying error in DevTools so future "Failed to
+      // get a response" reports come with a concrete cause (network,
+      // parse, post-turn fetch, …) rather than the generic message.
+      if (typeof console !== "undefined") {
+        console.error("[chat] handleSend error", err);
+      }
+      // Keyboard-stack abort + post-stream tear-down can both throw an
+      // AbortError after a successful turn (the SSE reader is
+      // released on `done`, then a stray reader.cancel() races with a
+      // late server EOF and surfaces as one). Both look identical to
+      // user-pressed-Stop here, so we additionally suppress the
+      // toast when at least one agent reply already landed for this
+      // turn — the user just got their answer; we shouldn't tack on
+      // a confusing failure bubble.
+      if (isAbort) {
+        setMessages((prev) => [
+          ...prev.map((m) =>
+            m.role === "tool-group" && m.toolCalls
+              ? {
+                  ...m,
+                  toolCalls: m.toolCalls.map((tc) =>
+                    tc.result === undefined ? { ...tc, result: "(stopped)" } : tc,
+                  ),
+                }
+              : m,
+          ),
+          { id: `e-${Date.now()}`, role: "agent", content: "(Stopped)", timestamp: Date.now() },
+        ]);
+      } else {
+        setMessages((prev) => {
+          const lastUser = [...prev].reverse().findIndex((m) => m.role === "user");
+          if (lastUser >= 0) {
+            const replyAfter = prev
+              .slice(prev.length - lastUser)
+              .some((m) => m.role === "agent" || m.role === "tool-group");
+            if (replyAfter) return prev; // turn already produced output
+          }
+          const errMsg = err instanceof Error && err.message
+            ? err.message
+            : "Failed to get a response. Is the gateway running?";
+          return [
+            ...prev,
+            {
+              id: `e-${Date.now()}`,
+              role: "agent",
+              content: errMsg,
+              timestamp: Date.now(),
+            },
+          ];
+        });
+      }
+    } finally {
+      batcher.flush();
+      finishSending();
+    }
+  }, [input, attachments, selectedAgent, sessionId, sending, loadSessions, handleNewChat]);
+
+  const handleStop = abortStream;
+
+  const handleFilePick = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const picked = e.target.files;
+    if (!picked || picked.length === 0) return;
+    // Snapshot the FileList into a stable File[] BEFORE we reset the
+    // input. FileList is tied to the input element — setting value=""
+    // empties it. Under StrictMode React invokes the setState updater
+    // twice for purity checks; if the closure references the live
+    // FileList, the second invocation sees an empty list and the state
+    // ends up empty even though the user picked a file.
+    const newFiles = Array.from(picked);
+    e.target.value = "";
+    setAttachments((prev) => [...prev, ...newFiles]);
+  }, []);
+
+  const removeAttachment = useCallback((idx: number) => {
+    setAttachments((prev) => prev.filter((_, i) => i !== idx));
+  }, []);
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // Don't submit while an IME composition is active — Enter in that state
+    // is the user confirming the IME candidate (e.g. pinyin → 好), not
+    // sending the message. keyCode 229 also signals "composing" on some
+    // browsers where isComposing isn't set.
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+
+    // Slash menu keyboard handling takes precedence when open: arrows move
+    // the selection, Enter confirms, Escape closes without sending.
+    if (slashOpen && filteredSkills.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSlashIndex((i) => (i + 1) % filteredSkills.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSlashIndex((i) => (i - 1 + filteredSkills.length) % filteredSkills.length);
+        return;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        selectSkill(filteredSkills[slashIndex]);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setSlashOpen(false);
+        return;
+      }
+    }
+
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  // onChange wrapper: update input + slash menu visibility in one pass.
+  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const next = e.target.value;
+    setInput(next);
+    const caret = e.target.selectionStart ?? next.length;
+    const ctx = slashContext(next, caret);
+    if (ctx) {
+      setSlashOpen(true);
+      setSlashQuery(ctx.query);
+      setSlashIndex(0);
+    } else {
+      setSlashOpen(false);
+    }
+  };
+
+  const handleCopy = (msg: ChatMessage) => {
+    navigator.clipboard.writeText(msg.content);
+    setCopiedId(msg.id);
+    setTimeout(() => setCopiedId(null), 1500);
+  };
+
+  const formatTime = (ts: number) =>
+    new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+  return (
+    <div className="flex h-[calc(100vh-3rem)] flex-col">
+      {/* Messages */}
+        <div className="flex-1 overflow-y-auto min-h-0 px-4 py-4">
+          <div className="mx-auto max-w-2xl space-y-3">
+            {messages.length === 0 && (
+              <div className="flex flex-col items-center justify-center py-24 text-center">
+                <div className="flex h-16 w-16 items-center justify-center rounded-full bg-muted mb-4">
+                  <Bot className="h-8 w-8 text-muted-foreground" />
+                </div>
+                <p className="text-lg font-medium mb-1">
+                  Chat with {agentName || selectedAgent || "your agent"}
+                </p>
+                <p className="text-sm text-muted-foreground">
+                  Send a message to start a conversation
+                </p>
+              </div>
+            )}
+
+            {(() => {
+              // Tool-group artefacts (e.g. an image rendered to base64 by
+              // a Python script inside the sandbox) are attached to the
+              // *next* agent reply bubble — so they appear as part of the
+              // assistant's answer, not inside the tool panel. If no agent
+              // reply follows (tool still running or chain didn't finish),
+              // we skip surfacing the image; it will show up with the next
+              // reply. `surfacedSrcs` tracks every image src we've
+              // surfaced so bubbles can suppress duplicate inline copies.
+              const attachedImages = new Map<string, Array<{ alt: string; src: string }>>();
+              const surfacedSrcs = new Set<string>();
+              let pending: Array<{ alt: string; src: string }> = [];
+              for (const m of messages) {
+                if (m.role === "tool-group" && m.toolCalls) {
+                  for (const tc of m.toolCalls) {
+                    if (!tc.result) continue;
+                    for (const p of splitDataImages(tc.result)) {
+                      if (p.type === "image") {
+                        pending.push({ alt: p.alt, src: p.src });
+                      }
+                    }
+                  }
+                  continue;
+                }
+                if (m.role === "agent" && pending.length > 0) {
+                  attachedImages.set(m.id, pending);
+                  for (const img of pending) surfacedSrcs.add(img.src);
+                  pending = [];
+                }
+              }
+              return messages.map((msg) =>
+              msg.role === "tool-group" ? (
+                <div key={msg.id}>
+                  <ToolCallGroup msg={msg} surfacedSrcs={surfacedSrcs} agentId={selectedAgent} sessionId={sessionId} />
+                  {msg.files && msg.files.length > 0 && (
+                    <FilesPanel agentId={selectedAgent} files={msg.files} />
+                  )}
+                </div>
+              ) : (
+                <div
+                  key={msg.id}
+                  className={`flex min-w-0 ${msg.role === "user" ? "justify-end" : "justify-start"}`}
+                >
+                  <div
+                    className={`group relative min-w-0 max-w-[80%] ${
+                      msg.role === "user" ? "order-1" : ""
+                    }`}
+                  >
+                    <div
+                      className={`min-w-0 overflow-hidden rounded-2xl px-4 py-2.5 ${
+                        msg.role === "user"
+                          ? "bg-sidebar text-sidebar-foreground rounded-br-md"
+                          : "bg-muted rounded-bl-md"
+                      }`}
+                    >
+                      {(() => {
+                        const attached = attachedImages.get(msg.id);
+                        return attached && attached.length > 0 ? (
+                          <div className="space-y-2 mb-2">
+                            {attached.map((img, i) => (
+                              // eslint-disable-next-line @next/next/no-img-element
+                              <img
+                                key={i}
+                                src={img.src}
+                                alt={img.alt}
+                                className="rounded-lg max-w-full h-auto"
+                              />
+                            ))}
+                          </div>
+                        ) : null;
+                      })()}
+                      {msg.role === "user" && msg.attachments && msg.attachments.length > 0 && (
+                        <div className="space-y-2 mb-2">
+                          {msg.attachments.map((att, i) =>
+                            att.isImage && att.previewUrl ? (
+                              <button
+                                key={i}
+                                type="button"
+                                onClick={() => setLightboxSrc(att.previewUrl!)}
+                                className="block cursor-zoom-in"
+                                aria-label={`Preview ${att.name}`}
+                              >
+                                {/* eslint-disable-next-line @next/next/no-img-element */}
+                                <img
+                                  src={att.previewUrl}
+                                  alt={att.name}
+                                  className="rounded-lg max-w-full h-auto"
+                                />
+                              </button>
+                            ) : (
+                              <div
+                                key={i}
+                                className="flex items-center gap-2 rounded-md bg-sidebar-foreground/10 px-2 py-1.5 text-xs"
+                              >
+                                <Paperclip className="h-3 w-3 opacity-70" />
+                                <span className="truncate">{att.name}</span>
+                              </div>
+                            ),
+                          )}
+                        </div>
+                      )}
+                      {msg.content && (
+                        <div
+                          className="chat-markdown min-w-0 text-[15px] leading-relaxed prose prose-sm max-w-none prose-p:my-1 prose-pre:my-2 prose-ul:my-1 prose-ol:my-1 dark:prose-invert"
+                        >
+                          {renderContentWithDataImages(
+                            msg.content,
+                            surfacedSrcs,
+                            (attachedImages.get(msg.id)?.length ?? 0) > 0,
+                          ) ?? (
+                            <ReactMarkdown
+                              remarkPlugins={[remarkGfm]}
+                              components={chatMarkdownComponents}
+                              urlTransform={makeUrlTransform(selectedAgent, sessionId)}
+                            >
+                              {msg.content}
+                            </ReactMarkdown>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    {msg.files && msg.files.length > 0 && (
+                      <FilesPanel agentId={selectedAgent} files={msg.files} />
+                    )}
+                    <div
+                      className={`flex items-center gap-1.5 mt-1 ${
+                        msg.role === "user" ? "justify-end" : "justify-start"
+                      }`}
+                    >
+                      {msg.timestamp > 0 && (
+                        <span className="text-[10px] text-muted-foreground/60">
+                          {formatTime(msg.timestamp)}
+                        </span>
+                      )}
+                      {msg.role === "agent" && (
+                        <button
+                          onClick={() => handleCopy(msg)}
+                          className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-muted text-muted-foreground/60 hover:text-muted-foreground transition-all"
+                          title="Copy"
+                        >
+                          {copiedId === msg.id ? (
+                            <Check className="h-3 w-3 text-emerald-500" />
+                          ) : (
+                            <Copy className="h-3 w-3" />
+                          )}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )
+            );
+            })()}
+
+            {sending && (
+              <div className="flex justify-start">
+                <div className="bg-muted rounded-2xl rounded-bl-md px-4 py-3">
+                  <div className="flex items-center gap-1">
+                    <span className="typing-dot inline-block h-2 w-2 rounded-full bg-muted-foreground/60" style={{ animationDelay: "0ms" }} />
+                    <span className="typing-dot inline-block h-2 w-2 rounded-full bg-muted-foreground/60" style={{ animationDelay: "200ms" }} />
+                    <span className="typing-dot inline-block h-2 w-2 rounded-full bg-muted-foreground/60" style={{ animationDelay: "400ms" }} />
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div ref={messagesEndRef} />
+          </div>
+        </div>
+
+        {/* Input */}
+        <div className="shrink-0 px-4 pb-6 pt-2">
+          <div className="mx-auto max-w-2xl relative">
+            {slashOpen && filteredSkills.length > 0 && (
+              <SlashMenu
+                skills={filteredSkills}
+                activeIndex={slashIndex}
+                onHover={setSlashIndex}
+                onSelect={selectSkill}
+              />
+            )}
+            <div className="rounded-xl border border-border bg-card px-4 py-3 focus-within:ring-2 focus-within:ring-ring/20 transition-shadow">
+              {attachments.length > 0 && (
+                <div className="flex flex-wrap gap-2 mb-2 pb-2 border-b border-border/60">
+                  {attachments.map((f, i) => {
+                    const preview = attachmentPreviews[i];
+                    if (preview) {
+                      return (
+                        <div
+                          key={`${f.name}-${i}`}
+                          className="group relative h-14 w-14 overflow-hidden rounded-md border border-border bg-muted"
+                        >
+                          <button
+                            type="button"
+                            onClick={() => setLightboxSrc(preview)}
+                            className="block h-full w-full cursor-zoom-in"
+                            aria-label={`Preview ${f.name}`}
+                          >
+                            {/* eslint-disable-next-line @next/next/no-img-element */}
+                            <img
+                              src={preview}
+                              alt={f.name}
+                              className="h-full w-full object-cover"
+                            />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => removeAttachment(i)}
+                            className="absolute right-0.5 top-0.5 flex h-4 w-4 items-center justify-center rounded-full bg-background/80 text-muted-foreground opacity-0 transition group-hover:opacity-100 hover:text-foreground"
+                            aria-label="Remove attachment"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </div>
+                      );
+                    }
+                    return (
+                      <div
+                        key={`${f.name}-${i}`}
+                        className="flex items-center gap-1.5 rounded-md bg-muted/60 pl-2 pr-1 py-1 text-xs"
+                      >
+                        <Paperclip className="h-3 w-3 text-muted-foreground" />
+                        <span className="max-w-[160px] truncate">{f.name}</span>
+                        <button
+                          type="button"
+                          onClick={() => removeAttachment(i)}
+                          className="p-0.5 rounded hover:bg-muted-foreground/15 text-muted-foreground hover:text-foreground"
+                          aria-label="Remove attachment"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              <div className="flex items-center gap-2">
+                <label
+                  className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors ${
+                    !selectedAgent || sending
+                      ? "opacity-50 cursor-not-allowed"
+                      : "hover:bg-muted hover:text-foreground cursor-pointer"
+                  }`}
+                  aria-label="Attach files"
+                >
+                  <Paperclip className="h-4 w-4" />
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    multiple
+                    className="sr-only"
+                    onChange={handleFilePick}
+                    disabled={!selectedAgent || sending}
+                  />
+                </label>
+                <textarea
+                  ref={textareaRef}
+                  value={input}
+                  onChange={handleInputChange}
+                  onKeyDown={handleKeyDown}
+                  onBlur={() => setTimeout(() => setSlashOpen(false), 120)}
+                  placeholder={
+                    selectedAgent
+                      ? `Message ${agentName || selectedAgent}... ("/" to pick a skill)`
+                      : "Select an agent first"
+                  }
+                  disabled={!selectedAgent || sending}
+                  rows={1}
+                  className="flex-1 resize-none bg-transparent text-[15px] placeholder:text-muted-foreground/50 outline-none disabled:opacity-50"
+                  style={{ maxHeight: 200, minHeight: 24 }}
+                />
+                {sending ? (
+                  <Button
+                    onClick={handleStop}
+                    size="icon"
+                    className="h-8 w-8 shrink-0 rounded-lg"
+                    aria-label="Stop generating"
+                  >
+                    <Square className="h-3.5 w-3.5 fill-current" />
+                  </Button>
+                ) : (
+                  <Button
+                    onClick={handleSend}
+                    disabled={(!input.trim() && attachments.length === 0) || !selectedAgent}
+                    size="icon"
+                    className="h-8 w-8 shrink-0 rounded-lg"
+                    aria-label="Send message"
+                  >
+                    <Send className="h-4 w-4" />
+                  </Button>
+                )}
+              </div>
+            </div>
+            <p className="text-center text-[11px] text-muted-foreground/50 mt-2">
+              Enter to send, Shift+Enter for new line
+            </p>
+          </div>
+        </div>
+        {lightboxSrc && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-6 cursor-zoom-out"
+            onClick={() => setLightboxSrc(null)}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Image preview"
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={lightboxSrc}
+              alt="Preview"
+              className="max-h-full max-w-full rounded-lg shadow-2xl"
+              onClick={(e) => e.stopPropagation()}
+            />
+            <button
+              type="button"
+              onClick={() => setLightboxSrc(null)}
+              className="absolute right-4 top-4 flex h-9 w-9 items-center justify-center rounded-full bg-background/80 text-foreground hover:bg-background"
+              aria-label="Close preview"
+            >
+              <X className="h-5 w-5" />
+            </button>
+          </div>
+        )}
+    </div>
+  );
+}
+
+interface ChatHeaderTitleProps {
+  title: string;
+  fallback: string;
+  onSave: (next: string) => void | Promise<void>;
+}
+
+/** Editable chat title rendered into the global sticky header via
+ *  usePageHeader. Click / focus to edit; Enter or blur commits. */
+function ChatHeaderTitle({ title, fallback, onSave }: ChatHeaderTitleProps) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(title);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (editing) inputRef.current?.select();
+  }, [editing]);
+
+  const commit = () => {
+    setEditing(false);
+    const next = draft.trim();
+    if (!next || next === title) return;
+    onSave(next);
+  };
+
+  if (editing) {
+    // field-sizing: content grows the input to match its text; min width
+    // keeps it reasonable right after entering edit mode even if the
+    // current title is very short.
+    return (
+      <input
+        ref={inputRef}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          // Ignore Enter while the user is mid-composition (CJK IME). Both
+          // conditions matter: isComposing is the modern signal, keyCode 229
+          // is the legacy flag some browsers (and macOS Pinyin in particular)
+          // still emit without isComposing set.
+          if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+          if (e.key === "Enter") {
+            e.preventDefault();
+            commit();
+          } else if (e.key === "Escape") {
+            setDraft(title);
+            setEditing(false);
+          }
+        }}
+        onBlur={commit}
+        style={{ fieldSizing: "content" } as React.CSSProperties}
+        className="h-7 min-w-[8ch] max-w-[40ch] rounded-md bg-transparent px-2 text-sm outline-none ring-1 ring-border focus:ring-primary/40"
+      />
+    );
+  }
+
+  return (
+    <button
+      onClick={() => {
+        setDraft(title);
+        setEditing(true);
+      }}
+      // Cap the title width responsively so a long auto-summary doesn't
+      // push the whole header off-screen on small viewports. The
+      // arbitrary `min(...)` keeps narrow widths on phones (60vw) while
+      // capping at ~32rem on desktop; sm:/md: bumps give intermediate
+      // breakpoints a deterministic width too.
+      className="group flex min-w-0 max-w-[min(60vw,18rem)] sm:max-w-[24rem] md:max-w-[28rem] lg:max-w-[32rem] items-center gap-1.5 rounded-md px-2 py-1 text-sm text-foreground hover:bg-muted/50"
+      title={title || fallback}
+    >
+      <span className="truncate">{title || fallback}</span>
+      <Pencil className="h-3 w-3 shrink-0 text-muted-foreground/50 opacity-0 transition-opacity group-hover:opacity-100" />
+    </button>
+  );
+}
+
+/** Renders a group of tool calls as a collapsible summary. */
+function ToolCallGroup({ msg, surfacedSrcs, agentId, sessionId }: { msg: ChatMessage; surfacedSrcs?: ReadonlySet<string>; agentId: string; sessionId: string }) {
+  const [groupOpen, setGroupOpen] = useState(false);
+  const [expandedTool, setExpandedTool] = useState<Record<string, boolean>>({});
+
+  const tools = msg.toolCalls || [];
+  const doneCount = tools.filter((tc) => tc.result != null).length;
+  const allDone = doneCount === tools.length;
+
+  const toggleTool = (id: string) =>
+    setExpandedTool((prev) => ({ ...prev, [id]: !prev[id] }));
+
+  return (
+    <div className="flex min-w-0 justify-start">
+      <div className="min-w-0 max-w-[85%] space-y-2">
+        {/* Content before tools */}
+        {msg.content && (
+          <div className="min-w-0 overflow-hidden bg-muted rounded-2xl rounded-bl-md px-4 py-2.5">
+            <div className="chat-markdown min-w-0 text-[15px] leading-relaxed prose prose-sm dark:prose-invert max-w-none prose-p:my-1">
+              {renderContentWithDataImages(msg.content, surfacedSrcs) ?? (
+                <ReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  components={chatMarkdownComponents}
+                  urlTransform={makeUrlTransform(agentId, sessionId)}
+                >
+                  {msg.content}
+                </ReactMarkdown>
+              )}
+            </div>
+          </div>
+        )}
+        {/* Collapsed tool group summary */}
+        <div className="rounded-lg border border-border bg-card/50 overflow-hidden">
+          <button
+            onClick={() => setGroupOpen(!groupOpen)}
+            className="flex w-full items-center gap-2 px-3 py-2 text-xs hover:bg-muted/50 transition-colors"
+          >
+            {!allDone ? (
+              <div className="h-3.5 w-3.5 shrink-0 rounded-full border-2 border-amber-500 border-t-transparent animate-spin" />
+            ) : (
+              <Wrench className="h-3.5 w-3.5 text-amber-500 shrink-0" />
+            )}
+            <span className="font-medium text-foreground">
+              {allDone
+                ? `Executed ${tools.length} tool${tools.length > 1 ? "s" : ""}`
+                : `Running tools (${doneCount}/${tools.length})...`}
+            </span>
+            <span className="text-muted-foreground/60 text-[11px] flex-1 text-left truncate">
+              {tools.map((tc) => tc.name).join(", ")}
+            </span>
+            {groupOpen ? (
+              <ChevronDown className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+            ) : (
+              <ChevronRight className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+            )}
+          </button>
+
+          {groupOpen && (
+            <div className="border-t border-border">
+              {tools.map((tc) => (
+                <div key={tc.id} className="border-b border-border last:border-b-0">
+                  <button
+                    onClick={() => toggleTool(tc.id)}
+                    className="flex w-full items-center gap-2 px-3 py-1.5 text-xs hover:bg-muted/30 transition-colors"
+                  >
+                    {tc.result === undefined ? (
+                      <div className="h-3 w-3 shrink-0 rounded-full border-2 border-amber-500/60 border-t-transparent animate-spin" />
+                    ) : (
+                      <Check className="h-3 w-3 text-emerald-500 shrink-0" />
+                    )}
+                    <span className="font-medium text-foreground">{tc.name}</span>
+                    {tc.metadata?.sandbox && (
+                      <span
+                        className="flex items-center gap-0.5 rounded bg-emerald-500/10 px-1 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400"
+                        title="Executed inside a sandboxed container"
+                      >
+                        <ShieldCheck className="h-2.5 w-2.5" />
+                        sandbox
+                      </span>
+                    )}
+                    <span className="text-muted-foreground/50 font-mono truncate flex-1 text-left text-[11px]">
+                      {(() => {
+                        try {
+                          const args = JSON.parse(tc.arguments);
+                          return Object.values(args).join(", ");
+                        } catch {
+                          return tc.arguments;
+                        }
+                      })()}
+                    </span>
+                    {expandedTool[tc.id] ? (
+                      <ChevronDown className="h-3 w-3 text-muted-foreground/50 shrink-0" />
+                    ) : (
+                      <ChevronRight className="h-3 w-3 text-muted-foreground/50 shrink-0" />
+                    )}
+                  </button>
+                  {expandedTool[tc.id] && (
+                    <div className="px-3 py-2 space-y-2 bg-muted/20">
+                      <div>
+                        <p className="text-[10px] font-medium text-muted-foreground uppercase mb-1">Input</p>
+                        <pre className="text-xs font-mono bg-muted/50 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-40">
+                          {(() => {
+                            try { return JSON.stringify(JSON.parse(tc.arguments), null, 2); }
+                            catch { return tc.arguments; }
+                          })()}
+                        </pre>
+                      </div>
+                      {tc.result != null ? (
+                        <div>
+                          <p className="text-[10px] font-medium text-muted-foreground uppercase mb-1">Output</p>
+                          <pre className="text-xs font-mono bg-muted/50 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-60">
+                            {tc.result.length > 2000 ? tc.result.slice(0, 2000) + "..." : tc.result}
+                          </pre>
+                        </div>
+                      ) : (
+                        <p className="text-xs text-muted-foreground/60 italic">Executing...</p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** File extension → icon + preview kind. */
+function fileKind(path: string): { icon: typeof File; preview: "image" | "pdf" | "markdown" | "text" | "none" } {
+  const ext = path.toLowerCase().split(".").pop() || "";
+  if (["png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico"].includes(ext)) return { icon: ImageIcon, preview: "image" };
+  if (ext === "pdf") return { icon: FileText, preview: "pdf" };
+  if (ext === "md" || ext === "markdown") return { icon: FileText, preview: "markdown" };
+  if (["mp4", "webm", "mov", "mkv"].includes(ext)) return { icon: Film, preview: "none" };
+  if (["mp3", "wav", "ogg", "flac", "m4a"].includes(ext)) return { icon: Music, preview: "none" };
+  if (["js", "ts", "tsx", "jsx", "py", "go", "rs", "c", "cpp", "h", "java", "rb", "sh", "json", "yaml", "yml", "toml", "xml", "html", "css"].includes(ext))
+    return { icon: FileCode, preview: "text" };
+  if (["txt", "csv", "log"].includes(ext)) return { icon: FileText, preview: "text" };
+  return { icon: File, preview: "none" };
+}
+
+function formatBytes(n?: number): string {
+  if (n === undefined) return "";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function fileUrl(agentId: string, path: string, download: boolean): string {
+  const token = getAuthToken();
+  const encoded = path.split("/").map(encodeURIComponent).join("/");
+  const params = new URLSearchParams();
+  if (download) params.set("download", "1");
+  if (token) params.set("token", token);
+  const qs = params.toString();
+  return `/api/agents/${agentId}/files/${encoded}${qs ? "?" + qs : ""}`;
+}
+
+function FilesPanel({ agentId, files }: { agentId: string; files: ProducedFile[] }) {
+  const [previewing, setPreviewing] = useState<ProducedFile | null>(null);
+  return (
+    <>
+      <div className="mt-2 space-y-1.5 max-w-[85%]">
+        <p className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/70">
+          Your files
+        </p>
+        <div className="flex flex-col gap-1.5">
+          {files.map((f) => {
+            const { icon: Icon } = fileKind(f.path);
+            const basename = f.path.split("/").pop() || f.path;
+            const downloadUrl = fileUrl(agentId, f.path, true);
+            return (
+              <div
+                key={f.path}
+                className="group flex items-center gap-2.5 rounded-lg border border-border bg-card/50 px-3 py-2 hover:bg-card/80 transition-colors"
+              >
+                <Icon className="h-4 w-4 text-muted-foreground shrink-0" />
+                <button
+                  onClick={() => setPreviewing(f)}
+                  className="flex-1 min-w-0 text-left"
+                  title="Open preview"
+                >
+                  <div className="text-sm font-medium text-foreground truncate">{basename}</div>
+                  {f.size !== undefined && (
+                    <div className="text-[11px] text-muted-foreground/70">{formatBytes(f.size)}</div>
+                  )}
+                </button>
+                <a
+                  href={downloadUrl}
+                  className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+                  title="Download"
+                >
+                  <Download className="h-4 w-4" />
+                </a>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      {previewing && (
+        <FilePreview
+          agentId={agentId}
+          file={previewing}
+          onClose={() => setPreviewing(null)}
+        />
+      )}
+    </>
+  );
+}
+
+function FilePreview({ agentId, file, onClose }: { agentId: string; file: ProducedFile; onClose: () => void }) {
+  const { preview } = fileKind(file.path);
+  const src = fileUrl(agentId, file.path, false);
+  const downloadUrl = fileUrl(agentId, file.path, true);
+  const basename = file.path.split("/").pop() || file.path;
+  const [loadedText, setLoadedText] = useState<{
+    src: string;
+    text: string | null;
+    error: string | null;
+  } | null>(null);
+  const text = loadedText?.src === src ? loadedText.text : null;
+  const error = loadedText?.src === src ? loadedText.error : null;
+
+  useEffect(() => {
+    if (preview !== "markdown" && preview !== "text") return;
+    const controller = new AbortController();
+    fetch(src, { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.text();
+      })
+      .then((content) => {
+        if (!controller.signal.aborted) {
+          setLoadedText({ src, text: content, error: null });
+        }
+      })
+      .catch((loadError) => {
+        if (!controller.signal.aborted) {
+          setLoadedText({ src, text: null, error: String(loadError) });
+        }
+      });
+    return () => controller.abort();
+  }, [src, preview]);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm p-4" onClick={onClose}>
+      <div className="flex h-[85vh] w-full max-w-4xl flex-col rounded-xl border border-border bg-card shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between border-b border-border px-4 py-3 shrink-0">
+          <div className="flex items-center gap-2 min-w-0">
+            <FileText className="h-4 w-4 text-muted-foreground shrink-0" />
+            <span className="font-medium text-sm truncate">{basename}</span>
+            {file.size !== undefined && (
+              <span className="text-[11px] text-muted-foreground shrink-0">{formatBytes(file.size)}</span>
+            )}
+          </div>
+          <div className="flex items-center gap-1 shrink-0">
+            <a
+              href={downloadUrl}
+              className="rounded-md p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted/50"
+              title="Download"
+            >
+              <Download className="h-4 w-4" />
+            </a>
+            <button
+              onClick={onClose}
+              className="rounded-md p-1.5 text-muted-foreground hover:text-foreground hover:bg-muted/50"
+              title="Close"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+        <div className="flex-1 overflow-auto p-4 min-h-0">
+          {preview === "image" && (
+            <Image
+              src={src}
+              alt={basename}
+              width={1600}
+              height={1200}
+              unoptimized
+              className="mx-auto h-auto max-h-full w-auto max-w-full object-contain"
+            />
+          )}
+          {preview === "pdf" && (
+            <iframe src={src} className="h-full w-full border-0" title={basename} />
+          )}
+          {preview === "markdown" && (
+            error ? <p className="text-sm text-destructive">Failed to load: {error}</p>
+            : text === null ? <p className="text-sm text-muted-foreground">Loading…</p>
+            : (
+              <div className="prose prose-sm dark:prose-invert max-w-none">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+              </div>
+            )
+          )}
+          {preview === "text" && (
+            error ? <p className="text-sm text-destructive">Failed to load: {error}</p>
+            : text === null ? <p className="text-sm text-muted-foreground">Loading…</p>
+            : (
+              <pre className="text-xs font-mono whitespace-pre-wrap break-all bg-muted/30 rounded p-3">{text}</pre>
+            )
+          )}
+          {preview === "none" && (
+            <div className="flex flex-col items-center justify-center h-full gap-3 text-center">
+              <File className="h-12 w-12 text-muted-foreground/50" />
+              <p className="text-sm text-muted-foreground">Preview not available for this file type.</p>
+              <a href={downloadUrl} className="inline-flex items-center gap-2 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90">
+                <Download className="h-3.5 w-3.5" /> Download
+              </a>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SlashMenu({
+  skills,
+  activeIndex,
+  onHover,
+  onSelect,
+}: {
+  skills: SkillInfo[];
+  activeIndex: number;
+  onHover: (i: number) => void;
+  onSelect: (s: SkillInfo) => void;
+}) {
+  return (
+    <div className="absolute bottom-full left-0 right-0 mb-2 rounded-xl border border-border bg-popover shadow-lg overflow-hidden z-20">
+      <div className="max-h-[320px] overflow-y-auto py-1">
+        {skills.map((s, i) => (
+          <button
+            key={s.name}
+            // onMouseDown fires before the textarea's onBlur so the click
+            // isn't swallowed by the blur-driven menu close.
+            onMouseDown={(e) => {
+              e.preventDefault();
+              onSelect(s);
+            }}
+            onMouseEnter={() => onHover(i)}
+            className={`w-full flex items-start gap-3 px-3 py-2 text-left transition-colors ${
+              i === activeIndex ? "bg-muted/60" : "hover:bg-muted/40"
+            }`}
+          >
+            <Puzzle className="h-4 w-4 mt-0.5 shrink-0 text-muted-foreground" />
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2">
+                <p className="text-sm font-medium truncate">{s.name}</p>
+                <span className="text-[10px] uppercase tracking-wider text-muted-foreground/70">
+                  {s.type || "skill"}
+                </span>
+              </div>
+              {s.description && (
+                <p className="text-xs text-muted-foreground line-clamp-1">
+                  {s.description}
+                </p>
+              )}
+            </div>
+          </button>
+        ))}
+      </div>
+      <Link
+        href="/skills/"
+        className="flex items-center gap-2 border-t border-border px-3 py-2 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/30 transition-colors"
+      >
+        <SlidersHorizontal className="h-3.5 w-3.5" />
+        Manage Skills
+      </Link>
+    </div>
+  );
+}

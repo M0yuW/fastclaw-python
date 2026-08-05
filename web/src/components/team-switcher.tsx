@@ -1,0 +1,176 @@
+"use client";
+
+import * as React from "react";
+import Image from "next/image";
+import { useRouter } from "next/navigation";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import {
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  useSidebar,
+} from "@/components/ui/sidebar";
+import { Bot, ChevronsUpDownIcon, PlusIcon } from "lucide-react";
+
+// AgentAvatar shows the agent's uploaded /api/agents/{id}/files/avatar.png
+// when available, falls back to the FastClaw logo for the platform header
+// (no agent), and falls back to a Bot icon when an agent has no custom
+// avatar yet (the image 404s).
+function AgentAvatar({
+  agentId,
+  size = 32,
+}: {
+  agentId?: string | null;
+  size?: number;
+}) {
+  const [failedAgentId, setFailedAgentId] = React.useState<string | null>(null);
+
+  if (!agentId) {
+    return (
+      <Image
+        src="/logo.png"
+        alt="FastClaw"
+        width={size}
+        height={size}
+        className="rounded-lg"
+        style={{ width: size, height: size }}
+      />
+    );
+  }
+  if (failedAgentId === agentId) {
+    return (
+      <div
+        className="flex shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-violet-500 to-purple-600"
+        style={{ width: size, height: size }}
+      >
+        <Bot className="text-white" style={{ width: size * 0.55, height: size * 0.55 }} />
+      </div>
+    );
+  }
+  return (
+    <Image
+      src={`/api/agents/${agentId}/files/avatar.png`}
+      alt=""
+      width={size}
+      height={size}
+      unoptimized
+      className="shrink-0 rounded-lg object-cover"
+      style={{ width: size, height: size }}
+      onError={() => setFailedAgentId(agentId)}
+    />
+  );
+}
+
+export interface AgentSwitcherItem {
+  id: string;
+  name?: string;
+  model?: string;
+}
+
+// AgentSwitcher renders the sidebar header.
+//
+//   activeAgentId set     → show that agent's display name + id, dropdown
+//                           lists every agent for quick switching
+//   activeAgentId unset   → show "FastClaw" (platform brand). The dropdown
+//                           still lists agents so users can jump in from
+//                           any non-agent page.
+//
+// We never auto-promote the first agent into the header — the header on
+// admin pages (Agents list, API Keys, Settings, …) stays neutral.
+export function AgentSwitcher({
+  agents,
+  activeAgentId,
+  onSelect,
+}: {
+  agents: AgentSwitcherItem[];
+  activeAgentId?: string | null;
+  onSelect?: (id: string) => void;
+}) {
+  const { isMobile } = useSidebar();
+  const router = useRouter();
+
+  const active = activeAgentId
+    ? agents.find((a) => a.id === activeAgentId) ?? null
+    : null;
+
+  const goto = React.useCallback(
+    (id: string) => {
+      if (onSelect) onSelect(id);
+      else router.push(`/agents/${id}/chat/`);
+    },
+    [onSelect, router],
+  );
+
+  const headerLabel = active ? active.name || active.id : "FastClaw";
+
+  return (
+    <SidebarMenu>
+      <SidebarMenuItem>
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            render={
+              <SidebarMenuButton
+                size="lg"
+                className="data-open:bg-sidebar-accent data-open:text-sidebar-accent-foreground"
+              />
+            }
+          >
+            <AgentAvatar agentId={active?.id} size={32} />
+            <div className="grid flex-1 text-left text-sm leading-tight">
+              <span className="truncate font-medium">{headerLabel}</span>
+            </div>
+            <ChevronsUpDownIcon className="ml-auto" />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent
+            className="min-w-56 rounded-lg"
+            align="start"
+            side={isMobile ? "bottom" : "right"}
+            sideOffset={4}
+          >
+            {agents.length > 0 && (
+              <>
+                <DropdownMenuGroup>
+                  <DropdownMenuLabel className="text-xs text-muted-foreground">
+                    Agents
+                  </DropdownMenuLabel>
+                  {agents.map((a) => (
+                    <DropdownMenuItem
+                      key={a.id}
+                      onClick={() => goto(a.id)}
+                      className="gap-2 p-2"
+                    >
+                      <AgentAvatar agentId={a.id} size={24} />
+                      <span className="flex-1 truncate">{a.name || a.id}</span>
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuGroup>
+                <DropdownMenuSeparator />
+              </>
+            )}
+            <DropdownMenuGroup>
+              <DropdownMenuItem
+                className="gap-2 p-2"
+                onClick={() => router.push("/agents/")}
+              >
+                <div className="flex size-6 items-center justify-center rounded-md border bg-transparent">
+                  <PlusIcon className="size-4" />
+                </div>
+                <div className="font-medium text-muted-foreground">
+                  Manage agents
+                </div>
+              </DropdownMenuItem>
+            </DropdownMenuGroup>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </SidebarMenuItem>
+    </SidebarMenu>
+  );
+}

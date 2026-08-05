@@ -144,6 +144,12 @@ always taken from the trusted execution context.
 
 See [the phase 4 migration record](docs/migration/phase-4-multi-agent.md).
 
+## Web snapshot
+
+The Next.js application under `web/` is a source-attributed snapshot of the Go
+project at the locked compatibility baseline. Its Git history was not copied.
+See [web/SOURCE.md](web/SOURCE.md) for the exact source commit and license.
+
 ## License
 
 See [LICENSE](LICENSE).
