@@ -26,6 +26,8 @@ class ResponseAccumulator:
         self._tool_calls: dict[int, dict[str, Any]] = {}
         self._finish_reason: str | None = None
         self._usage = Usage()
+        self._raw_delta_strings: dict[str, list[str]] = {}
+        self._raw_delta_values: dict[str, Any] = {}
         self._raw_assistant: dict[str, Any] | None = None
         self._done = False
 
@@ -36,6 +38,11 @@ class ResponseAccumulator:
     def apply(self, event: ProviderEvent) -> None:
         if self._done:
             raise ProviderStreamError("received an event after the terminal event")
+        for key, value in event.raw_assistant_delta.items():
+            if isinstance(value, str):
+                self._raw_delta_strings.setdefault(key, []).append(value)
+            else:
+                self._raw_delta_values[key] = value
         if event.type is ProviderEventType.CONTENT_DELTA:
             self._content.append(event.content)
         elif event.type is ProviderEventType.THINKING_DELTA:
@@ -81,6 +88,8 @@ class ResponseAccumulator:
                 thinking=thinking,
                 signature=signature,
                 tool_calls=tool_calls,
+                raw_delta_strings=self._raw_delta_strings,
+                raw_delta_values=self._raw_delta_values,
             )
         else:
             tool_calls = accumulated_calls
@@ -146,13 +155,17 @@ class ResponseAccumulator:
         thinking: str,
         signature: str,
         tool_calls: tuple[ToolCall, ...],
+        raw_delta_strings: dict[str, list[str]],
+        raw_delta_values: dict[str, Any],
     ) -> dict[str, Any]:
         raw: dict[str, Any] = {"role": "assistant", "content": content}
         if tool_calls:
             raw["tool_calls"] = [
                 call.model_dump(by_alias=True, exclude_none=True) for call in tool_calls
             ]
-        if thinking:
+        raw.update(raw_delta_values)
+        raw.update({key: "".join(values) for key, values in raw_delta_strings.items()})
+        if thinking and not ({"thinking", "reasoning_content"} & raw.keys()):
             raw["thinking"] = thinking
         if signature:
             raw["thinking_signature"] = signature

@@ -177,4 +177,5 @@ class ProviderEvent(ProviderModel):
     tool_arguments: str = ""
     finish_reason: str | None = None
     usage: Usage | None = None
+    raw_assistant_delta: dict[str, JsonValue] = Field(default_factory=dict)
     raw_assistant: dict[str, JsonValue] | None = Field(default=None, alias="_raw")
