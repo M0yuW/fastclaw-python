@@ -28,6 +28,9 @@ class AgentRunRequest(AgentModel):
     message: str
     allowed_tools: frozenset[str] | None = None
     max_rounds: int = Field(default=8, ge=1, le=64)
+    max_tokens: int = Field(default=4096, gt=0)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    thinking_budget_tokens: int | None = Field(default=None, gt=0)
     tool_timeout: float = Field(default=30.0, gt=0)
     system_prompt: str = ""
 

@@ -11,10 +11,11 @@ import asyncio
 import json
 import os
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Protocol
 from uuid import uuid4
 
@@ -33,13 +34,28 @@ from fastclaw.orchestration import (
 )
 from fastclaw.providers import ChatMessage, Provider, create_provider
 from fastclaw.runtime import Runtime, RuntimeState
+from fastclaw.skills import Skill, SkillCatalog, SkillError
 from fastclaw.storage import AgentRecord, ConfigRecord, Database, UnitOfWork
-from fastclaw.tools import ReadFileTool, ToolRegistry, WebFetchTool
+from fastclaw.tools import (
+    ListDirTool,
+    ReadFileTool,
+    SkillScriptTool,
+    ToolRegistry,
+    WebFetchTool,
+    WorldCupLedgerTool,
+    WriteFileTool,
+)
+
+_STANDARD_PROVIDERS: dict[str, tuple[str, str]] = {
+    "deepseek": ("https://api.deepseek.com", "openai-compatible"),
+    "openrouter": ("https://openrouter.ai/api/v1", "openai-compatible"),
+}
 
 
 @dataclass(frozen=True, slots=True)
 class AgentRuntimeConfig:
     data_root: Path
+    legacy_data_root: Path = Path.home() / ".fastclaw"
     default_provider_name: str = ""
     default_provider_api_key: str = ""
     default_provider_api_base: str = ""
@@ -54,6 +70,7 @@ class AgentRuntimeProfile:
     agent: AgentRecord
     system_prompt: str
     allowed_tools: frozenset[str] | None
+    skills: tuple[Skill, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +91,8 @@ class ToolFactory(Protocol):
         bus: InProcessMessageBus,
         runtime: Runtime,
         data_root: Path,
+        legacy_data_root: Path,
+        catalog: SkillCatalog,
     ) -> ToolRegistry: ...
 
 
@@ -82,15 +101,21 @@ def _default_tools(
     bus: InProcessMessageBus,
     runtime: Runtime,
     data_root: Path,
+    legacy_data_root: Path,
+    catalog: SkillCatalog,
 ) -> ToolRegistry:
     workspace = data_root / "workspaces" / profile.agent.id
-    return ToolRegistry(
-        (
-            ReadFileTool(workspace),
-            WebFetchTool(runtime.http_client),
-            SpawnSubagentTool(bus),
-        )
-    )
+    tools: list[Any] = [
+        ReadFileTool(workspace),
+        ListDirTool(workspace),
+        WriteFileTool(workspace),
+        WebFetchTool(runtime.http_client),
+        SpawnSubagentTool(bus),
+        WorldCupLedgerTool(data_root),
+    ]
+    if profile.skills:
+        tools.append(SkillScriptTool(catalog, profile.skills, forbidden_roots=(legacy_data_root,)))
+    return ToolRegistry(tools)
 
 
 class ManagedAgentStream(AsyncIterator[AgentEvent]):
@@ -214,6 +239,8 @@ class AgentRuntimeManager:
         self.bus = InProcessMessageBus(self._queue)
         self._tool_factory = tool_factory
         self._profiles: dict[str, AgentRuntimeProfile] = {}
+        self.skill_catalog = SkillCatalog(config.data_root / "skills")
+        self._skill_errors: dict[str, str] = {}
         self._profile_lock = asyncio.Lock()
         self._started = False
         self._closing = False
@@ -226,11 +253,20 @@ class AgentRuntimeManager:
     def profile_count(self) -> int:
         return len(self._profiles)
 
+    @property
+    def profiles(self) -> Mapping[str, AgentRuntimeProfile]:
+        return MappingProxyType(self._profiles)
+
+    @property
+    def skill_errors(self) -> Mapping[str, str]:
+        return MappingProxyType(self._skill_errors)
+
     async def start(self) -> None:
         if self._started:
             return
         if self.runtime.state is not RuntimeState.RUNNING:
             raise RuntimeError("Agent manager requires a running Runtime")
+        self.skill_catalog.discover()
         async with UnitOfWork(self.database) as unit:
             store = unit.require_store()
             users = await store.list_users()
@@ -351,9 +387,12 @@ class AgentRuntimeManager:
             "database": database_ready,
             "agent_manager": self.started,
             "providers": provider_ready,
-            # Phase C replaces this with validation of every referenced skill.
-            # An empty skill set has no missing dependency.
-            "skills": True,
+            "skills": not self._skill_errors
+            and all(
+                self.skill_catalog.is_prepared(skill)
+                for profile in self._profiles.values()
+                for skill in profile.skills
+            ),
         }
 
     async def provider_selection(
@@ -378,8 +417,9 @@ class AgentRuntimeManager:
         if selected is not None:
             data = selected.data
             api_key = str(data.get("apiKey") or self._provider_env_key(selected.name))
-            api_base = str(data.get("apiBase") or "")
-            api_type = str(data.get("apiType") or "openai-compatible")
+            standard = _STANDARD_PROVIDERS.get(selected.name, ("", "openai-compatible"))
+            api_base = str(data.get("apiBase") or standard[0])
+            api_type = str(data.get("apiType") or standard[1])
             configured_model = str(data.get("model") or "")
             model = model or configured_model
             if api_key and api_base and model:
@@ -391,6 +431,18 @@ class AgentRuntimeManager:
                     model=model,
                     source=selected.scope,
                     config_id=selected.id,
+                )
+        default_provider = _STANDARD_PROVIDERS.get(provider_name)
+        if default_provider is not None and model:
+            key = self._provider_env_key(provider_name)
+            if key:
+                return ProviderSelection(
+                    name=provider_name,
+                    api_key=key,
+                    api_base=default_provider[0],
+                    api_type=default_provider[1],
+                    model=model,
+                    source="environment-default",
                 )
         if (
             self.config.default_provider_name
@@ -445,7 +497,14 @@ class AgentRuntimeManager:
         emit: Callable[[AgentEvent], None],
     ) -> str:
         provider, owned = await self._provider(selection)
-        tools = self._tool_factory(profile, self.bus, self.runtime, self.config.data_root)
+        tools = self._tool_factory(
+            profile,
+            self.bus,
+            self.runtime,
+            self.config.data_root,
+            self.config.legacy_data_root,
+            self.skill_catalog,
+        )
         runner = AgentRunner(provider, tools, DatabaseSessionPersistence(self.database))
         final: ChatMessage | None = None
         stream = runner.stream(request, context)
@@ -478,7 +537,13 @@ class AgentRuntimeManager:
 
     async def _load_profile(self, agent: AgentRecord) -> AgentRuntimeProfile:
         async with UnitOfWork(self.database) as unit:
-            records = await unit.require_store().list_agent_files(agent.id, agent.user_id)
+            store = unit.require_store()
+            records = await store.list_agent_files(agent.id, agent.user_id)
+            default_layers = [
+                await store.list_configs(kind="setting", user_id="", agent_id=""),
+                await store.list_configs(kind="setting", user_id=agent.user_id, agent_id=""),
+                await store.list_configs(kind="setting", user_id=agent.user_id, agent_id=agent.id),
+            ]
         files = {record.filename: record.data for record in records}
         file_config: dict[str, Any] = {}
         raw_config = files.get("agent.json")
@@ -489,7 +554,12 @@ class AgentRuntimeManager:
                 parsed = None
             if isinstance(parsed, dict):
                 file_config = parsed
-        effective_config = {**file_config, **agent.config}
+        defaults: dict[str, Any] = {}
+        for layer in default_layers:
+            for record in layer:
+                if record.enabled and record.name == "agents.defaults":
+                    defaults.update(record.data)
+        effective_config = {**defaults, **file_config, **agent.config}
         prompt_parts: list[str] = []
         for filename in ("SOUL.md", "IDENTITY.md", "USER.md", "MEMORY.md"):
             raw = files.get(filename)
@@ -504,6 +574,27 @@ class AgentRuntimeManager:
         configured_soul = str(effective_config.get("soul") or "").strip()
         if configured_soul and "SOUL.md" not in files:
             prompt_parts.insert(0, f"## SOUL.md\n\n{configured_soul}")
+        configured_skills = effective_config.get("skills")
+        always_load = (
+            configured_skills.get("alwaysLoad", []) if isinstance(configured_skills, dict) else []
+        )
+        skills: list[Skill] = []
+        for value in always_load if isinstance(always_load, list) else []:
+            name = str(value)
+            try:
+                skill = self.skill_catalog.require(name)
+            except SkillError as exc:
+                self._skill_errors[f"{agent.id}:{name}"] = str(exc)
+                continue
+            self._skill_errors.pop(f"{agent.id}:{name}", None)
+            skills.append(skill)
+            prompt_parts.append(
+                self.skill_catalog.prompt(
+                    skill,
+                    source_root=self.config.legacy_data_root,
+                    target_root=self.config.data_root,
+                )
+            )
         policy = str(effective_config.get("policy") or "").strip()
         if policy == "no-tools":
             allowed_tools: frozenset[str] | None = frozenset()
@@ -511,15 +602,27 @@ class AgentRuntimeManager:
             allowed_tools = frozenset({"spawn_subagent"})
         else:
             configured = effective_config.get("allowedTools")
-            allowed_tools = (
-                frozenset(str(item) for item in configured)
-                if isinstance(configured, list)
-                else None
-            )
+            if isinstance(configured, list):
+                allowed_tools = frozenset(str(item) for item in configured)
+            elif skills:
+                allowed_tools = frozenset(
+                    {"exec", "read_file", "web_fetch", "list_dir", "write_file"}
+                )
+            elif "coordinator" in agent.name.lower():
+                coordinator_tools = {"spawn_subagent"}
+                if agent.name.lower() == "coordinator-wc":
+                    coordinator_tools.add("worldcup_ledger")
+                allowed_tools = frozenset(coordinator_tools)
+            else:
+                allowed_tools = frozenset({"read_file", "web_fetch", "list_dir", "write_file"})
+        system_prompt = "\n\n".join(prompt_parts).replace(
+            str(self.config.legacy_data_root), str(self.config.data_root)
+        )
         return AgentRuntimeProfile(
             agent=agent.model_copy(update={"config": effective_config}),
-            system_prompt="\n\n".join(prompt_parts),
+            system_prompt=system_prompt,
             allowed_tools=allowed_tools,
+            skills=tuple(skills),
         )
 
     @staticmethod
@@ -531,6 +634,13 @@ class AgentRuntimeManager:
             system_prompt=profile.system_prompt or str(config.get("soul") or ""),
             allowed_tools=profile.allowed_tools,
             max_rounds=int(config.get("maxToolIterations") or 8),
+            max_tokens=int(config.get("maxTokens") or 4096),
+            temperature=float(
+                config["temperature"] if config.get("temperature") is not None else 0.7
+            ),
+            thinking_budget_tokens=(
+                int(config["thinkingBudgetTokens"]) if config.get("thinkingBudgetTokens") else None
+            ),
         )
 
     @staticmethod

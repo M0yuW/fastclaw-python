@@ -31,6 +31,7 @@ def create_app(
         app_runtime,
         AgentRuntimeConfig(
             data_root=app_settings.data_root,
+            legacy_data_root=app_settings.legacy_data_root,
             default_provider_name=app_settings.provider_name,
             default_provider_api_key=app_settings.provider_api_key,
             default_provider_api_base=app_settings.provider_api_base,

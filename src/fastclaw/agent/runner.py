@@ -128,6 +128,9 @@ class AgentRunner:
                             messages=tuple(history),
                             model=request.model,
                             tools=self._tools.definitions(request.allowed_tools),
+                            max_tokens=request.max_tokens,
+                            temperature=request.temperature,
+                            thinking_budget_tokens=request.thinking_budget_tokens,
                         )
                     )
                     async for provider_event in provider_stream:

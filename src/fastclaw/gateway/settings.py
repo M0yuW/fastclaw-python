@@ -11,6 +11,7 @@ from pathlib import Path
 class GatewaySettings:
     database_url: str
     data_root: Path = Path.home() / ".fastclaw-python"
+    legacy_data_root: Path = Path.home() / ".fastclaw"
     port: int = 18954
     session_ttl_seconds: int = 60 * 60 * 24 * 30
     secure_cookies: bool = False
@@ -33,6 +34,9 @@ class GatewaySettings:
             ),
             data_root=Path(
                 os.environ.get("FASTCLAW_DATA_ROOT", str(Path.home() / ".fastclaw-python"))
+            ).expanduser(),
+            legacy_data_root=Path(
+                os.environ.get("FASTCLAW_LEGACY_DATA_ROOT", str(Path.home() / ".fastclaw"))
             ).expanduser(),
             port=int(os.environ.get("FASTCLAW_PORT", "18954")),
             session_ttl_seconds=int(

@@ -18,7 +18,14 @@ from fastclaw.providers import (
     ProviderStream,
 )
 from fastclaw.runtime import Runtime
-from fastclaw.storage import AgentRecord, ConfigRecord, Database, UnitOfWork, UserRecord
+from fastclaw.storage import (
+    AgentFileRecord,
+    AgentRecord,
+    ConfigRecord,
+    Database,
+    UnitOfWork,
+    UserRecord,
+)
 
 
 class CoordinatingProvider:
@@ -147,6 +154,8 @@ async def test_root_and_nested_runs_share_queue_without_deadlock(tmp_path: Path)
             "model": "fixture/coordinator",
             "policy": "delegate-only",
             "maxToolIterations": 3,
+            "maxTokens": 8192,
+            "temperature": 0.1,
         },
         created_at=now,
         updated_at=now,
@@ -183,6 +192,8 @@ async def test_root_and_nested_runs_share_queue_without_deadlock(tmp_path: Path)
         ]
         assert len(coordinator_requests) == 2
         assert len(specialist_requests) == 1
+        assert coordinator_requests[0].max_tokens == 8192
+        assert coordinator_requests[0].temperature == 0.1
         assert [tool.function.name for tool in coordinator_requests[0].tools] == ["spawn_subagent"]
         assert specialist_requests[0].tools == ()
         async with UnitOfWork(database) as unit:
@@ -282,5 +293,155 @@ async def test_named_provider_credential_is_resolved_from_environment(
         assert selected.api_base == "https://deepseek.example/v1"
         assert selected.model == "deepseek/deepseek-v4-flash"
         assert readiness["providers"] is True
+    finally:
+        await close_manager(manager, runtime, database)
+
+
+async def test_profile_loads_skill_by_frontmatter_name_and_requires_preparation(
+    tmp_path: Path,
+) -> None:
+    skill_root = tmp_path / "skills" / "directory-name-differs"
+    skill_root.mkdir(parents=True)
+    (skill_root / "SKILL.md").write_text(
+        """---
+name: imported-skill-name
+description: Fixture
+---
+
+Read /legacy/.fastclaw/data before answering.
+""",
+        encoding="utf-8",
+    )
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'skill-profile.db'}")
+    await database.create_schema()
+    now = datetime.now(UTC)
+    agent = AgentRecord(
+        id="skill-agent",
+        user_id="user-1",
+        name="Skill Agent",
+        config={"model": "fixture/skill"},
+        created_at=now,
+        updated_at=now,
+    )
+    async with UnitOfWork(database) as unit:
+        store = unit.require_store()
+        await store.save_user(
+            UserRecord(
+                id="user-1",
+                username="fixture",
+                email="fixture@example.test",
+                password_hash="unused",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await store.save_agent(agent)
+        await store.save_agent_file(
+            AgentFileRecord(
+                agent_id=agent.id,
+                user_id=agent.user_id,
+                filename="agent.json",
+                data=b'{"skills":{"alwaysLoad":["imported-skill-name"]}}',
+            )
+        )
+    provider = CoordinatingProvider("")
+    runtime = Runtime((provider,))
+    await runtime.start()
+    manager = AgentRuntimeManager(
+        database,
+        runtime,
+        AgentRuntimeConfig(
+            data_root=tmp_path,
+            legacy_data_root=Path("/legacy/.fastclaw"),
+        ),
+    )
+    await manager.start()
+    try:
+        profile = await manager.profile(agent.id, agent.user_id)
+
+        assert [skill.name for skill in profile.skills] == ["imported-skill-name"]
+        assert profile.skills[0].root.name == "directory-name-differs"
+        assert "/legacy/.fastclaw" not in profile.system_prompt
+        assert str(tmp_path) in profile.system_prompt
+        assert (await manager.readiness())["skills"] is False
+
+        await manager.skill_catalog.prepare(profile.skills[0])
+        assert (await manager.readiness())["skills"] is True
+    finally:
+        await close_manager(manager, runtime, database)
+
+
+async def test_openrouter_standard_endpoint_requires_only_the_central_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FASTCLAW_PROVIDER_OPENROUTER_API_KEY", "central-secret")
+    now = datetime.now(UTC)
+    agent = AgentRecord(
+        id="openrouter-agent",
+        user_id="user-1",
+        name="OpenRouter",
+        config={"model": "openrouter/google/gemini-fixture", "policy": "no-tools"},
+        created_at=now,
+        updated_at=now,
+    )
+    provider = CoordinatingProvider("")
+    manager, runtime, database = await build_manager(tmp_path / "openrouter.db", provider, (agent,))
+    try:
+        # The fixture Runtime provider has a different name, so resolution uses
+        # the official OpenRouter compatibility endpoint.
+        selected = await manager.provider_selection(await manager.profile(agent.id, agent.user_id))
+
+        assert selected.api_base == "https://openrouter.ai/api/v1"
+        assert selected.api_key == "central-secret"
+        assert selected.source == "environment-default"
+    finally:
+        await close_manager(manager, runtime, database)
+
+
+async def test_agent_without_agent_json_inherits_system_defaults(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    agent = AgentRecord(
+        id="leo",
+        user_id="user-1",
+        name="LEO",
+        config={},
+        created_at=now,
+        updated_at=now,
+    )
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'defaults.db'}")
+    await database.create_schema()
+    async with UnitOfWork(database) as unit:
+        store = unit.require_store()
+        await store.save_user(
+            UserRecord(
+                id="user-1",
+                username="fixture",
+                email="fixture@example.test",
+                password_hash="unused",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await store.save_agent(agent)
+        await store.save_config(
+            ConfigRecord(
+                id="system-defaults",
+                kind="setting",
+                scope="system",
+                name="agents.defaults",
+                data={"model": "deepseek/deepseek-v4-pro", "maxToolIterations": 20},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    runtime = Runtime()
+    await runtime.start()
+    manager = AgentRuntimeManager(database, runtime, AgentRuntimeConfig(data_root=tmp_path))
+    await manager.start()
+    try:
+        profile = await manager.profile(agent.id, agent.user_id)
+
+        assert profile.agent.config["model"] == "deepseek/deepseek-v4-pro"
+        assert profile.agent.config["maxToolIterations"] == 20
     finally:
         await close_manager(manager, runtime, database)

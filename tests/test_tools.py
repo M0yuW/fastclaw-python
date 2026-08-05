@@ -10,7 +10,15 @@ import httpx
 import pytest
 
 from fastclaw.execution import ExecutionContext
-from fastclaw.tools import ExecTool, ReadFileTool, ToolRegistry, WebFetchTool
+from fastclaw.tools import (
+    ExecTool,
+    ListDirTool,
+    ReadFileTool,
+    ToolRegistry,
+    WebFetchTool,
+    WorldCupLedgerTool,
+    WriteFileTool,
+)
 
 
 def context() -> ExecutionContext:
@@ -37,6 +45,53 @@ async def test_read_file_is_confined_to_workspace(tmp_path: Path) -> None:
     assert denied.is_error
     assert "tool 'read_file' failed (reference " in denied.content
     assert "outside" not in denied.content
+
+
+async def test_workspace_list_and_atomic_write_remain_confined(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    writer = WriteFileTool(workspace)
+    listing = ListDirTool(workspace)
+
+    written = await writer.execute({"path": "reports/result.txt", "content": "complete"}, context())
+    result = await listing.execute({"path": "reports"}, context())
+
+    assert written.content == "wrote 8 bytes"
+    assert result.content == '[{"name":"result.txt","type":"file"}]'
+    with pytest.raises(ValueError, match="workspace"):
+        await writer.execute({"path": "../../escape", "content": "no"}, context())
+
+
+async def test_worldcup_ledger_is_atomic_unique_and_reports_directly(tmp_path: Path) -> None:
+    tool = WorldCupLedgerTool(tmp_path)
+    entry = {
+        "date": "2026-06-30",
+        "match": "France vs Sweden",
+        "our_pred": "France",
+        "our_confidence": "high",
+        "actual_result": None,
+    }
+
+    appended = await tool.execute({"operation": "append", "entry": entry}, context())
+    with pytest.raises(ValueError, match="already contains"):
+        await tool.execute({"operation": "append", "entry": entry}, context())
+    settled = await tool.execute(
+        {
+            "operation": "settle",
+            "date": entry["date"],
+            "match": entry["match"],
+            "actual_result": "France",
+            "actual_score": "2-1",
+        },
+        context(),
+    )
+    report = await tool.execute({"operation": "report"}, context())
+
+    assert appended.content == "prediction appended"
+    assert settled.content == "prediction settled"
+    assert report.direct_return is True
+    assert "France vs Sweden" in report.content
+    assert "2-1" in report.content
 
 
 @pytest.mark.asyncio
