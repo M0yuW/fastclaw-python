@@ -213,9 +213,10 @@ class AnthropicProvider:
             "model": strip_provider_prefix(request.model),
             "messages": messages,
             "max_tokens": request.max_tokens,
-            "temperature": request.temperature,
             "stream": True,
         }
+        if request.thinking_budget_tokens is None:
+            payload["temperature"] = request.temperature
         if systems:
             payload["system"] = "\n\n".join(systems)
         if request.tools:
