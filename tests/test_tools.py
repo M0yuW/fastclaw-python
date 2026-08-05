@@ -197,6 +197,7 @@ async def test_exec_cancellation_kills_the_entire_process_group(tmp_path: Path) 
         termination_grace_seconds=0.05,
     )
     started = anyio.current_time()
+    process_group_file = workspace / "process-group"
 
     with pytest.raises(TimeoutError):
         with anyio.fail_after(0.05):
@@ -205,10 +206,16 @@ async def test_exec_cancellation_kills_the_entire_process_group(tmp_path: Path) 
                     "argv": [
                         "sh",
                         "-c",
-                        "trap '' TERM; (trap '' TERM; while :; do :; done) & wait",
+                        (
+                            "printf '%s' $$ > process-group; "
+                            "trap '' TERM; (trap '' TERM; while :; do :; done) & wait"
+                        ),
                     ]
                 },
                 context(),
             )
 
     assert anyio.current_time() - started < 1
+    process_group_id = int(process_group_file.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.killpg(process_group_id, 0)
