@@ -258,8 +258,11 @@ class AnthropicProvider:
                     "signature": message.thinking_signature or "",
                 }
             )
-        if isinstance(message.content, tuple):
-            content.extend(self._content_part_payload(part) for part in message.content)
+        multipart = message.content_parts or (
+            message.content if isinstance(message.content, tuple) else ()
+        )
+        if multipart:
+            content.extend(self._content_part_payload(part) for part in multipart)
         elif message.content:
             content.append({"type": "text", "text": message.content})
         for call in message.tool_calls:
@@ -291,8 +294,11 @@ class AnthropicProvider:
     def _text_content(message: ChatMessage) -> str:
         if isinstance(message.content, str):
             return message.content
-        if isinstance(message.content, tuple):
-            return "\n".join(part.text or "" for part in message.content if part.type == "text")
+        multipart = message.content_parts or (
+            message.content if isinstance(message.content, tuple) else ()
+        )
+        if multipart:
+            return "\n".join(part.text or "" for part in multipart if part.type == "text")
         return ""
 
     @staticmethod
