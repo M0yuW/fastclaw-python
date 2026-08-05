@@ -115,9 +115,14 @@ class OpenAIProvider:
                 content = delta.get("content")
                 if isinstance(content, str) and content:
                     yield ProviderEvent(type=ProviderEventType.CONTENT_DELTA, content=content)
-                thinking = delta.get("reasoning_content", delta.get("thinking"))
+                thinking_field = "reasoning_content" if "reasoning_content" in delta else "thinking"
+                thinking = delta.get(thinking_field)
                 if isinstance(thinking, str) and thinking:
-                    yield ProviderEvent(type=ProviderEventType.THINKING_DELTA, content=thinking)
+                    yield ProviderEvent(
+                        type=ProviderEventType.THINKING_DELTA,
+                        content=thinking,
+                        raw_assistant_delta={thinking_field: thinking},
+                    )
                 signature = delta.get("thinking_signature")
                 if isinstance(signature, str) and signature:
                     yield ProviderEvent(

@@ -94,6 +94,8 @@ async def test_anthropic_stream_preserves_blocks_signature_tools_and_usage() -> 
         response = await provider.chat(
             ChatRequest(
                 model="anthropic/claude-test",
+                max_tokens=2048,
+                thinking_budget_tokens=1024,
                 messages=(
                     ChatMessage(role=MessageRole.SYSTEM, content="system rules"),
                     ChatMessage(
@@ -111,6 +113,8 @@ async def test_anthropic_stream_preserves_blocks_signature_tools_and_usage() -> 
     assert len(requests) == 1
     assert requests[0]["model"] == "claude-test"
     assert requests[0]["system"] == "system rules"
+    assert requests[0]["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+    assert "temperature" not in requests[0]
     assert requests[0]["messages"][0] == raw_assistant  # type: ignore[index]
     assert response.content == "Hello"
     assert response.thinking == "reason"
