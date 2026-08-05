@@ -98,6 +98,44 @@ class AgentCreate(WireModel):
     model: str = ""
 
 
+class AgentUpdate(WireModel):
+    name: str | None = None
+    description: str | None = None
+    model: str | None = None
+    soul: str | None = None
+    skills: dict[str, Any] | None = None
+    providers: dict[str, Any] | None = None
+    allowed_tools: list[str] | None = None
+    policy: Literal["no-tools", "delegate-only", "custom"] | None = None
+
+
+class AdminUserCreate(WireModel):
+    username: str
+    email: str
+    password: str = Field(min_length=8)
+    display_name: str = ""
+    role: Literal["user", "super_admin"] = "user"
+
+
+class AdminUserUpdate(WireModel):
+    display_name: str | None = None
+    role: Literal["user", "super_admin"] | None = None
+    status: Literal["active", "disabled"] | None = None
+
+
+class PasswordReset(WireModel):
+    password: str = Field(min_length=8)
+
+
+class SessionUpdate(WireModel):
+    agent_id: str
+    title: str = Field(max_length=200)
+
+
+class SystemFileWrite(WireModel):
+    content: str = Field(max_length=1_000_000)
+
+
 class APIKeyCreate(WireModel):
     name: str
     agent_ids: list[str] = Field(default_factory=list)

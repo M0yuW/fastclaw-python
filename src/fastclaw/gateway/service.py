@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -83,7 +83,7 @@ class GatewayService:
                     api_key_id=key.id,
                     api_key_agents=agents,
                 )
-                return AuthContext(identity, user)
+                return await self._apply_act_as(request, identity, user)
 
             sid = request.cookies.get(SESSION_COOKIE, "")
             session = await store.get_web_session(sid) if sid else None
@@ -92,9 +92,27 @@ class GatewayService:
             user = await store.get_user(session.user_id)
             if user is None or user.status != "active":
                 raise HTTPException(status.HTTP_401_UNAUTHORIZED, "inactive session owner")
-            return AuthContext(
-                Identity(user_id=user.id, role=user.role, auth_method="cookie"), user
+            identity = Identity(user_id=user.id, role=user.role, auth_method="cookie")
+            return await self._apply_act_as(request, identity, user)
+
+    async def _apply_act_as(
+        self, request: Request, identity: Identity, user: UserRecord
+    ) -> AuthContext:
+        target = (
+            request.query_params.get("actAs", "").strip()
+            or request.headers.get("x-fastclaw-act-as", "").strip()
+        )
+        if not target or target == user.id:
+            return AuthContext(identity, user)
+        if identity.role != "super_admin" or identity.auth_method != "cookie":
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN, "actAs requires an administrator session"
             )
+        async with UnitOfWork(self.database) as unit:
+            target_user = await unit.require_store().get_user(target)
+        if target_user is None or target_user.status != "active":
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "actAs user not found")
+        return AuthContext(replace(identity, act_as_user_id=target), user)
 
     async def login(self, login: str, password: str) -> tuple[UserRecord, WebSessionRecord]:
         async with UnitOfWork(self.database) as unit:

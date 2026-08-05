@@ -112,6 +112,10 @@ class InProcessMessageBus:
             raise ValueError(f"agent {agent_id!r} is already registered")
         self._handlers[agent_id] = (user_id, handler)
 
+    def unregister(self, agent_id: str) -> None:
+        """Prevent new delegations while allowing already-started calls to finish."""
+        self._handlers.pop(agent_id, None)
+
     async def request(
         self, context: ExecutionContext, target_agent_id: str, task: str
     ) -> TaskResult:

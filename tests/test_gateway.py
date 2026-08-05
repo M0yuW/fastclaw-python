@@ -11,16 +11,33 @@ from fastapi import FastAPI
 
 from fastclaw.app import create_app
 from fastclaw.gateway import GatewaySettings
-from fastclaw.identity import hash_api_key
+from fastclaw.identity import hash_api_key, hash_password
 from fastclaw.runtime import Runtime
-from fastclaw.storage import AgentFileRecord, AgentRecord, APIKeyRecord, Database, UnitOfWork
+from fastclaw.storage import (
+    AgentFileRecord,
+    AgentRecord,
+    APIKeyRecord,
+    Database,
+    SessionRecord,
+    UnitOfWork,
+    UserRecord,
+)
 
 
 @asynccontextmanager
 async def gateway_client(
     path: Path, *, transport: httpx.AsyncBaseTransport | None = None
 ) -> AsyncIterator[tuple[httpx.AsyncClient, Database]]:
-    settings = GatewaySettings(database_url=f"sqlite+aiosqlite:///{path}", port=18954)
+    settings = GatewaySettings(
+        database_url=f"sqlite+aiosqlite:///{path}",
+        data_root=path.parent / "data",
+        legacy_data_root=path.parent / "legacy",
+        port=18954,
+        provider_name="fixture",
+        provider_api_key="provider-secret",
+        provider_api_base="https://llm.test/v1",
+        provider_api_type="openai-compatible",
+    )
     runtime = Runtime(
         http_client_factory=lambda: (
             httpx.AsyncClient(transport=transport) if transport is not None else httpx.AsyncClient()
@@ -66,7 +83,7 @@ async def login(client: httpx.AsyncClient) -> None:
 
 
 async def test_onboard_cookie_auth_status_agents_and_masked_provider(tmp_path: Path) -> None:
-    async with gateway_client(tmp_path / "gateway.db") as (client, _):
+    async with gateway_client(tmp_path / "gateway.db") as (client, database):
         root = await client.get("/")
         before = await client.get("/api/status")
         created = await onboard(client)
@@ -94,6 +111,19 @@ async def test_onboard_cookie_auth_status_agents_and_masked_provider(tmp_path: P
         token = created_key.json()["token"]
         listed_keys = await client.get("/api/apikeys")
         bearer_me = await client.get("/api/me", headers={"Authorization": f"Bearer {token}"})
+        rejected_provider_secret = await client.post(
+            "/api/providers",
+            json={
+                "name": "deepseek",
+                "scope": "user",
+                "apiBase": "https://api.deepseek.com",
+                "apiKey": "must-not-persist",
+            },
+        )
+        async with UnitOfWork(database) as unit:
+            stored_providers = await unit.require_store().list_configs(
+                kind="provider", user_id=created["userId"], agent_id=""
+            )
 
         assert root.status_code == 200
         assert before.json()["configured"] is False
@@ -111,6 +141,8 @@ async def test_onboard_cookie_auth_status_agents_and_masked_provider(tmp_path: P
         assert token.startswith("fc_")
         assert token not in json.dumps(listed_keys.json())
         assert bearer_me.json()["authMethod"] == "apikey"
+        assert rejected_provider_secret.status_code == 400
+        assert all("apiKey" not in item.data for item in stored_providers)
 
         logged_out = await client.post("/api/logout")
         denied = await client.get("/api/me")
@@ -256,3 +288,159 @@ async def test_chat_stream_and_history_use_configured_provider(tmp_path: Path) -
         assert [message["role"] for message in messages] == ["system", "user", "assistant"]
         assert "You are the imported analyst." in messages[0]["content"]
         assert messages[-1]["content"] == "hello world"
+
+
+async def test_admin_act_as_is_tenant_scoped_and_read_only(tmp_path: Path) -> None:
+    async with gateway_client(tmp_path / "admin.db") as (client, database):
+        created = await onboard(client)
+        now = datetime.now(UTC)
+        async with UnitOfWork(database) as unit:
+            store = unit.require_store()
+            await store.save_user(
+                UserRecord(
+                    id="usr_benchmark",
+                    username="benchmark",
+                    email="benchmark@example.test",
+                    password_hash=hash_password("benchmark password"),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            await store.save_agent(
+                AgentRecord(
+                    id="agent-benchmark",
+                    user_id="usr_benchmark",
+                    name="Benchmark Coordinator",
+                    config={"model": "fixture/model-1"},
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        await login(client)
+
+        users = await client.get("/api/admin/users")
+        all_agents = await client.get("/api/admin/agents")
+        acting = {"x-fastclaw-act-as": "usr_benchmark"}
+        me = await client.get("/api/me", headers=acting)
+        agents = await client.get("/api/agents", headers=acting)
+        mutation = await client.put(
+            "/api/agents/agent-benchmark",
+            headers=acting,
+            json={"name": "must not change"},
+        )
+        chat = await client.post(
+            "/api/chat",
+            headers=acting,
+            json={"agentId": "agent-benchmark", "sessionId": "read-only", "message": "no"},
+        )
+
+        assert {item["id"] for item in users.json()["users"]} == {
+            created["userId"],
+            "usr_benchmark",
+        }
+        benchmark = next(
+            item for item in all_agents.json()["agents"] if item["id"] == "agent-benchmark"
+        )
+        assert benchmark["ownerUsername"] == "benchmark"
+        assert me.json()["actAsUserId"] == "usr_benchmark"
+        assert me.json()["readOnly"] is True
+        assert [item["id"] for item in agents.json()["agents"]] == ["agent-benchmark"]
+        assert mutation.status_code == 403
+        assert chat.status_code == 403
+
+
+async def test_agent_system_files_config_and_workspace_listing(tmp_path: Path) -> None:
+    database_path = tmp_path / "files.db"
+    async with gateway_client(database_path) as (client, _):
+        created = await onboard(client)
+        agent_id = created["agentId"]
+        base_dir = tmp_path / "data" / "agents" / agent_id
+        base_dir.mkdir(parents=True)
+        (base_dir / "SOUL.md").write_text("base soul", encoding="utf-8")
+        workspace = tmp_path / "data" / "workspaces" / agent_id
+        workspace.mkdir(parents=True)
+        (workspace / "report.md").write_text("report", encoding="utf-8")
+        await login(client)
+
+        base = await client.get(f"/api/agents/{agent_id}/system-files/SOUL.md")
+        uploaded = await client.post(
+            f"/api/agents/{agent_id}/files",
+            params={"sessionId": "session-1"},
+            files={"file": ("evidence.txt", b"evidence", "text/plain")},
+        )
+        rejected_path = await client.post(
+            f"/api/agents/{agent_id}/files",
+            files={"file": ("../escape.txt", b"no", "text/plain")},
+        )
+        saved = await client.put(
+            f"/api/agents/{agent_id}/system-files/SOUL.md",
+            json={"content": "edited soul"},
+        )
+        override = await client.get(f"/api/agents/{agent_id}/system-files/SOUL.md")
+        updated = await client.put(
+            f"/api/agents/{agent_id}",
+            json={"description": "updated", "policy": "delegate-only"},
+        )
+        config = await client.get(f"/api/agents/{agent_id}/config")
+        files = await client.get(f"/api/agents/{agent_id}/files")
+        downloaded = await client.get(f"/api/agents/{agent_id}/files/report.md")
+        reverted = await client.delete(f"/api/agents/{agent_id}/system-files/SOUL.md")
+        fallback = await client.get(f"/api/agents/{agent_id}/system-files/SOUL.md")
+
+        assert base.json() == {"content": "base soul", "source": "fs"}
+        assert uploaded.json()["files"] == [{"path": "sessions/session-1/evidence.txt", "size": 8}]
+        assert rejected_path.status_code == 400
+        assert saved.json() == {"ok": True}
+        assert override.json() == {
+            "content": "edited soul",
+            "source": "db",
+            "baseContent": "base soul",
+        }
+        assert updated.json()["agent"]["description"] == "updated"
+        assert config.json()["policy"] == "delegate-only"
+        assert files.json()["files"][0]["path"] == "report.md"
+        assert downloaded.text == "report"
+        assert reverted.json() == {"ok": True}
+        assert fallback.json() == {"content": "base soul", "source": "fs"}
+
+
+async def test_session_management_config_and_unsupported_envelopes(tmp_path: Path) -> None:
+    async with gateway_client(tmp_path / "sessions.db") as (client, database):
+        created = await onboard(client)
+        now = datetime.now(UTC)
+        async with UnitOfWork(database) as unit:
+            await unit.require_store().save_session(
+                SessionRecord(
+                    user_id=created["userId"],
+                    agent_id=created["agentId"],
+                    key="session-1",
+                    title="Old",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        await login(client)
+
+        renamed = await client.put(
+            "/api/chat/sessions/session-1",
+            json={"agentId": created["agentId"], "title": "Renamed"},
+        )
+        sessions = await client.get("/api/chat/sessions", params={"agentId": created["agentId"]})
+        safe_config = await client.post(
+            "/api/config", json={"agents": {"defaults": {"maxTokens": 2048}}}
+        )
+        leaked_config = await client.post(
+            "/api/config", json={"providers": {"deepseek": {"apiKey": "plaintext"}}}
+        )
+        unsupported = await client.get("/api/plugins")
+        deleted = await client.delete(
+            "/api/chat/sessions/session-1", params={"agentId": created["agentId"]}
+        )
+
+        assert renamed.json() == {"ok": True}
+        assert sessions.json()["sessions"][0]["title"] == "Renamed"
+        assert safe_config.json() == {"ok": True}
+        assert leaked_config.status_code == 400
+        assert unsupported.status_code == 501
+        assert unsupported.json()["code"] == "not_implemented"
+        assert deleted.json() == {"ok": True}

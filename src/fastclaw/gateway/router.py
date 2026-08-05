@@ -3,30 +3,40 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
+import tempfile
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from fastclaw.agent import AgentEvent, AgentEventType
 from fastclaw.agent.manager import AgentRuntimeManager
 from fastclaw.gateway.models import (
+    AdminUserCreate,
+    AdminUserUpdate,
     AgentCreate,
+    AgentUpdate,
     APIKeyAgents,
     APIKeyCreate,
     ChatInput,
     LoginRequest,
     OnboardRequest,
     OpenAIChatInput,
+    PasswordReset,
     ProviderTest,
     ProviderUpdate,
     ProviderWrite,
+    SessionUpdate,
     StoredProviderTest,
+    SystemFileWrite,
 )
 from fastclaw.gateway.service import (
     SESSION_COOKIE,
@@ -38,7 +48,9 @@ from fastclaw.gateway.settings import GatewaySettings
 from fastclaw.identity import generate_api_key, hash_api_key, hash_password, use_identity
 from fastclaw.providers import ChatMessage, ChatRequest, MessageRole, create_provider
 from fastclaw.runtime import Runtime
+from fastclaw.skills import SkillError
 from fastclaw.storage import (
+    AgentFileRecord,
     AgentRecord,
     APIKeyRecord,
     ConfigRecord,
@@ -46,6 +58,20 @@ from fastclaw.storage import (
     UnitOfWork,
     UserRecord,
 )
+
+_SYSTEM_FILES = frozenset(
+    {
+        "SOUL.md",
+        "IDENTITY.md",
+        "USER.md",
+        "TOOLS.md",
+        "BOOTSTRAP.md",
+        "HEARTBEAT.md",
+        "MEMORY.md",
+        "AGENTS.md",
+    }
+)
+_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 
 class Gateway:
@@ -84,6 +110,76 @@ def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
 
 
+def _safe_child(root: Path, relative: str) -> Path:
+    if not relative or "\x00" in relative:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid file path")
+    root = root.resolve()
+    candidate = (root / relative).resolve()
+    if not candidate.is_relative_to(root):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "file path escapes workspace")
+    return candidate
+
+
+def _write_atomic(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in patch.items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(current, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _find_plaintext_credentials(value: Any, path: str = "") -> list[str]:
+    sensitive = {"apikey", "bottoken", "apptoken", "token", "password", "secret"}
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            child = f"{path}.{key}" if path else str(key)
+            if (
+                str(key).lower() in sensitive
+                and isinstance(item, str)
+                and item
+                and "****" not in item
+            ):
+                found.append(child)
+            else:
+                found.extend(_find_plaintext_credentials(item, child))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            found.extend(_find_plaintext_credentials(item, f"{path}[{index}]"))
+    return found
+
+
+def _drop_credentials(value: Any) -> Any:
+    sensitive = {"apikey", "bottoken", "apptoken", "token", "password", "secret"}
+    if isinstance(value, dict):
+        return {
+            key: _drop_credentials(item)
+            for key, item in value.items()
+            if str(key).lower() not in sensitive
+        }
+    if isinstance(value, list):
+        return [_drop_credentials(item) for item in value]
+    return value
+
+
 def _web_event(event: AgentEvent) -> dict[str, Any]:
     data: dict[str, Any] = {
         "turnId": event.turn_id,
@@ -120,6 +216,22 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             yield auth
 
     auth_dependency = Depends(require_auth)
+
+    def require_mutation(auth: AuthContext, *, admin: bool = False) -> None:
+        if auth.identity.read_only or auth.identity.auth_method == "apikey":
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "credential is read-only")
+        if admin and auth.identity.role != "super_admin":
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "admin required")
+
+    async def require_mutable_agent(auth: AuthContext, agent_id: str) -> AgentRecord:
+        require_mutation(auth)
+        agent = await service.require_agent(auth, agent_id)
+        if agent.user_id != auth.identity.effective_user_id:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "cross-tenant Agent access is read-only; use actAs for inspection",
+            )
+        return agent
 
     @router.get("/", include_in_schema=False, response_model=None)
     async def root() -> Response | dict[str, Any]:
@@ -219,7 +331,7 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                     updated_at=now,
                 )
             )
-            if provider_name and payload.api_base and payload.api_key:
+            if provider_name and payload.api_base:
                 await store.save_config(
                     ConfigRecord(
                         id=f"cfg_{secrets.token_hex(10)}",
@@ -230,7 +342,6 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                         name=provider_name,
                         data={
                             "apiBase": payload.api_base,
-                            "apiKey": payload.api_key,
                             "apiType": payload.api_type,
                             "authType": payload.auth_type,
                             "model": model,
@@ -258,7 +369,12 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                         updated_at=now,
                     )
                 )
-        return {"ok": True, "userId": user_id, "agentId": agent_id}
+        return {
+            "ok": True,
+            "userId": user_id,
+            "agentId": agent_id,
+            "providerCredentialStored": False,
+        }
 
     @router.post("/api/onboard")
     async def onboard(payload: OnboardRequest) -> dict[str, Any]:
@@ -300,6 +416,109 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             "readOnly": auth.identity.read_only,
         }
 
+    @router.get("/api/admin/users")
+    async def admin_users(auth: AuthContext = auth_dependency) -> dict[str, Any]:
+        require_mutation(auth, admin=True)
+        async with UnitOfWork(gateway.database) as unit:
+            users = await unit.require_store().list_users()
+        return {"users": [service.public_user(user) for user in users]}
+
+    @router.post("/api/admin/users", status_code=status.HTTP_201_CREATED)
+    async def admin_create_user(
+        payload: AdminUserCreate, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        require_mutation(auth, admin=True)
+        now = datetime.now(UTC)
+        record = UserRecord(
+            id=f"usr_{secrets.token_hex(10)}",
+            username=payload.username.strip(),
+            email=payload.email.strip(),
+            password_hash=hash_password(payload.password),
+            display_name=payload.display_name.strip(),
+            role=payload.role,
+            created_at=now,
+            updated_at=now,
+        )
+        if not record.username or not record.email:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "username and email are required")
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            if await store.get_user_by_login(record.username) or await store.get_user_by_login(
+                record.email
+            ):
+                raise HTTPException(status.HTTP_409_CONFLICT, "username or email already exists")
+            await store.save_user(record)
+        return {"ok": True, "user": service.public_user(record)}
+
+    async def require_admin_user(auth: AuthContext, user_id: str) -> UserRecord:
+        require_mutation(auth, admin=True)
+        async with UnitOfWork(gateway.database) as unit:
+            user = await unit.require_store().get_user(user_id)
+        if user is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "user not found")
+        return user
+
+    @router.put("/api/admin/users/{user_id}")
+    async def admin_update_user(
+        user_id: str, payload: AdminUserUpdate, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        record = await require_admin_user(auth, user_id)
+        patch = payload.model_dump(exclude_unset=True)
+        if user_id == auth.identity.user_id and patch.get("status") == "disabled":
+            raise HTTPException(status.HTTP_409_CONFLICT, "cannot disable the current user")
+        if user_id == auth.identity.user_id and patch.get("role") not in {None, "super_admin"}:
+            raise HTTPException(status.HTTP_409_CONFLICT, "cannot demote the current user")
+        updated = record.model_copy(update={**patch, "updated_at": datetime.now(UTC)})
+        async with UnitOfWork(gateway.database) as unit:
+            await unit.require_store().save_user(updated)
+        return {"ok": True, "user": service.public_user(updated)}
+
+    @router.post("/api/admin/users/{user_id}/password")
+    async def admin_reset_password(
+        user_id: str, payload: PasswordReset, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        record = await require_admin_user(auth, user_id)
+        updated = record.model_copy(
+            update={
+                "password_hash": hash_password(payload.password),
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        async with UnitOfWork(gateway.database) as unit:
+            await unit.require_store().save_user(updated)
+        return {"ok": True}
+
+    @router.delete("/api/admin/users/{user_id}")
+    async def admin_delete_user(
+        user_id: str, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        await require_admin_user(auth, user_id)
+        if user_id == auth.identity.user_id:
+            raise HTTPException(status.HTTP_409_CONFLICT, "cannot delete the current user")
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            agents = await store.list_agents(user_id)
+            await store.delete_user(user_id)
+        for agent in agents:
+            gateway.agent_manager.remove_profile(agent.id)
+        return {"ok": True}
+
+    @router.get("/api/admin/agents")
+    async def admin_agents(auth: AuthContext = auth_dependency) -> dict[str, Any]:
+        require_mutation(auth, admin=True)
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            users = await store.list_users()
+            agents = [agent for user in users for agent in await store.list_agents(user.id)]
+        resolved = [(await service.agent_runtime_profile(agent)).agent for agent in agents]
+        owners = {user.id: user.username for user in users}
+        return {
+            "agents": [
+                {**_agent_json(agent), "ownerUsername": owners.get(agent.user_id, "")}
+                for agent in resolved
+            ]
+        }
+
     @router.get("/api/agents")
     async def list_agents(auth: AuthContext = auth_dependency) -> dict[str, Any]:
         async with UnitOfWork(gateway.database) as unit:
@@ -332,6 +551,182 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         agent = await service.require_agent(auth, agent_id)
         return {"agent": _agent_json((await service.agent_runtime_profile(agent)).agent)}
 
+    @router.get("/api/agents/{agent_id}/config")
+    async def get_agent_config(
+        agent_id: str, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        agent = await service.require_agent(auth, agent_id)
+        async with UnitOfWork(gateway.database) as unit:
+            raw = await unit.require_store().get_agent_file(agent.id, agent.user_id, "agent.json")
+        if raw is not None:
+            try:
+                parsed = json.loads(raw.data)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                return {**parsed, **agent.config}
+        return dict(agent.config)
+
+    @router.put("/api/agents/{agent_id}")
+    async def update_agent(
+        agent_id: str, payload: AgentUpdate, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        agent = await require_mutable_agent(auth, agent_id)
+        values = payload.model_dump(exclude_unset=True, by_alias=True)
+        if _find_plaintext_credentials(values):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Agent credentials must use declared environment variables",
+            )
+        values = _drop_credentials(values)
+        name = str(values.pop("name", agent.name)).strip()
+        if not name:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "agent name is required")
+        config = dict(agent.config)
+        if values.get("policy") == "custom":
+            values.pop("policy")
+            config.pop("policy", None)
+        config.update(values)
+        updated = agent.model_copy(
+            update={"name": name, "config": config, "updated_at": datetime.now(UTC)}
+        )
+        async with UnitOfWork(gateway.database) as unit:
+            await unit.require_store().save_agent(updated)
+        resolved = (await service.agent_runtime_profile(updated)).agent
+        return {"ok": True, "agent": _agent_json(resolved)}
+
+    @router.delete("/api/agents/{agent_id}")
+    async def delete_agent(agent_id: str, auth: AuthContext = auth_dependency) -> dict[str, Any]:
+        await require_mutable_agent(auth, agent_id)
+        async with UnitOfWork(gateway.database) as unit:
+            await unit.require_store().delete_agent(agent_id)
+        gateway.agent_manager.remove_profile(agent_id)
+        return {"ok": True, "assetsRetained": True}
+
+    @router.get("/api/agents/{agent_id}/system-files/{filename}")
+    async def get_system_file(
+        agent_id: str, filename: str, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        if filename not in _SYSTEM_FILES:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "system file not found")
+        agent = await service.require_agent(auth, agent_id)
+        async with UnitOfWork(gateway.database) as unit:
+            override = await unit.require_store().get_agent_file(agent.id, agent.user_id, filename)
+        base_path = gateway.settings.data_root / "agents" / agent.id / filename
+        base = base_path.read_text(encoding="utf-8") if base_path.is_file() else ""
+        if override is not None:
+            return {
+                "content": override.data.decode("utf-8"),
+                "source": "db",
+                "baseContent": base,
+            }
+        return {"content": base, "source": "fs" if base else "default"}
+
+    @router.put("/api/agents/{agent_id}/system-files/{filename}")
+    async def put_system_file(
+        agent_id: str,
+        filename: str,
+        payload: SystemFileWrite,
+        auth: AuthContext = auth_dependency,
+    ) -> dict[str, Any]:
+        if filename not in _SYSTEM_FILES:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "unsupported system file")
+        agent = await require_mutable_agent(auth, agent_id)
+        now = datetime.now(UTC)
+        updated = agent.model_copy(update={"updated_at": now})
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            await store.save_agent_file(
+                AgentFileRecord(
+                    agent_id=agent.id,
+                    user_id=agent.user_id,
+                    filename=filename,
+                    data=payload.content.encode("utf-8"),
+                    updated_at=now,
+                )
+            )
+            await store.save_agent(updated)
+        await gateway.agent_manager.reload_profile(updated)
+        return {"ok": True}
+
+    @router.delete("/api/agents/{agent_id}/system-files/{filename}")
+    async def delete_system_file(
+        agent_id: str, filename: str, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        if filename not in _SYSTEM_FILES:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "system file not found")
+        agent = await require_mutable_agent(auth, agent_id)
+        now = datetime.now(UTC)
+        updated = agent.model_copy(update={"updated_at": now})
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            await store.delete_agent_file(agent.id, agent.user_id, filename)
+            await store.save_agent(updated)
+        await gateway.agent_manager.reload_profile(updated)
+        return {"ok": True}
+
+    @router.get("/api/agents/{agent_id}/files")
+    async def list_agent_workspace_files(
+        agent_id: str, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        await service.require_agent(auth, agent_id)
+        root = gateway.settings.data_root / "workspaces" / agent_id
+        files: list[dict[str, Any]] = []
+        if root.is_dir():
+            for path in sorted(root.rglob("*")):
+                if path.is_symlink() or not path.is_file():
+                    continue
+                stat_result = path.stat()
+                files.append(
+                    {
+                        "path": path.relative_to(root).as_posix(),
+                        "size": stat_result.st_size,
+                        "modTime": int(stat_result.st_mtime * 1000),
+                    }
+                )
+        return {"files": files}
+
+    @router.post("/api/agents/{agent_id}/files")
+    async def upload_agent_workspace_files(
+        agent_id: str,
+        request: Request,
+        sessionId: str = "",
+        auth: AuthContext = auth_dependency,
+    ) -> dict[str, Any]:
+        await require_mutable_agent(auth, agent_id)
+        form = await request.form()
+        uploads = [item for item in form.getlist("file") if isinstance(item, StarletteUploadFile)]
+        if not uploads:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "no files supplied")
+        root = gateway.settings.data_root / "workspaces" / agent_id
+        base = _safe_child(root, f"sessions/{sessionId}") if sessionId else root.resolve()
+        written: list[dict[str, Any]] = []
+        total = 0
+        for upload in uploads:
+            filename = Path(upload.filename or "").name
+            if not filename or filename != (upload.filename or ""):
+                raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid upload filename")
+            data = await upload.read(_MAX_UPLOAD_BYTES + 1)
+            total += len(data)
+            if len(data) > _MAX_UPLOAD_BYTES or total > _MAX_UPLOAD_BYTES:
+                raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "upload is too large")
+            target = _safe_child(base, filename)
+            _write_atomic(target, data)
+            written.append(
+                {"path": target.relative_to(root.resolve()).as_posix(), "size": len(data)}
+            )
+        return {"ok": True, "files": written}
+
+    @router.get("/api/agents/{agent_id}/files/{filename:path}", response_model=None)
+    async def get_agent_workspace_file(
+        agent_id: str, filename: str, auth: AuthContext = auth_dependency
+    ) -> Response:
+        await service.require_agent(auth, agent_id)
+        target = _safe_child(gateway.settings.data_root / "workspaces" / agent_id, filename)
+        if not target.is_file() or target.is_symlink():
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "file not found")
+        return FileResponse(target)
+
     async def require_owned_api_key(auth: AuthContext, api_key_id: str) -> APIKeyRecord:
         if auth.identity.auth_method == "apikey" or auth.identity.read_only:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "credential cannot manage API keys")
@@ -344,7 +739,9 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
     async def validate_api_key_agents(auth: AuthContext, agent_ids: list[str]) -> list[str]:
         unique = list(dict.fromkeys(agent_ids))
         for agent_id in unique:
-            await service.require_agent(auth, agent_id)
+            agent = await service.require_agent(auth, agent_id)
+            if agent.user_id != auth.identity.effective_user_id:
+                raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-tenant Agent ACL denied")
         return unique
 
     async def api_key_json(record: APIKeyRecord) -> dict[str, Any]:
@@ -485,7 +882,7 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                     "apiBase": str(item.data.get("apiBase") or ""),
                     "apiType": str(item.data.get("apiType") or "openai-compatible"),
                     "authType": str(item.data.get("authType") or "bearer-token"),
-                    "apiKey": mask_secret(str(item.data.get("apiKey") or "")),
+                    "apiKey": mask_secret(gateway.agent_manager.provider_credential(item.name)),
                     "models": item.data.get("models") or [],
                     "updatedAt": item.updated_at.isoformat(),
                 }
@@ -499,13 +896,18 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
     ) -> dict[str, Any]:
         if auth.identity.read_only or auth.identity.auth_method == "apikey":
             raise HTTPException(status.HTTP_403_FORBIDDEN, "credential is read-only")
+        if payload.api_key:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"set FASTCLAW_PROVIDER_{payload.name.upper().replace('-', '_')}_API_KEY instead",
+            )
         if payload.scope == "system":
             if auth.identity.role != "super_admin":
                 raise HTTPException(status.HTTP_403_FORBIDDEN, "admin required")
             scope_id = ""
         elif payload.scope == "agent":
             scope_id = payload.scope_id
-            await service.require_agent(auth, scope_id)
+            await require_mutable_agent(auth, scope_id)
         else:
             scope_id = payload.scope_id or auth.identity.effective_user_id
             if scope_id != auth.identity.effective_user_id:
@@ -526,7 +928,6 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             name=payload.name,
             data={
                 "apiBase": payload.api_base,
-                "apiKey": payload.api_key,
                 "apiType": payload.api_type,
                 "authType": payload.auth_type,
                 "models": payload.models,
@@ -551,21 +952,31 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             await service.require_agent(auth, record.scope_id)
         return record
 
+    async def require_mutable_provider(auth: AuthContext, provider_id: str) -> ConfigRecord:
+        require_mutation(auth)
+        record = await require_provider_record(auth, provider_id)
+        if record.scope != "system" and record.user_id != auth.identity.effective_user_id:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-tenant provider access denied")
+        return record
+
     @router.put("/api/providers/{provider_id}")
     async def update_provider(
         provider_id: str,
         payload: ProviderUpdate,
         auth: AuthContext = auth_dependency,
     ) -> dict[str, Any]:
-        if auth.identity.read_only or auth.identity.auth_method == "apikey":
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "credential is read-only")
-        record = await require_provider_record(auth, provider_id)
+        record = await require_mutable_provider(auth, provider_id)
         patch = payload.model_dump(exclude_unset=True, by_alias=True)
         enabled = bool(patch.pop("enabled", record.enabled))
         name = str(patch.pop("name", record.name))
         data = dict(record.data)
-        if patch.get("apiKey", None) == "":
-            patch.pop("apiKey")
+        data.pop("apiKey", None)
+        requested_key = str(patch.pop("apiKey", ""))
+        if requested_key and "****" not in requested_key:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"set FASTCLAW_PROVIDER_{record.name.upper().replace('-', '_')}_API_KEY instead",
+            )
         data.update(patch)
         updated = record.model_copy(
             update={"name": name, "enabled": enabled, "data": data, "updated_at": datetime.now(UTC)}
@@ -578,9 +989,7 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
     async def delete_provider(
         provider_id: str, auth: AuthContext = auth_dependency
     ) -> dict[str, Any]:
-        if auth.identity.read_only or auth.identity.auth_method == "apikey":
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "credential is read-only")
-        await require_provider_record(auth, provider_id)
+        await require_mutable_provider(auth, provider_id)
         async with UnitOfWork(gateway.database) as unit:
             await unit.require_store().delete_config(provider_id)
         return {"ok": True}
@@ -622,11 +1031,11 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         payload: StoredProviderTest,
         auth: AuthContext = auth_dependency,
     ) -> dict[str, Any]:
-        record = await require_provider_record(auth, provider_id)
+        record = await require_mutable_provider(auth, provider_id)
         return await run_provider_test(
             name=record.name,
             api_base=str(record.data.get("apiBase") or ""),
-            api_key=str(record.data.get("apiKey") or ""),
+            api_key=gateway.agent_manager.provider_credential(record.name),
             api_type=str(record.data.get("apiType") or "openai-compatible"),
             model=payload.model,
         )
@@ -636,7 +1045,7 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         records = await provider_records(auth)
         providers = {
             item.name: {
-                "apiKey": mask_secret(str(item.data.get("apiKey") or "")),
+                "apiKey": mask_secret(gateway.agent_manager.provider_credential(item.name)),
                 "apiBase": str(item.data.get("apiBase") or ""),
                 "apiType": str(item.data.get("apiType") or "openai-compatible"),
                 "authType": str(item.data.get("authType") or "bearer-token"),
@@ -644,7 +1053,11 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             }
             for item in records
         }
-        return {
+        async with UnitOfWork(gateway.database) as unit:
+            stored = await unit.require_store().find_config(
+                kind="setting", scope="system", scope_id="", name="system.config"
+            )
+        result: dict[str, Any] = {
             "providers": providers,
             "agents": {
                 "defaults": {
@@ -659,6 +1072,69 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             "storage": {"type": "sqlite"},
             "hooks": {"enabled": False},
         }
+        if stored is not None:
+            result = _deep_merge(result, stored.data)
+            result["providers"] = providers
+        return result
+
+    @router.post("/api/config")
+    async def save_config(
+        payload: dict[str, Any], auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        require_mutation(auth, admin=True)
+        forbidden = _find_plaintext_credentials(payload)
+        if forbidden:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "credentials must use FASTCLAW_PROVIDER_* or declared skill environment variables",
+            )
+        now = datetime.now(UTC)
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            current = await store.find_config(
+                kind="setting", scope="system", scope_id="", name="system.config"
+            )
+            safe_payload = _drop_credentials(payload)
+            data = _deep_merge(current.data if current else {}, safe_payload)
+            await store.save_config(
+                ConfigRecord(
+                    id=current.id if current else f"cfg_{secrets.token_hex(10)}",
+                    kind="setting",
+                    scope="system",
+                    scope_id="",
+                    name="system.config",
+                    data=data,
+                    created_at=current.created_at if current else now,
+                    updated_at=now,
+                )
+            )
+            agents_config = safe_payload.get("agents")
+            defaults = agents_config.get("defaults") if isinstance(agents_config, dict) else None
+            if isinstance(defaults, dict):
+                current_defaults = await store.find_config(
+                    kind="setting", scope="system", scope_id="", name="agents.defaults"
+                )
+                await store.save_config(
+                    ConfigRecord(
+                        id=(
+                            current_defaults.id
+                            if current_defaults is not None
+                            else f"cfg_{secrets.token_hex(10)}"
+                        ),
+                        kind="setting",
+                        scope="system",
+                        scope_id="",
+                        name="agents.defaults",
+                        data=_deep_merge(
+                            current_defaults.data if current_defaults is not None else {},
+                            defaults,
+                        ),
+                        created_at=current_defaults.created_at if current_defaults else now,
+                        updated_at=now,
+                    )
+                )
+        await gateway.agent_manager.reload_profiles()
+        return {"ok": True}
 
     @router.get("/api/chat/history")
     async def chat_history(
@@ -700,8 +1176,217 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             ]
         }
 
+    @router.put("/api/chat/sessions/{session_id}")
+    async def rename_chat_session(
+        session_id: str, payload: SessionUpdate, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        require_mutation(auth)
+        await service.require_agent(auth, payload.agent_id)
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            record = await store.get_session(
+                auth.identity.effective_user_id, payload.agent_id, session_id
+            )
+            if record is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+            await store.save_session(
+                record.model_copy(
+                    update={"title": payload.title.strip(), "updated_at": datetime.now(UTC)}
+                )
+            )
+        return {"ok": True}
+
+    @router.delete("/api/chat/sessions/{session_id}")
+    async def delete_chat_session(
+        session_id: str, agentId: str, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        require_mutation(auth)
+        await service.require_agent(auth, agentId)
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            record = await store.get_session(auth.identity.effective_user_id, agentId, session_id)
+            if record is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+            await store.delete_session(auth.identity.effective_user_id, agentId, session_id)
+        return {"ok": True}
+
+    def skill_json(skill: Any, *, location: str = "global") -> dict[str, Any]:
+        return {
+            "name": skill.name,
+            "description": skill.description,
+            "location": location,
+            "type": "python",
+            "envSpec": [
+                {"name": name, "required": True, "secret": True} for name in skill.environment_names
+            ],
+            "prepared": gateway.agent_manager.skill_catalog.is_prepared(skill),
+        }
+
+    @router.get("/api/skills")
+    async def list_skills(auth: AuthContext = auth_dependency) -> list[dict[str, Any]]:
+        del auth
+        return [skill_json(skill) for skill in gateway.agent_manager.skill_catalog.skills]
+
+    @router.get("/api/agents/{agent_id}/skills")
+    async def list_agent_skills(
+        agent_id: str, auth: AuthContext = auth_dependency
+    ) -> list[dict[str, Any]]:
+        agent = await service.require_agent(auth, agent_id)
+        profile = await service.agent_runtime_profile(agent)
+        return [skill_json(skill, location="agent") for skill in profile.skills]
+
+    @router.delete("/api/agents/{agent_id}/skills/{skill_name}")
+    async def unbind_agent_skill(
+        agent_id: str, skill_name: str, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        agent = await require_mutable_agent(auth, agent_id)
+        config = dict(agent.config)
+        skill_config = dict(config.get("skills") or {})
+        always = [str(item) for item in skill_config.get("alwaysLoad", [])]
+        skill_config["alwaysLoad"] = [item for item in always if item != skill_name]
+        config["skills"] = skill_config
+        updated = agent.model_copy(update={"config": config, "updated_at": datetime.now(UTC)})
+        async with UnitOfWork(gateway.database) as unit:
+            await unit.require_store().save_agent(updated)
+        await service.agent_runtime_profile(updated)
+        return {"ok": True}
+
+    @router.get("/api/tools")
+    async def get_tools(auth: AuthContext = auth_dependency) -> dict[str, Any]:
+        del auth
+        return {"categories": [], "toolProviders": {}, "tools": {}}
+
+    @router.put("/api/tools")
+    async def save_tools_config(
+        payload: dict[str, Any], auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        require_mutation(auth, admin=True)
+        if _find_plaintext_credentials(payload):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "tool credentials must use environment variables",
+            )
+        return await save_config({"tools": payload}, auth)
+
+    @router.get("/api/tasks")
+    async def tasks(auth: AuthContext = auth_dependency) -> dict[str, Any]:
+        del auth
+        return {
+            "tasks": [],
+            "pending": gateway.agent_manager.pending_count,
+            "detail": "individual in-process tasks are intentionally not exposed",
+        }
+
+    def unsupported(feature: str) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            content={
+                "ok": False,
+                "error": "unsupported",
+                "code": "not_implemented",
+                "feature": feature,
+            },
+        )
+
+    def unsupported_handler(feature: str) -> Any:
+        async def handler() -> Response:
+            return unsupported(feature)
+
+        return handler
+
+    @router.get("/api/skills/search", response_model=None)
+    async def search_skills(auth: AuthContext = auth_dependency) -> Response:
+        del auth
+        return unsupported("remote skill registry")
+
+    @router.post("/api/skills/install", response_model=None)
+    async def install_skill(
+        payload: dict[str, Any], auth: AuthContext = auth_dependency
+    ) -> Response | dict[str, Any]:
+        require_mutation(auth)
+        name = str(payload.get("name") or "").strip()
+        try:
+            skill = gateway.agent_manager.skill_catalog.require(name)
+        except SkillError:
+            return unsupported("remote skill installation")
+        agent_id = str(payload.get("agent") or "").strip()
+        if not agent_id:
+            if auth.identity.role != "super_admin":
+                raise HTTPException(status.HTTP_403_FORBIDDEN, "admin required")
+            return {"ok": True, "source": "local", "name": skill.name, "files": 0}
+        agent = await require_mutable_agent(auth, agent_id)
+        config = dict(agent.config)
+        skill_config = dict(config.get("skills") or {})
+        always = [str(item) for item in skill_config.get("alwaysLoad", [])]
+        skill_config["alwaysLoad"] = list(dict.fromkeys([*always, skill.name]))
+        config["skills"] = skill_config
+        updated = agent.model_copy(update={"config": config, "updated_at": datetime.now(UTC)})
+        async with UnitOfWork(gateway.database) as unit:
+            await unit.require_store().save_agent(updated)
+        await gateway.agent_manager.reload_profile(updated)
+        return {"ok": True, "source": "local", "name": skill.name, "files": 0}
+
+    @router.delete("/api/skills/{skill_name}", response_model=None)
+    async def delete_skill(skill_name: str, auth: AuthContext = auth_dependency) -> Response:
+        del skill_name
+        require_mutation(auth, admin=True)
+        return unsupported("global skill deletion")
+
+    for method, path, feature in (
+        ("GET", "/api/scoped-channels", "channels"),
+        ("POST", "/api/scoped-channels", "channels"),
+        ("GET", "/api/channels", "channels"),
+        ("GET", "/api/plugins", "plugins"),
+        ("GET", "/api/cron", "cron"),
+        ("POST", "/api/cron", "cron"),
+        ("GET", "/api/agent-bindings", "agent bindings"),
+    ):
+        router.add_api_route(
+            path,
+            unsupported_handler(feature),
+            methods=[method],
+            dependencies=[Depends(require_auth)],
+            response_model=None,
+        )
+
+    @router.put("/api/scoped-channels/{channel_id}", response_model=None)
+    async def update_unsupported_channel(
+        channel_id: str, auth: AuthContext = auth_dependency
+    ) -> Response:
+        del channel_id, auth
+        return unsupported("channels")
+
+    @router.delete("/api/scoped-channels/{channel_id}", response_model=None)
+    async def delete_unsupported_channel(
+        channel_id: str, auth: AuthContext = auth_dependency
+    ) -> Response:
+        del channel_id, auth
+        return unsupported("channels")
+
+    @router.put("/api/plugins/{plugin_id}", response_model=None)
+    async def update_unsupported_plugin(
+        plugin_id: str, auth: AuthContext = auth_dependency
+    ) -> Response:
+        del plugin_id, auth
+        return unsupported("plugins")
+
+    @router.put("/api/cron/{job_id}", response_model=None)
+    @router.delete("/api/cron/{job_id}", response_model=None)
+    async def mutate_unsupported_cron(job_id: str, auth: AuthContext = auth_dependency) -> Response:
+        del job_id, auth
+        return unsupported("cron")
+
+    @router.put("/api/agents/{agent_id}/binding", response_model=None)
+    async def update_unsupported_binding(
+        agent_id: str, auth: AuthContext = auth_dependency
+    ) -> Response:
+        await service.require_agent(auth, agent_id)
+        return unsupported("agent bindings")
+
     @router.post("/api/chat")
     async def chat(payload: ChatInput, auth: AuthContext = auth_dependency) -> dict[str, str]:
+        if auth.identity.read_only:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "actAs is read-only")
         await service.require_agent(auth, payload.agent_id)
         message = await gateway.agent_manager.chat(
             user_id=auth.identity.effective_user_id,
@@ -715,6 +1400,8 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
     async def chat_stream(
         payload: ChatInput, auth: AuthContext = auth_dependency
     ) -> StreamingResponse:
+        if auth.identity.read_only:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "actAs is read-only")
         await service.require_agent(auth, payload.agent_id)
         stream = await gateway.agent_manager.stream(
             user_id=auth.identity.effective_user_id,
@@ -743,6 +1430,8 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         request: Request,
         auth: AuthContext = auth_dependency,
     ) -> Response:
+        if auth.identity.read_only:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "actAs is read-only")
         if not payload.messages:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "messages is required")
         message = next(

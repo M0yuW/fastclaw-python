@@ -12,4 +12,8 @@ The snapshot was copied without Git history so the Go repository remains an
 independent, read-only reference. Subsequent Python-runtime compatibility
 changes are recorded only in the `fastclaw-python` history.
 
+Files intentionally changed or added for the Python Gateway are enumerated in
+`tests/fixtures/web-python-overlays.json`. CI continues to verify every other
+upstream file byte-for-byte against the reference commit.
+
 The original MIT license is reproduced in [LICENSE](LICENSE).
