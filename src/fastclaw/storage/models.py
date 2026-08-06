@@ -108,7 +108,7 @@ class AgentTeamMemberModel(Base):
         ForeignKey("agent_teams.id", ondelete="CASCADE"), primary_key=True
     )
     agent_id: Mapped[str] = mapped_column(
-        ForeignKey("agents.id", ondelete="RESTRICT"), primary_key=True
+        ForeignKey("agents.id", ondelete="RESTRICT"), primary_key=True, unique=True
     )
     role_key: Mapped[str] = mapped_column(String)
     member_type: Mapped[str] = mapped_column(String)
