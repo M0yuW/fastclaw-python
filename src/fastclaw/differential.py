@@ -161,6 +161,8 @@ async def run_case(
     go_token: str = "",
     python_token: str = "",
 ) -> dict[str, Any]:
+    if case.stream and case.comparison == "selected":
+        raise DifferentialMismatch(f"{case.name}: selected comparison does not support streams")
     go = await capture(go_client, case, token=go_token)
     python = await capture(python_client, case, token=python_token)
     if go.status_code != python.status_code:
@@ -175,10 +177,21 @@ async def run_case(
             "events": 0,
             "contract": "status-only",
         }
+    if case.comparison not in {"json_shape", "selected"}:
+        raise DifferentialMismatch(f"{case.name}: unknown comparison mode")
     if case.require_terminal_tasks:
         require_terminal_tasks(go.json_body)
         require_terminal_tasks(python.json_body)
-    if case.stream:
+    go_contract: Any
+    python_contract: Any
+    if case.comparison == "selected":
+        if not case.equal_paths:
+            raise DifferentialMismatch(f"{case.name}: selected comparison has no paths")
+        go_contract = {path: json_shape(json_path(go.json_body, path)) for path in case.equal_paths}
+        python_contract = {
+            path: json_shape(json_path(python.json_body, path)) for path in case.equal_paths
+        }
+    elif case.stream:
         go_contract = sse_signature(go.events)
         python_contract = sse_signature(python.events)
     else:

@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "executedAt": "2026-08-06T13:08:00+08:00",
+  "fixture": "tests/fixtures/differential-smoke.json",
+  "go": {
+    "commit": "792417b86b5c12af1b99364865217a74f4d52f38",
+    "baseUrl": "http://127.0.0.1:18953",
+    "dataRoot": "independent ~/.fastclaw",
+    "stoppedAfterRun": true
+  },
+  "python": {
+    "commit": "e0ba077ab392d2a475cf179eedb75ffc1eff0f4b",
+    "baseUrl": "http://127.0.0.1:18954",
+    "dataRoot": "independent ~/.fastclaw-python",
+    "runningAfterRun": true
+  },
+  "sharedDatabase": false,
+  "results": [
+    {
+      "name": "health",
+      "status": 200,
+      "stream": false,
+      "events": 0,
+      "contract": "status-only"
+    },
+    {
+      "name": "status",
+      "status": 200,
+      "stream": false,
+      "events": 0,
+      "contract": {
+        "configured": "boolean",
+        "running": "boolean"
+      }
+    }
+  ],
+  "limitations": [
+    "This run covers only common unauthenticated health and status semantics.",
+    "The locked Go command builds GatewayCfg with port and bind only, so /v1/agents is not registered and falls through to the SPA handler.",
+    "Authenticated Agent, chat, SSE, Provider, tool and cancellation parity remain blocked on rotated credentials."
+  ]
+}
