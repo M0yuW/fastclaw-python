@@ -2,7 +2,7 @@
 
 FROM node:22-bookworm-slim AS web-builder
 WORKDIR /build/web
-RUN corepack enable
+RUN corepack enable && corepack prepare pnpm@10.33.2 --activate
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY web/ ./

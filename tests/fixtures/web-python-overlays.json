@@ -6,7 +6,7 @@
   "modifiedFiles": {
     "package.json": {
       "reason": "Playwright test command and dependency",
-      "sha256": "e057f49b47de727769c6cfecb233a150ada4c8bbbb942dfe598de77696ee9d03"
+      "sha256": "8222278065b7ffd6268b3d8c9406420ff9336d0d6de14920a024eddc138c091a"
     },
     "pnpm-lock.yaml": {
       "reason": "Lockfile for the Playwright dependency",
