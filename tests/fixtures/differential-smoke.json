@@ -8,9 +8,11 @@
       "comparison": "status"
     },
     {
-      "name": "agents",
+      "name": "status",
       "method": "GET",
-      "path": "/v1/agents"
+      "path": "/api/status",
+      "comparison": "selected",
+      "equalPaths": ["configured", "running"]
     }
   ]
 }

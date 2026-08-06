@@ -13,46 +13,28 @@
 
 ```bash
 cd /Users/wangzheyu/.codex/worktrees/8e65/fastclaw/fastclaw-python
-git status                 # 提交本轮 G 阶段后应为干净
-git log --oneline -1       # 应为当前 release-hardening 分支最新提交
+git status                 # 提交切换验证更新后应为干净
+git log --oneline -1       # 当前为 cutover-verification 分支最新提交
 ```
 
 | 项 | 值 |
 |---|---|
 | 工作树路径 | `/Users/wangzheyu/.codex/worktrees/8e65/fastclaw/fastclaw-python` |
-| 当前分支 | `codex/release-hardening` |
-| HEAD | 以 `git log --oneline -1` 为准；当前包含 G 阶段与切换审计/发行包加固 |
-| `origin/main` | `4c284d1` |
-| 未推送提交数 | 以 `git rev-list --count origin/main..HEAD` 为准 |
-| upstream | **未配置**——从未 push、从未 rebase、从未 force push |
-| 工作树 | G 阶段提交后应干净 |
+| 当前分支 | `codex/cutover-verification` |
+| 基线 | `main@e0ba077`（PR #1–#13 全部合并） |
+| `origin/main` | `e0ba077` |
+| Python 服务 | 127.0.0.1:18954 正在运行；health 200，ready 503（仅 Provider false） |
+| Go 服务 | differential 后已优雅停止 |
+| 工作树 | 提交本轮验证证据后应干净 |
 
-`origin/main..HEAD` 至少包含以下 7 个功能提交，另加 G 阶段收口与切换审计/发行包加固提交（新→旧）：
-
-```
-4c9bc98  Restore Go agent and tool event contracts
-bdebde3  Harden release and differential cutover gates
-4a75793  Add supervised finance plugin runtime
-3b2442e  Stabilize Playwright history assertion
-6aa21c0  Complete Gateway and Web compatibility APIs
-d07700c  Import assets and prepare production skills
-09156de  Wire application Agent runtime manager
-```
+本轮只在 `main` 之上补真实 differential 证据与状态文档；不改写已合并历史。
 
 ---
 
 ## 2. 分支拓扑与 PR 状态
 
-严格祖先链（每个分支都是下一个的祖先，无交叉、无 rebase）：
-
-```
-origin/main (4c284d1)
-  └─ codex/runtime-manager      (09156de)  PR #9   OPEN，已推送
-      └─ codex/assets-skills    (d07700c)  PR #10  OPEN，已推送
-          └─ codex/gateway-web-api (3b2442e) PR #11 OPEN，已推送，5/5 CI 绿
-              └─ codex/plugin-finance-tools (4a75793)  无 remote，无 PR
-                  └─ codex/release-hardening (4c9bc98)  无 remote，无 PR ← 当前 HEAD
-```
+历史堆叠已全部收口到 `main`。#9–#13 均使用 merge commit，逐层 retarget 后重跑
+CI，没有 rebase、force push 或删除 Go 历史。
 
 | PR | 分支 | 主题 | 状态 |
 |---|---|---|---|
@@ -64,15 +46,15 @@ origin/main (4c284d1)
 | #6 | — | Next.js Web 快照 | MERGED |
 | #7 | — | Alembic 基线 | MERGED |
 | #8 | — | Gateway 鉴权 + Provider API | MERGED |
-| #9 | `codex/runtime-manager` | AgentRuntimeManager 接入 lifespan | **OPEN**，base = `main` |
-| #10 | `codex/assets-skills` | 资产导入与生产 skills 准备 | **OPEN**，base = `codex/runtime-manager` |
-| #11 | `codex/gateway-web-api` | Phase D Gateway/Web 兼容 API | **OPEN**，base = `codex/assets-skills` |
-| 待建 | `codex/plugin-finance-tools` | Phase E 插件协议 + finance tools | **未推送**（额度阻断） |
-| 待建 | `codex/release-hardening` | Phase F 发布加固 + differential | **未推送**（额度阻断） |
+| #9 | `codex/runtime-manager` | AgentRuntimeManager 接入 lifespan | MERGED |
+| #10 | `codex/assets-skills` | 资产导入与生产 skills 准备 | MERGED |
+| #11 | `codex/gateway-web-api` | Phase D Gateway/Web 兼容 API | MERGED |
+| #12 | `codex/plugin-finance-tools` | Phase E 插件协议 + finance tools | MERGED |
+| #13 | `codex/release-hardening` | Phase F/G 发布加固 + cutover audit | MERGED，9/9 CI 绿 |
 
 **合并规则（不可违反）**：逐个 retarget 到 `main`，**不 rebase、不 force push**。原因是保住 PR 行内评论的锚点；一旦 rebase，历史评论全部失去位置，审查上下文不可恢复。父 PR 合并后子 PR 只做 base 切换 + 重跑 CI。
 
-合并顺序：`#9 → #10 → #11 → `（推送后的 Phase E PR）`→ `（推送后的 Phase F PR）。
+实际合并顺序：`#9 → #10 → #11 → #12 → #13`。
 
 ---
 
@@ -89,12 +71,12 @@ origin/main (4c284d1)
 | — | Web 快照：Next.js 16.1.6 / React 19.2.3 逐文件保真迁入 + overlay 清单 | — | #6 | 已合并 |
 | — | Alembic 基线：冻结初版 revision，`alembic check` 漂移门禁替代 `create_all()` | `alembic-schema-integrity.md` | #7 | 已合并 |
 | — | Gateway 鉴权 + Provider API | — | #8 | 已合并 |
-| 5 | AgentRuntimeManager：FastAPI lifespan 装载 27 个 Agent 到 MessageBus，子 Agent 继承父的可信 user/root/call-path，no-tools / delegate-only / custom 策略 | `phase-5-runtime-manager.md` | #9 | OPEN |
-| 6 | 资产与 Skills：幂等 `fastclaw migrate import-assets`（dry-run / 冲突检测 / 逐文件 SHA-256 / 审计报告），按 requirements hash 建 per-skill venv | `phase-6-assets-skills.md` | #10 | OPEN |
-| 7 | Gateway / Web 兼容 API：Web 实际调用的全部端点，结构化 `unsupported` 取代模糊 404，浏览器 Abort → Gateway → Agent → Tool/Provider 的停止链 | `phase-7-gateway-web.md` | #11 | OPEN |
-| 8 | 插件协议与 finance tools：JSON-RPC 进程生命周期、握手、`tool.list`/`tool.execute`、超时重启、`_TRUSTED_ARGUMENT_NAMES` 身份拒绝；租户隔离的 thesis ledger / watchlist / 事件指纹 / 乐观版本 | `phase-8-plugins-finance.md` | 待建（`codex/plugin-finance-tools`） | 本地完成，未推送 |
-| 9 | 发布加固与切换：PostgreSQL/wheel/Docker/Playwright/依赖审计/secret scan CI，Go 18953 vs Python 18954 differential，故障矩阵，结构化日志 | `phase-9-release-cutover.md` | 待建（`codex/release-hardening`） | 本地完成，未推送 |
-| 10 | 切换就绪与遗留收口：G 口径收口 / H 凭据轮换 / I 合并堆叠 / J 真实环境验证 / K 切换执行 | `phase-10-cutover-readiness.md` | 当前分支 | G 已实现并验证；H–K 待外部条件 |
+| 5 | AgentRuntimeManager：FastAPI lifespan 装载 27 个 Agent 到 MessageBus，子 Agent 继承父的可信 user/root/call-path，no-tools / delegate-only / custom 策略 | `phase-5-runtime-manager.md` | #9 | 已合并 |
+| 6 | 资产与 Skills：幂等 `fastclaw migrate import-assets`（dry-run / 冲突检测 / 逐文件 SHA-256 / 审计报告），按 requirements hash 建 per-skill venv | `phase-6-assets-skills.md` | #10 | 已合并 |
+| 7 | Gateway / Web 兼容 API：Web 实际调用的全部端点，结构化 `unsupported` 取代模糊 404，浏览器 Abort → Gateway → Agent → Tool/Provider 的停止链 | `phase-7-gateway-web.md` | #11 | 已合并 |
+| 8 | 插件协议与 finance tools：JSON-RPC 进程生命周期、握手、`tool.list`/`tool.execute`、超时重启、`_TRUSTED_ARGUMENT_NAMES` 身份拒绝；租户隔离的 thesis ledger / watchlist / 事件指纹 / 乐观版本 | `phase-8-plugins-finance.md` | #12 | 已合并 |
+| 9 | 发布加固与切换：PostgreSQL/wheel/Docker/Playwright/依赖审计/secret scan CI，Go 18953 vs Python 18954 differential，故障矩阵，结构化日志 | `phase-9-release-cutover.md` | #13 | 已合并，完整 CI 绿 |
+| 10 | 切换就绪与遗留收口：G 口径收口 / H 凭据轮换 / I 合并堆叠 / J 真实环境验证 / K 切换执行 | `phase-10-cutover-readiness.md` | 当前分支 | G/I 完成；J 部分完成；H/K 被凭据阻断 |
 
 代码规模：`src/fastclaw/` 55 个 Python 文件，`tests/` 26 个 Python 测试文件，finance plugin 另有 1 个来源契约测试文件。模块划分：`agent/`、`gateway/`、`migration/`、`orchestration/`、`plugin/`、`providers/`、`storage/`、`tools/`，以及顶层 `app.py`、`cli.py`、`cutover.py`、`differential.py`、`execution.py`、`identity.py`、`models.py`、`observability.py`、`runtime.py`、`skills.py`。
 
@@ -106,7 +88,7 @@ origin/main (4c284d1)
 
 | 命令 | 预期输出 |
 |---|---|
-| `pytest -q` | `126 passed, 1 skipped`（skip = 本机无 PostgreSQL 服务） |
+| `pytest -q` | `129 passed, 1 skipped`（skip = 本机无 PostgreSQL 服务） |
 | `(cd plugins/finance-tools && ../../.venv/bin/python -m unittest -v test_plugin.py)` | `10 passed` |
 | `ruff check .` | `All checks passed` |
 | `ruff format --check .` | `108 files already formatted` |
@@ -121,7 +103,8 @@ Provider 凭据核对命令应报告 DeepSeek / OpenRouter / ODDS **三项均未
 
 CI（`.github/workflows/ci.yml`）的 job：`quality`（Python 3.12/3.13/3.14 + `alembic check`）、`web`（+ 快照校验）、`postgres`（postgres:17-alpine，`pytest -q -m postgres`）、`package`、`docker`、`security`（pip-audit + gitleaks）、`web-e2e`（Playwright，依赖其余全部）。
 
-`.github/workflows/differential.yml` 目前只有 `workflow_dispatch` + `runs-on: self-hosted`，**从未对真实双服务运行过**——见 5.2 J1。
+`.github/workflows/differential.yml` 使用 `workflow_dispatch` + `runs-on: self-hosted`。
+2026-08-06 已完成真实双服务的未认证 health/status 子集，认证/SSE 仍未执行——见 5.2 J1。
 
 发行包已在本机实际构建：wheel 约 142 KiB、sdist 约 674 KiB，分别包含 70/220
 个文件。`scripts/verify_distribution.py` 会阻断缺失 Alembic/plugin/cutover 运行文件，
@@ -141,7 +124,7 @@ sdist 曾达到约 105 MiB、21,901 个文件，因此这一检查不能只依�
 - **G1 Web 快照口径**统一为 `86 unchanged + 4 declared overlays + 4 attributed additions`，并由脚本输出和机械搜索共同锁定。
 - **G2 Web overlay 哈希**已写入 `web-python-overlays.json`；`verify_web_snapshot.py` 会校验全部 4 个 overlay，参数化测试逐一证明篡改会失败。
 - **G3 可信身份契约**已由回归测试锁定：`spawn_subagent` schema 只能暴露 `agent_id` 与 `task`，模型提供的 user/root/call-path 字段不影响可信上下文；plugin 的 10 个 camelCase/snake_case 受保护名称均逐一拒绝。
-- **G4 differential 状态**已纠正：`tests/test_differential.py` 通过 `httpx.MockTransport` 覆盖比对逻辑，真实 fixture 只由运行脚本加载；Go/Python 双服务尚未实际执行，真实运行与报告仍是切换硬前置。
+- **G4 differential 状态**已纠正：真实 Go/Python 的未认证 health/status 子集已执行并留证；认证 Agent/chat/SSE/Provider/工具/取消仍是切换硬前置。
 - **G5 切换审计**已实现：`fastclaw cutover audit` 在一次性安全副本上核对 2 用户、27 Agent、模型来源、角色文件、tool policy、Skill、Provider、ODDS、plugin、FK/ACL/Session/channel 状态，并以退出码 2 阻断不完整切换。当前真实副本只剩三项集中凭据未配置。
 
 **阶段 H——凭据轮换**：交接文档中出现过的全部口令、DeepSeek key、OpenRouter key、ODDS key 全部轮换。这些凭据在 Phase B–E 全部开发过程中一直有效，暴露窗口随时间线性增长；既然确定要轮换，现在轮换严格优于切换时轮换。新值只经环境变量或 secret 注入，轮换记录只记「已轮换 + 时间 + 责任人」。
@@ -150,14 +133,13 @@ G 与 H 可并行，互不依赖。
 
 ### 5.2 当前被阻断
 
-阻断原因有两类：**外部操作额度**（无法 push、无法重启真实 18954 服务）与**集中凭据缺失**（DeepSeek / OpenRouter / ODDS）。
+外部操作与宿主端口已解除。当前阻断是**集中凭据缺失**（DeepSeek / OpenRouter / ODDS）以及凭据轮换尚未由责任人确认。
 
 | 项 | 内容 | 缺什么 |
 |---|---|---|
-| 推送 Phase E/F | `codex/plugin-finance-tools`、`codex/release-hardening` 推送并建 Draft PR | 外部操作额度 |
-| J1 | differential 真实双服务运行（Go 18953 / Python 18954，**各自独立数据根，绝不共享 SQLite 文件**） | 宿主端口权限 |
+| J1 | 未认证 health/status 已通过；认证 Agent/chat/SSE/工具/取消仍需运行 | 轮换后的认证凭据 |
 | J2 | 真实 provider 异常语义：正常流 / 主动中断 / 429 / 5xx；重点核对 `cache_read_tokens`、`cache_write_tokens` 上报时机与累加值，以及 EOF 与畸形 SSE 是否被误判为成功。当前这些只在 MockTransport 下验过 | DeepSeek / OpenRouter 凭据 |
-| J3 | finance / World Cup / benchmark 三套固定 fixture 端到端 smoke，断言无悬挂 task、无重复 completion、无跨租户访问、无失配 ToolCall 历史 | 三项凭据 + 端口权限 |
+| J3 | finance / World Cup / benchmark 三套固定 fixture 端到端 smoke，断言无悬挂 task、无重复 completion、无跨租户访问、无失配 ToolCall 历史 | 三项凭据 |
 
 阻断解除前**不得进入阶段 K（切换执行）**。
 
@@ -167,7 +149,7 @@ G 与 H 可并行，互不依赖。
 G（口径与盲区收口）──┐
                      ├─→ I（合并堆叠）──→ J（真实环境验证）──→ K（切换执行）
 H（凭据轮换）────────┘                        ▲
-                                              └── 当前被外部额度阻断
+                                              └── 当前被凭据轮换/配置阻断
 ```
 
 I 依赖 G——否则把错误口径合入 `main`。

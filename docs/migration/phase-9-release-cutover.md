@@ -56,11 +56,18 @@ locked fixture adds `equalPaths` semantic assertions. A task fixture may set
 is uploaded as a workflow artifact.
 
 The comparison logic is covered by unit tests built on `httpx.MockTransport`.
-Those tests do not launch either implementation, and the locked smoke fixture is
-loaded only by `scripts/differential_smoke.py`. No real Go/Python dual-service
-run has been performed yet. A successful run against independently persisted
-Go 18953 and Python 18954 services, with its report retained and reviewed, is a
-hard cutover prerequisite.
+On 2026-08-06 it was also run against real, independently persisted Go 18953
+and Python 18954 services. The common unauthenticated `/healthz` and
+`/api/status` semantics passed; the retained report is
+`docs/migration/evidence/differential-smoke-2026-08-06.json`.
+
+That run does not close the cutover gate. The original fixture's unauthenticated
+`/v1/agents` case exposed a locked-Go launcher limitation: `cmd/fastclaw/main.go`
+constructs `GatewayCfg` with port and bind only, so the API server sees disabled
+zero-value HTTP endpoints and `/v1/agents` falls through to the SPA handler.
+The common smoke now compares only shared endpoints. Authenticated Agent/chat,
+SSE, Provider, tool and cancellation parity still require rotated credentials
+and a retained follow-up report.
 
 Local invocation:
 

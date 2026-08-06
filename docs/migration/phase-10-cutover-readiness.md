@@ -1,11 +1,13 @@
 # 后续开发计划：切换就绪与遗留收口
 
 - 制定日期：2026-08-06
-- 当前分支：`codex/release-hardening`（G 阶段完成后提交，工作树应干净）
-- 当前基线：`codex/release-hardening` 最新提交（包含 G 阶段与切换审计/发行包加固）
+- 当前分支：`codex/cutover-verification`（从已合并的 `main@e0ba077` 创建）
+- 当前基线：PR #1–#13 已合并；Python 18954 正在运行
 - 参考 Go 实现：`792417b86b5c12af1b99364865217a74f4d52f38`（只读）
 
-本文档接续 `phase-1` 至 `phase-9`。前九阶段完成的是**代码实现**；本计划的主题是把「实现完成」推进到「可切换」，并收口三类遗留：报告口径与代码不一致、验证手段存在盲区、以及被外部额度阻断的真实环境验证。
+本文档接续 `phase-1` 至 `phase-9`。前九阶段和合并工作已经完成；当前主题是把
+「实现完成」推进到「可切换」，并收口真实 Provider、认证/SSE differential 与
+三套生产 smoke。
 
 ---
 
@@ -15,7 +17,7 @@
 
 | 项目 | 结果 |
 |---|---|
-| `pytest -q` | 126 passed, 1 skipped（PostgreSQL 本机无服务） |
+| `pytest -q` | 129 passed, 1 skipped（PostgreSQL 本机无服务） |
 | `ruff check .` | All checks passed |
 | `ruff format --check .` | 108 files already formatted |
 | `mypy` | Success: no issues found in 81 source files |
@@ -85,7 +87,9 @@
 
 ### G4 · 修正 Phase E/F 的完成度表述
 
-`docs/migration/phase-9-release-cutover.md` 与相关 PR 描述把 differential harness 记为已完成。代码完成，但 `.github/workflows/differential.yml` 只有 `workflow_dispatch` + `runs-on: self-hosted`，从未对真实双服务运行过；`tests/test_differential.py` 通过 `httpx.MockTransport` 验证比对逻辑，锁定 fixture `tests/fixtures/differential-smoke.json` 只由 `scripts/differential_smoke.py` 在实际运行时加载，现有证据不包含两个实现的真实差异。
+`docs/migration/phase-9-release-cutover.md` 已区分 harness 单测和真实运行。2026-08-06
+已完成独立 Go/Python 的未认证 health/status 子集并留证；认证/SSE/工具路径仍未运行，
+不得把基础探针报告扩张解释为完整 parity。
 
 - 在 phase-9 中区分「比对逻辑已实现并有单测覆盖」与「尚未对真实双服务执行」。
 - 把 differential 真实运行列为切换的**硬前置**，不是可选项。
@@ -107,19 +111,22 @@
 
 ---
 
-## 4. 阶段 I：合并现有堆叠
+## 4. 阶段 I：合并现有堆叠（已完成）
 
-PR #1–#8 已合并。剩余顺序为 `#9 → #10 → #11 → Phase E → Phase F/G`，逐个 retarget 到 `main`，**不 rebase、不 force push**（保住行内评论锚点）。
+PR #1–#13 已按 `#9 → #10 → #11 → #12 → #13` 全部合并。每一级均把最新
+`main` 以 merge commit 向前合入、retarget 到 `main` 并重跑 CI；全程没有 rebase
+或 force push。最终 `main` 为 `e0ba077`。
 
-- 每次父 PR 合并后，子 PR retarget 并重跑：Python 3.12/3.13/3.14、Web、Alembic、快照校验。
-- 合并完成后 `main` 需与当前 release-hardening（含 G 阶段）功能等价，工作树干净。
-- Phase E/F 分支（`codex/release-hardening`）在 G 阶段收口完成后推送，创建后续 Draft PR。
+- 每次父 PR 合并后，子 PR 均已 retarget 并重跑 Python 3.12/3.13/3.14、Web、
+  Alembic、快照及该分支可用的后续门禁。
+- 最终 #13 在 `main` 基线上通过 PostgreSQL、package、Docker、security 与
+  Playwright 在内的 9/9 CI。
 
-**验收**：`main` 上全部 CI 门禁绿；`git diff` 对照 `4c9bc98` 只应出现 G 阶段的收口改动。
+**验收**：已完成，`main@e0ba077` 工作树可干净检出。
 
 ---
 
-## 5. 阶段 J：真实环境验证（当前被外部额度阻断）
+## 5. 阶段 J：真实环境验证（进行中，凭据阻断）
 
 先对一次性安全副本运行 `fastclaw cutover audit`。该命令固定核对 2 用户、
 M0yuW 13 Agent、benchmark 14 Agent、26 个角色文件 profile、模型来源、benchmark
@@ -127,7 +134,7 @@ M0yuW 13 Agent、benchmark 14 Agent、26 个角色文件 profile、模型来源�
 credential 清空状态；任何 blocker 都返回退出码 2。审计会启动 bundled plugin
 完成握手，因此禁止直接指向 Go 或线上 Python 数据根。
 
-以下三项都需要宿主端口权限与集中凭据，是切换的硬前置。阻断解除前不得进入阶段 K。
+宿主端口权限已验证可用。集中凭据仍缺失，阻断解除前不得进入阶段 K。
 
 ### J1 · differential 真实双服务运行
 
@@ -136,6 +143,12 @@ credential 清空状态；任何 blocker 都返回退出码 2。审计会启动 
 - 报告作为 artifact 留存，作为切换决策的书面依据。
 
 **验收**：差异报告为空，或每条差异都有书面接受理由。
+
+2026-08-06 已完成第一轮真实运行：独立 Go 18953 与 Python 18954 的 health/status
+共同语义通过，证据见 `evidence/differential-smoke-2026-08-06.json`。原
+`/v1/agents` fixture 暴露 Go launcher 未传播 HTTP endpoint 配置的问题，锁定 Go
+会把该路径交给 SPA，而不是 JSON API；默认 fixture 已改为真实可执行的共同端点。
+本轮仅关闭未认证基础探针，认证 Agent/chat、SSE、Provider、工具与取消仍待凭据。
 
 ### J2 · 真实 provider 异常语义
 
@@ -207,10 +220,10 @@ credential 清空状态；任何 blocker 都返回退出码 2。审计会启动 
 G（口径与盲区收口）──┐
                      ├─→ I（合并堆叠）──→ J（真实环境验证）──→ K（切换执行）
 H（凭据轮换）────────┘                        ▲
-                                              └── 当前被外部操作额度阻断
+                                              └── 当前被凭据轮换/配置阻断
 ```
 
-- G 与 H 可并行，均不依赖外部额度，**是当前唯一可立即推进的工作**。
-- I 依赖 G 完成（否则把错误口径合入 `main`）。
-- J 依赖宿主端口权限与三项集中凭据；阻断解除前 K 不可开始。
-- 当前阻断点：真实 18954 服务处于停止状态，重启授权被拒；Phase E/F 分支尚未推送。
+- G 与 I 已完成。
+- Python 18954 正在运行；宿主端口权限已验证。
+- J 的未认证基础探针已完成，剩余部分依赖三项轮换后的集中凭据。
+- 当前阻断点：凭据轮换/配置尚未由责任人完成；阻断解除前 K 不可开始。

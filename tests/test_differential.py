@@ -53,6 +53,84 @@ async def test_differential_can_compare_status_for_legacy_plain_text_probe() -> 
     assert result["contract"] == "status-only"
 
 
+async def test_differential_can_compare_selected_semantics_across_legacy_shapes() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "go.test":
+            return httpx.Response(
+                200,
+                json={"configured": True, "running": True, "port": 18953, "uptime": "1m"},
+            )
+        return httpx.Response(
+            200,
+            json={
+                "configured": True,
+                "running": True,
+                "port": 18954,
+                "uptime": "0:01:00",
+                "mode": "self-hosted",
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    case = DifferentialCase(
+        "status",
+        "GET",
+        "/api/status",
+        comparison="selected",
+        equal_paths=("configured", "running"),
+    )
+    async with (
+        httpx.AsyncClient(base_url="https://go.test", transport=transport) as go,
+        httpx.AsyncClient(base_url="https://python.test", transport=transport) as python,
+    ):
+        result = await run_case(go, python, case)
+
+    assert result["contract"] == {"configured": "boolean", "running": "boolean"}
+
+
+async def test_differential_selected_semantics_fail_on_value_drift() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            200,
+            json={"running": request.url.host == "go.test"},
+        )
+    )
+    case = DifferentialCase(
+        "status",
+        "GET",
+        "/api/status",
+        comparison="selected",
+        equal_paths=("running",),
+    )
+    async with (
+        httpx.AsyncClient(base_url="https://go.test", transport=transport) as go,
+        httpx.AsyncClient(base_url="https://python.test", transport=transport) as python,
+    ):
+        with pytest.raises(DifferentialMismatch, match="semantic value differs"):
+            await run_case(go, python, case)
+
+
+async def test_differential_rejects_selected_semantics_for_streams() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    case = DifferentialCase(
+        "chat",
+        "POST",
+        "/api/chat/stream",
+        stream=True,
+        comparison="selected",
+        equal_paths=("type",),
+    )
+    async with (
+        httpx.AsyncClient(base_url="https://go.test", transport=transport) as go,
+        httpx.AsyncClient(base_url="https://python.test", transport=transport) as python,
+    ):
+        with pytest.raises(DifferentialMismatch, match="does not support streams"):
+            await run_case(go, python, case)
+
+
 async def test_differential_validates_sse_order_and_tool_pairing() -> None:
     events = [
         {
