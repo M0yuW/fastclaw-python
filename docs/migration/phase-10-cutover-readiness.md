@@ -148,14 +148,19 @@ credential 清空状态；任何 blocker 都返回退出码 2。审计会启动 
 共同语义通过，证据见 `evidence/differential-smoke-2026-08-06.json`。原
 `/v1/agents` fixture 暴露 Go launcher 未传播 HTTP endpoint 配置的问题，锁定 Go
 会把该路径交给 SPA，而不是 JSON API；默认 fixture 已改为真实可执行的共同端点。
-本轮仅关闭未认证基础探针，认证 Agent/chat、SSE、Provider、工具与取消仍待凭据。
+该轮只关闭未认证基础探针；随后又完成了不依赖生产凭据的认证双服务差分。
 
 同日又在 disposable Python 副本的 18955 上，用只写入副本的一次性 Web session
 完成认证 API smoke：管理员身份、2 用户、M0yuW 的 13 Agent、只读 actAs 下的
 benchmark 14 Agent，以及 coordinator 的 5 个 Session 均通过。该验证不使用旧密码
 或 API key，证据见 `evidence/authenticated-api-smoke-2026-08-06.json`。因此认证读取
-链已关闭。随后在同一隔离策略下以确定性 Provider 跑通认证 chat/SSE、工具和取消；
-真实双服务认证差分与真实 Provider 行为仍待轮换后凭据。
+链已关闭。随后在独立 disposable Go/Python 副本上写入仅用于测试的 Agent-scoped
+API key，以确定性 Provider 完成 8 项认证差分：身份、允许 Agent、非流式 chat、SSE、
+finance coordinator 的 5 对 ToolCall/ToolResult、任务终态均通过。Go 的 5 个空
+`content` 事件与 Python 的可选 ToolResult `metadata` 作为显式兼容差异归一化，其他
+字段、顺序、seq、done 和调用配对仍严格比较。两边慢流中断后活动任务和残缺 assistant
+均为 0。证据见 `evidence/differential-authenticated-2026-08-06.json`。J1 至此关闭；
+真实 Provider 行为仍属于 J2。
 
 ### J2 · 真实 provider 异常语义
 
@@ -276,5 +281,5 @@ H（凭据轮换）────────┘                        ▲
 
 - G 与 I 已完成。
 - Python 18954 正在运行；宿主端口权限已验证。
-- J 的未认证基础探针已完成，剩余部分依赖三项轮换后的集中凭据。
+- J1 的未认证、认证、工具和取消双服务差分已完成；J2/J3 依赖三项轮换后的集中凭据。
 - 当前阻断点：凭据轮换/配置尚未由责任人完成；阻断解除前 K 不可开始。

@@ -90,7 +90,7 @@ CI，没有 rebase、force push 或删除 Go 历史。
 
 | 命令 | 预期输出 |
 |---|---|
-| `pytest -q` | `142 passed, 1 skipped`（skip = 本机无 PostgreSQL 服务） |
+| `pytest -q` | `145 passed, 1 skipped`（skip = 本机无 PostgreSQL 服务） |
 | `(cd plugins/finance-tools && ../../.venv/bin/python -m unittest -v test_plugin.py)` | `10 passed` |
 | `ruff check .` | `All checks passed` |
 | `ruff format --check .` | `112 files already formatted` |
@@ -106,16 +106,19 @@ Provider 凭据核对命令应报告 DeepSeek / OpenRouter / ODDS **三项均未
 CI（`.github/workflows/ci.yml`）的 job：`quality`（Python 3.12/3.13/3.14 + `alembic check`）、`web`（+ 快照校验）、`postgres`（postgres:17-alpine，`pytest -q -m postgres`）、`package`、`docker`、`security`（pip-audit + gitleaks）、`web-e2e`（Playwright，依赖其余全部）。
 
 `.github/workflows/differential.yml` 使用 `workflow_dispatch` + `runs-on: self-hosted`。
-2026-08-06 已完成真实双服务的未认证 health/status 子集；一次性 Python 副本上的
-认证读与确定性 SSE/工具/取消已执行，但真实 Go/Python 认证差分尚未执行——见 5.2 J1。
+2026-08-06 已完成真实双服务的未认证 health/status 子集；随后在独立 disposable
+副本上完成真实 Go/Python 的认证、SSE、五次 coordinator 委派、任务终态和慢流取消
+差分——见 5.2 J1。
 
 同日还在独立 disposable Python 副本上完成了不使用旧密码/API key 的认证读取 smoke：
 管理员 cookie、2 用户、M0yuW 13 Agent、只读 actAs 下 benchmark 14 Agent 和
 coordinator 的 5 个 Session 均通过；证据见
 `evidence/authenticated-api-smoke-2026-08-06.json`。随后确定性 Provider 下的认证
 chat/SSE、工具与取消也已通过，见 `evidence/runtime-wiring-smoke-2026-08-06.json`。
+独立 Go/Python disposable 副本上的认证双服务差分见
+`evidence/differential-authenticated-2026-08-06.json`。
 
-发行包已在本机实际构建并通过 `twine check`：分别包含 71/227 个 wheel/sdist
+发行包已在本机实际构建并通过 `twine check`：分别包含 71/229 个 wheel/sdist
 文件。`scripts/verify_distribution.py` 会阻断缺失 Alembic/plugin/cutover 运行文件、
 两个可复现 wiring smoke 脚本，
 以及把 `node_modules`、`.next`、`out` 等本地 Web 产物混入 sdist 的回归。修复前
@@ -134,7 +137,7 @@ sdist 曾达到约 105 MiB、21,901 个文件，因此这一检查不能只依�
 - **G1 Web 快照口径**统一为 `86 unchanged + 4 declared overlays + 4 attributed additions`，并由脚本输出和机械搜索共同锁定。
 - **G2 Web overlay 哈希**已写入 `web-python-overlays.json`；`verify_web_snapshot.py` 会校验全部 4 个 overlay，参数化测试逐一证明篡改会失败。
 - **G3 可信身份契约**已由回归测试锁定：`spawn_subagent` schema 只能暴露 `agent_id` 与 `task`，模型提供的 user/root/call-path 字段不影响可信上下文；plugin 的 10 个 camelCase/snake_case 受保护名称均逐一拒绝。
-- **G4 differential 状态**已纠正：真实 Go/Python 的未认证 health/status 子集已执行并留证；认证 Agent/chat/SSE/Provider/工具/取消仍是切换硬前置。
+- **G4 differential 状态**已关闭：真实 Go/Python 的未认证 health/status 与认证身份、Agent/chat/SSE、5 对 ToolCall/ToolResult、任务终态和取消均已执行并留证；真实 Provider 异常与业务结果属于 J2/J3。
 - **G5 切换审计**已实现：`fastclaw cutover audit` 在一次性安全副本上核对 2 用户、27 Agent、模型来源、角色文件、tool policy、Skill、Provider、ODDS、plugin、FK/ACL/Session/channel 状态，并以退出码 2 阻断不完整切换。当前真实副本只剩三项集中凭据未配置。
 - **J3 wiring 子门禁**已完成：真实迁移 profile + disposable 数据 + 本地确定性 SSE
   Provider 跑通四个 coordinator、18 对 ToolCall/ToolResult、账本 direct-return 和
@@ -157,7 +160,7 @@ G 与 H 可并行，互不依赖。
 
 | 项 | 内容 | 缺什么 |
 |---|---|---|
-| J1 | 未认证 health/status 与 disposable 副本认证读、fixture chat/SSE/工具/取消已通过；真实双服务认证差分仍需运行 | 轮换后的认证凭据 |
+| J1 | **已关闭**：独立 disposable Go/Python 副本的认证 HTTP/SSE、5 对 ToolCall/ToolResult、任务终态和慢流取消均通过 | — |
 | J2 | 真实 provider 异常语义：正常流 / 主动中断 / 429 / 5xx；重点核对 `cache_read_tokens`、`cache_write_tokens` 上报时机与累加值，以及 EOF 与畸形 SSE 是否被误判为成功。当前这些只在 MockTransport 下验过 | DeepSeek / OpenRouter 凭据 |
 | J3 | Runtime wiring fixture 已通过；finance / World Cup / benchmark 的真实 Provider/数据 smoke 仍需完成 | 三项凭据 |
 
@@ -187,6 +190,8 @@ I 依赖 G——否则把错误口径合入 `main`。
 | 会话数据流向 | 单向 Go → Python，Python 不回写 Go | Python 数据库格式为权威格式 |
 | Skill 依赖 | 运行时禁止自动安装，需显式 `fastclaw skills prepare` | 避免运行时网络与隐式环境变更 |
 | 未知端点 | 返回结构化 `unsupported`，不是模糊 404 | 让 Web 能区分「没实现」与「路径错」 |
+| Agent-scoped API key | 锁定 Go 会列出同租户全部 Agent；Python 只列出 ACL 明确允许的 Agent，并同样过滤任务 | 保留 Python 的安全强化，禁止为表面 parity 放宽 ACL |
+| 工具 SSE | Go 在每个 ToolCall 前发空 `content`；Python 不发空事件，并为 ToolResult 增加可选 `metadata` | `sse_compatible` 只归一化这两项；seq/done/共享字段/配对仍严格 |
 
 ---
 
