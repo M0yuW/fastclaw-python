@@ -108,12 +108,29 @@ async def test_plugin_manager_discovers_tools_and_injects_trusted_context(tmp_pa
         await manager.stop()
 
 
-async def test_plugin_tool_rejects_model_supplied_identity(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "argument_name",
+    [
+        "userId",
+        "user_id",
+        "agentId",
+        "agent_id",
+        "sessionId",
+        "session_id",
+        "rootExecutionId",
+        "root_execution_id",
+        "callPath",
+        "call_path",
+    ],
+)
+async def test_plugin_tool_rejects_model_supplied_identity(
+    tmp_path: Path, argument_name: str
+) -> None:
     manager = create_plugin(tmp_path)
     await manager.start()
     try:
         result = await manager.tools()[0].execute(
-            {"value": "hello", "userId": "attacker"}, context()
+            {"value": "hello", argument_name: "attacker"}, context()
         )
         assert result.is_error is True
         assert "Runtime-managed" in result.content

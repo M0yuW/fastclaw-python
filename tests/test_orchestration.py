@@ -16,6 +16,7 @@ from fastclaw.orchestration import (
     DelegationRequest,
     InProcessMessageBus,
     QueueShutdownError,
+    SpawnSubagentTool,
     TaskResult,
     WaitTicket,
 )
@@ -31,6 +32,50 @@ def context(
         root_execution_id=root,
         call_path=path,
     )
+
+
+def test_spawn_subagent_schema_exposes_only_delegation_arguments() -> None:
+    tool = SpawnSubagentTool(InProcessMessageBus())
+
+    properties = tool.definition.function.parameters["properties"]
+    assert isinstance(properties, dict)
+    assert set(properties) == {"agent_id", "task"}
+
+
+@pytest.mark.asyncio
+async def test_spawn_subagent_ignores_model_supplied_identity() -> None:
+    bus = InProcessMessageBus()
+    received: list[ExecutionContext] = []
+
+    async def handler(task: str, child: ExecutionContext) -> str:
+        assert task == "delegated task"
+        received.append(child)
+        return "complete"
+
+    bus.register(user_id="user-1", agent_id="worker", handler=handler)
+    tool = SpawnSubagentTool(bus)
+    try:
+        result = await tool.execute(
+            {
+                "agent_id": "worker",
+                "task": "delegated task",
+                "user_id": "attacker",
+                "userId": "attacker",
+                "root_execution_id": "attacker-root",
+                "rootExecutionId": "attacker-root",
+                "call_path": ["attacker"],
+                "callPath": ["attacker"],
+            },
+            context(),
+        )
+
+        assert result.content == "complete"
+        assert len(received) == 1
+        assert received[0].user_id == "user-1"
+        assert received[0].root_execution_id == "root-1"
+        assert received[0].call_path == ("worker",)
+    finally:
+        await bus.shutdown()
 
 
 @pytest.mark.asyncio

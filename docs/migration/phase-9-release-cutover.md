@@ -47,6 +47,13 @@ locked fixture adds `equalPaths` semantic assertions. A task fixture may set
 `requireTerminalTasks` to reject queued/running work before cutover. The report
 is uploaded as a workflow artifact.
 
+The comparison logic is covered by unit tests built on `httpx.MockTransport`.
+Those tests do not launch either implementation, and the locked smoke fixture is
+loaded only by `scripts/differential_smoke.py`. No real Go/Python dual-service
+run has been performed yet. A successful run against independently persisted
+Go 18953 and Python 18954 services, with its report retained and reviewed, is a
+hard cutover prerequisite.
+
 Local invocation:
 
 ```bash

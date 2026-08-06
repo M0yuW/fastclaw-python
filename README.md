@@ -211,8 +211,10 @@ See [the plugin and finance migration record](docs/migration/phase-8-plugins-fin
 
 `Dockerfile` produces a non-root Linux image with a read-only application
 layer and `/data` as the only persistent volume. The manual differential
-workflow compares independent Go 18953 and Python 18954 instances without ever
-sharing SQLite. See [the release and cutover record](docs/migration/phase-9-release-cutover.md).
+workflow is designed to compare independent Go 18953 and Python 18954 instances
+without ever sharing SQLite. Its comparison logic is unit-tested, but a real
+dual-service run and retained report remain a hard cutover prerequisite. See
+[the release and cutover record](docs/migration/phase-9-release-cutover.md).
 
 ## License
 
