@@ -516,3 +516,75 @@ async def test_agent_without_agent_json_inherits_system_defaults(tmp_path: Path)
         assert profile.agent.config["maxToolIterations"] == 20
     finally:
         await close_manager(manager, runtime, database)
+
+
+async def test_agent_database_scope_overrides_stale_agent_json(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    agent = AgentRecord(
+        id="production-agent",
+        user_id="user-1",
+        name="Production Agent",
+        config={"description": "explicit agents.config value"},
+        created_at=now,
+        updated_at=now,
+    )
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'precedence.db'}")
+    await database.create_schema()
+    async with UnitOfWork(database) as unit:
+        store = unit.require_store()
+        await store.save_user(
+            UserRecord(
+                id="user-1",
+                username="fixture",
+                email="fixture@example.test",
+                password_hash="unused",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await store.save_agent(agent)
+        await store.save_agent_file(
+            AgentFileRecord(
+                agent_id=agent.id,
+                user_id=agent.user_id,
+                filename="agent.json",
+                data=b'{"model":"openrouter/legacy-model","temperature":0.4}',
+                updated_at=now,
+            )
+        )
+        await store.save_config(
+            ConfigRecord(
+                id="system-defaults",
+                kind="setting",
+                scope="system",
+                name="agents.defaults",
+                data={"model": "deepseek/system-default", "maxToolIterations": 10},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await store.save_config(
+            ConfigRecord(
+                id="agent-defaults",
+                kind="setting",
+                scope="agent",
+                scope_id=agent.id,
+                name="agents.defaults",
+                data={"model": "deepseek/deepseek-v4-pro", "maxToolIterations": 20},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    runtime = Runtime()
+    await runtime.start()
+    manager = AgentRuntimeManager(database, runtime, AgentRuntimeConfig(data_root=tmp_path))
+    await manager.start()
+    try:
+        profile = await manager.profile(agent.id, agent.user_id)
+
+        assert profile.agent.config["model"] == "deepseek/deepseek-v4-pro"
+        assert profile.agent.config["maxToolIterations"] == 20
+        assert profile.agent.config["temperature"] == 0.4
+        assert profile.agent.config["description"] == "explicit agents.config value"
+    finally:
+        await close_manager(manager, runtime, database)

@@ -664,11 +664,25 @@ class AgentRuntimeManager:
             if isinstance(parsed, dict):
                 file_config = parsed
         defaults: dict[str, Any] = {}
-        for layer in default_layers:
+        for layer in default_layers[:2]:
             for record in layer:
                 if record.enabled and record.name == "agents.defaults":
                     defaults.update(record.data)
-        effective_config = {**defaults, **file_config, **agent.config}
+        agent_overrides: dict[str, Any] = {}
+        for record in default_layers[2]:
+            if record.enabled and record.name == "agents.defaults":
+                agent_overrides.update(record.data)
+        # Go's effective runtime order applies system/user defaults first,
+        # then the compatibility agent.json layer, followed by explicit
+        # Agent-scoped database settings and finally agents.config.  Keeping
+        # the Agent scope after agent.json prevents a stale imported system
+        # file from reviving an older Provider selection.
+        effective_config = {
+            **defaults,
+            **file_config,
+            **agent_overrides,
+            **agent.config,
+        }
         prompt_parts: list[str] = []
         for filename in ("SOUL.md", "IDENTITY.md", "USER.md", "MEMORY.md"):
             raw = files.get(filename)
