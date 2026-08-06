@@ -400,6 +400,8 @@ class AgentRuntimeManager:
     ) -> ManagedAgentStream:
         self._require_running()
         profile = await self.profile(agent_id, user_id)
+        if not await self._agent_accepts_tasks(agent_id, user_id):
+            raise AgentRunError("agent team is archived")
         selection = await self.provider_selection(profile, requested_model)
         context = ExecutionContext(
             user_id=user_id,
@@ -572,7 +574,46 @@ class AgentRuntimeManager:
             configs.update({item.name: item for item in layer if item.enabled})
         return configs
 
+    async def _agent_accepts_tasks(self, agent_id: str, user_id: str) -> bool:
+        async with UnitOfWork(self.database) as unit:
+            store = unit.require_store()
+            for team in await store.list_teams(user_id):
+                members = await store.list_team_members(team.id)
+                if any(member.agent_id == agent_id for member in members):
+                    return team.status == "active"
+        return True
+
     async def _delegated_chat(self, agent_id: str, task: str, context: ExecutionContext) -> str:
+        if not await self._agent_accepts_tasks(agent_id, context.user_id):
+            raise AgentRunError("agent team is archived")
+        if len(context.call_path) > 1:
+            source_id = context.call_path[-2]
+            async with UnitOfWork(self.database) as unit:
+                store = unit.require_store()
+                permitted = False
+                source_is_team_member = False
+                for team in await store.list_teams(context.user_id):
+                    members = await store.list_team_members(team.id)
+                    source = next(
+                        (member for member in members if member.agent_id == source_id), None
+                    )
+                    target = next(
+                        (member for member in members if member.agent_id == agent_id), None
+                    )
+                    source_is_team_member = source_is_team_member or source is not None
+                    if team.status != "active":
+                        continue
+                    if (
+                        source
+                        and target
+                        and source.member_type == "coordinator"
+                        and target.member_type == "specialist"
+                        and target.status == "active"
+                    ):
+                        permitted = True
+                        break
+            if source_is_team_member and not permitted:
+                raise AgentRunError("team delegation is restricted to active specialists")
         profile = self._profiles[agent_id]
         selection = await self.provider_selection(profile)
         request = self._request(profile, selection.model, task)
@@ -630,11 +671,18 @@ class AgentRuntimeManager:
         async with UnitOfWork(self.database) as unit:
             store = unit.require_store()
             records = await store.list_agent_files(agent.id, agent.user_id)
+            teams = await store.list_teams(agent.user_id)
+            team_members = [(team, await store.list_team_members(team.id)) for team in teams]
             default_layers = [
                 await store.list_configs(kind="setting", user_id="", agent_id=""),
                 await store.list_configs(kind="setting", user_id=agent.user_id, agent_id=""),
                 await store.list_configs(kind="setting", user_id=agent.user_id, agent_id=agent.id),
             ]
+            roster_agents = {
+                member.agent_id: await store.get_agent(member.agent_id)
+                for _, members in team_members
+                for member in members
+            }
         files: dict[str, bytes] = {}
         asset_root = self.config.data_root / "agents" / agent.id
         for filename in (
@@ -743,6 +791,22 @@ class AgentRuntimeManager:
                 allowed_tools = frozenset({"read_file", "web_fetch", "list_dir", "write_file"})
         if allowed_tools is None or "spawn_subagent" in allowed_tools:
             prompt_parts.append(_DELEGATION_TOOL_PROMPT.strip())
+        for team, members in team_members:
+            current = next((member for member in members if member.agent_id == agent.id), None)
+            if current is None:
+                continue
+            roster = "\n".join(
+                f"- {member.role_key}: "
+                f"{(roster_agents[member.agent_id] or agent).name} ({member.agent_id})"
+                for member in members
+                if member.status == "active"
+            )
+            prompt_parts.append(
+                "## Team roster\n\n"
+                f"Team: {team.name}\nStatus: {team.status}\n{roster}\n\n"
+                "Only the coordinator may delegate, and only to active specialists in this roster."
+            )
+            break
         system_prompt = "\n\n".join(prompt_parts).replace(
             str(self.config.legacy_data_root), str(self.config.data_root)
         )
