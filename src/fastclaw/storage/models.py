@@ -10,6 +10,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     LargeBinary,
     String,
     Text,
@@ -100,15 +101,15 @@ class AgentTeamModel(Base):
 class AgentTeamMemberModel(Base):
     __tablename__ = "agent_team_members"
     __table_args__ = (
-        UniqueConstraint("team_id", "agent_id"),
         UniqueConstraint("team_id", "role_key"),
+        Index("uq_agent_team_members_agent_id", "agent_id", unique=True),
     )
 
     team_id: Mapped[str] = mapped_column(
         ForeignKey("agent_teams.id", ondelete="CASCADE"), primary_key=True
     )
     agent_id: Mapped[str] = mapped_column(
-        ForeignKey("agents.id", ondelete="RESTRICT"), primary_key=True, unique=True
+        ForeignKey("agents.id", ondelete="RESTRICT"), primary_key=True
     )
     role_key: Mapped[str] = mapped_column(String)
     member_type: Mapped[str] = mapped_column(String)
