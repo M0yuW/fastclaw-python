@@ -27,6 +27,7 @@ OVERLAY_PATHS = {
     "src/app/agents/page.tsx",
     "src/lib/api.ts",
     "src/lib/chat-stream.ts",
+    "src/components/app-sidebar.tsx",
 }
 
 

@@ -9,7 +9,7 @@ import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { createTeam, getTeamTemplates, getTeams, previewTeam, type TeamInfo, type TeamTemplate } from "@/lib/api";
+import { archiveTeam, createTeam, getTeamTemplates, getTeams, previewTeam, type TeamInfo, type TeamTemplate } from "@/lib/api";
 
 export default function TeamsPage() {
   const [teams, setTeams] = useState<TeamInfo[]>([]);
@@ -18,6 +18,8 @@ export default function TeamsPage() {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [templateKey, setTemplateKey] = useState("finance-market-research");
+  const [specialists, setSpecialists] = useState("");
+  const [requestId, setRequestId] = useState("");
   const [preview, setPreview] = useState<string[]>([]);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
@@ -26,23 +28,25 @@ export default function TeamsPage() {
   const selected = templates.find((item) => item.key === templateKey);
   async function runPreview() {
     setError("");
-    const result = await previewTeam({ name: name || "Preview", templateKey, clientRequestId: crypto.randomUUID() });
+    const result = await previewTeam({ name: name || "Preview", templateKey, clientRequestId: requestId || crypto.randomUUID(), specialists: customRoles() });
     if (!result.ok) return setError(result.detail || "Preview failed");
     setPreview(result.roles || []);
   }
   async function submit() {
     if (!name.trim()) return;
     setSaving(true); setError("");
-    const result = await createTeam({ name: name.trim(), description, templateKey, clientRequestId: crypto.randomUUID() });
+    const result = await createTeam({ name: name.trim(), description, templateKey, clientRequestId: requestId, specialists: customRoles() });
     setSaving(false);
     if (!result.ok) return setError(result.detail || result.error || "Team creation failed");
-    setOpen(false); setName(""); setDescription(""); setPreview([]); load();
+    setOpen(false); setName(""); setDescription(""); setSpecialists(""); setRequestId(""); setPreview([]); load();
   }
+  function customRoles() { return specialists.split("\n").map((name) => name.trim()).filter(Boolean).map((name) => ({ key: name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, ""), name })); }
+  async function archive(team: TeamInfo) { const result = await archiveTeam(team.id, team.revision); if (!result.ok) setError(result.detail || "Archive failed"); else load(); }
   return <div className="mx-auto max-w-5xl space-y-6 p-6">
-    <div className="flex items-center justify-between"><div><h2 className="text-2xl font-semibold">Teams</h2><p className="mt-1 text-sm text-muted-foreground">Coordinator-led specialist teams.</p></div><Button onClick={() => setOpen(true)}><Plus /> Create team</Button></div>
-    <div className="grid gap-4 md:grid-cols-2">{teams.map((team) => <Card key={team.id}><CardHeader><CardTitle className="flex items-center gap-2"><UsersRound size={18} />{team.name}</CardTitle><CardDescription>{team.description || team.templateKey}</CardDescription></CardHeader><CardContent className="space-y-3"><Badge variant={team.status === "active" ? "default" : "secondary"}>{team.status}</Badge><div className="text-sm text-muted-foreground">{team.members.length} members · revision {team.revision}</div><div className="flex flex-wrap gap-2">{team.members.map((member) => <Badge key={member.agentId} variant="outline">{member.roleKey}</Badge>)}</div></CardContent></Card>)}</div>
+    <div className="flex items-center justify-between"><div><h2 className="text-2xl font-semibold">Teams</h2><p className="mt-1 text-sm text-muted-foreground">Coordinator-led specialist teams.</p></div><Button onClick={() => { setRequestId(crypto.randomUUID()); setOpen(true); }}><Plus /> Create team</Button></div>
+    <div className="grid gap-4 md:grid-cols-2">{teams.map((team) => <Card key={team.id}><CardHeader><CardTitle className="flex items-center gap-2"><UsersRound size={18} />{team.name}</CardTitle><CardDescription>{team.description || team.templateKey}</CardDescription></CardHeader><CardContent className="space-y-3"><Badge variant={team.status === "active" ? "default" : "secondary"}>{team.status}</Badge><div className="text-sm text-muted-foreground">{team.members.length} members · revision {team.revision}</div><div className="flex flex-wrap gap-2">{team.members.map((member) => <Badge key={member.agentId} variant="outline">{member.roleKey}</Badge>)}</div>{team.status === "active" && <Button variant="outline" size="sm" onClick={() => archive(team)}>Archive</Button>}</CardContent></Card>)}</div>
     {!teams.length && !error && <Card><CardContent className="p-8 text-center text-muted-foreground">No teams yet. Create a template-based team to start.</CardContent></Card>}
     {error && <p className="text-sm text-destructive">{error}</p>}
-    <Dialog open={open} onOpenChange={setOpen}><DialogContent><DialogHeader><DialogTitle>Create team</DialogTitle></DialogHeader><div className="space-y-4"><div><Label htmlFor="team-name">Name</Label><Input id="team-name" value={name} onChange={(event) => setName(event.target.value)} /></div><div><Label htmlFor="team-description">Description</Label><Textarea id="team-description" value={description} onChange={(event) => setDescription(event.target.value)} /></div><div><Label htmlFor="team-template">Template</Label><select id="team-template" className="mt-1 w-full rounded-md border bg-background p-2" value={templateKey} onChange={(event) => { setTemplateKey(event.target.value); setPreview([]); }}>{templates.map((template) => <option key={template.key} value={template.key}>{template.name}</option>)}</select><p className="mt-2 text-xs text-muted-foreground">{selected?.roles.map((role) => role.name).join(" · ")}</p></div>{preview.length > 0 && <div className="text-sm">Preview: {preview.join(", ")}</div>}</div><DialogFooter><Button variant="outline" onClick={runPreview}>Preview</Button><Button onClick={submit} disabled={saving || !name.trim()}>Create</Button></DialogFooter></DialogContent></Dialog>
+    <Dialog open={open} onOpenChange={setOpen}><DialogContent><DialogHeader><DialogTitle>Create team</DialogTitle></DialogHeader><div className="space-y-4"><div><Label htmlFor="team-name">Name</Label><Input id="team-name" value={name} onChange={(event) => setName(event.target.value)} /></div><div><Label htmlFor="team-description">Description</Label><Textarea id="team-description" value={description} onChange={(event) => setDescription(event.target.value)} /></div><div><Label htmlFor="team-template">Template</Label><select id="team-template" className="mt-1 w-full rounded-md border bg-background p-2" value={templateKey} onChange={(event) => { setTemplateKey(event.target.value); setPreview([]); }}><option value="custom">Custom team</option>{templates.map((template) => <option key={template.key} value={template.key}>{template.name}</option>)}</select><p className="mt-2 text-xs text-muted-foreground">{selected?.roles.map((role) => role.name).join(" · ")}</p></div>{templateKey === "custom" && <div><Label htmlFor="team-specialists">Specialists</Label><Textarea id="team-specialists" placeholder="One specialist name per line" value={specialists} onChange={(event) => setSpecialists(event.target.value)} /></div>}{preview.length > 0 && <div className="text-sm">Preview: {preview.join(", ")}</div>}</div><DialogFooter><Button variant="outline" onClick={runPreview}>Preview</Button><Button onClick={submit} disabled={saving || !name.trim()}>Create</Button></DialogFooter></DialogContent></Dialog>
   </div>;
 }
