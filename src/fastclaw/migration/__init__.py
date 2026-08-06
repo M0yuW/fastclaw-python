@@ -1,5 +1,10 @@
 """Migration utilities."""
 
+from fastclaw.migration.assets import (
+    AssetImportConflictError,
+    AssetImportReport,
+    import_assets,
+)
 from fastclaw.migration.importer import (
     ImportIssue,
     ImportReport,
@@ -7,4 +12,12 @@ from fastclaw.migration.importer import (
     import_go_database,
 )
 
-__all__ = ["ImportIssue", "ImportReport", "ImportValidationError", "import_go_database"]
+__all__ = [
+    "AssetImportConflictError",
+    "AssetImportReport",
+    "ImportIssue",
+    "ImportReport",
+    "ImportValidationError",
+    "import_assets",
+    "import_go_database",
+]

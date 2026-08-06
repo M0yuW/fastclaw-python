@@ -3,5 +3,19 @@
 from fastclaw.tools.base import Tool, ToolResult
 from fastclaw.tools.builtin import ExecTool, ReadFileTool, WebFetchTool
 from fastclaw.tools.registry import ToolRegistry
+from fastclaw.tools.skill import SkillScriptTool
+from fastclaw.tools.workspace import ListDirTool, WriteFileTool
+from fastclaw.tools.worldcup import WorldCupLedgerTool
 
-__all__ = ["ExecTool", "ReadFileTool", "Tool", "ToolRegistry", "ToolResult", "WebFetchTool"]
+__all__ = [
+    "ExecTool",
+    "ListDirTool",
+    "ReadFileTool",
+    "SkillScriptTool",
+    "Tool",
+    "ToolRegistry",
+    "ToolResult",
+    "WebFetchTool",
+    "WorldCupLedgerTool",
+    "WriteFileTool",
+]
