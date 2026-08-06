@@ -69,8 +69,8 @@ The common smoke initially compared only shared unauthenticated endpoints. A
 second run used independent disposable database/asset copies, a synthetic
 Agent-scoped API key, and the repository's deterministic Provider. All eight
 authenticated cases passed: identity, allowed-Agent access, non-stream chat,
-SSE content, five paired coordinator ToolCalls/ToolResults, and terminal task
-state. Disconnecting a slow stream on each Runtime left zero active tasks and
+SSE content, five successful paired coordinator ToolCalls/ToolResults with six
+Agent Sessions on each Runtime, and terminal task state. Disconnecting a slow stream on each Runtime left zero active tasks and
 persisted no partial assistant. The retained report is
 `docs/migration/evidence/differential-authenticated-2026-08-06.json`.
 

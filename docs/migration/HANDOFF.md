@@ -107,7 +107,8 @@ CI（`.github/workflows/ci.yml`）的 job：`quality`（Python 3.12/3.13/3.14 + 
 
 `.github/workflows/differential.yml` 使用 `workflow_dispatch` + `runs-on: self-hosted`。
 2026-08-06 已完成真实双服务的未认证 health/status 子集；随后在独立 disposable
-副本上完成真实 Go/Python 的认证、SSE、五次 coordinator 委派、任务终态和慢流取消
+副本上完成真实 Go/Python 的认证、SSE、五次成功 coordinator 委派（各 6 个 Agent
+Session）、任务终态和慢流取消
 差分——见 5.2 J1。
 
 同日还在独立 disposable Python 副本上完成了不使用旧密码/API key 的认证读取 smoke：

@@ -158,7 +158,8 @@ benchmark 14 Agent，以及 coordinator 的 5 个 Session 均通过。该验证�
 API key，以确定性 Provider 完成 8 项认证差分：身份、允许 Agent、非流式 chat、SSE、
 finance coordinator 的 5 对 ToolCall/ToolResult、任务终态均通过。Go 的 5 个空
 `content` 事件与 Python 的可选 ToolResult `metadata` 作为显式兼容差异归一化，其他
-字段、顺序、seq、done 和调用配对仍严格比较。两边慢流中断后活动任务和残缺 assistant
+字段、顺序、seq、done、工具结果语义和调用配对仍严格比较；两边均生成 coordinator
+以及 5 个 specialist 的 6 个 Session。两边慢流中断后活动任务和残缺 assistant
 均为 0。证据见 `evidence/differential-authenticated-2026-08-06.json`。J1 至此关闭；
 真实 Provider 行为仍属于 J2。
 
