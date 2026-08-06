@@ -812,6 +812,20 @@ export async function archiveTeam(id: string, revision: number) {
   return res.json();
 }
 
+export async function restoreTeam(id: string, revision: number) {
+  const res = await apiFetch(`/api/agent-teams/${encodeURIComponent(id)}/restore`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ revision }),
+  });
+  return res.json();
+}
+
+export async function deleteTeam(id: string, revision: number) {
+  const res = await apiFetch(`/api/agent-teams/${encodeURIComponent(id)}`, {
+    method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ teamId: id, revision }),
+  });
+  return res.json();
+}
+
 // Single-agent detail. Falls back through the same permission rules as
 // the rest of /api/agents/{id} — owner or super_admin can fetch. Used
 // by the chat header to resolve a name when the agent isn't in the
