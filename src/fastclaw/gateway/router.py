@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from fastclaw.agent import AgentEvent, AgentEventType
-from fastclaw.agent.manager import AgentRuntimeManager
+from fastclaw.agent.manager import AgentRuntimeManager, AgentRuntimeProfile
 from fastclaw.gateway.models import (
     AdminUserCreate,
     AdminUserUpdate,
@@ -632,12 +632,44 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             validate_roles(template.roles)
         except TeamValidationError as exc:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+        preview_agent = AgentRecord(
+            id="preview-agent",
+            user_id=auth.identity.effective_user_id,
+            name=template.roles[0].name,
+            config={**({"model": payload.model} if payload.model else {})},
+        )
+        profile = AgentRuntimeProfile(
+            agent=preview_agent,
+            system_prompt="",
+            allowed_tools=frozenset(template.roles[0].allowed_tools),
+        )
+        try:
+            selection = await gateway.agent_manager.provider_selection(profile)
+            provider_check: dict[str, Any] = {
+                "ok": True,
+                "name": selection.name,
+                "model": selection.model,
+            }
+        except RuntimeError as exc:
+            provider_check = {"ok": False, "error": str(exc)}
+        required_tools = sorted({tool for role in template.roles for tool in role.allowed_tools})
+        environment = {
+            "ODDS_API_KEY": bool(os.environ.get("ODDS_API_KEY"))
+            if template.key == "world-cup-analysis"
+            else True
+        }
         return {
-            "ok": True,
+            "ok": bool(provider_check["ok"]) and all(environment.values()),
             "writesDatabase": False,
             "templateKey": template.key,
             "roles": [role.key for role in template.roles],
-            "checks": {"provider": "deferred"},
+            "checks": {
+                "provider": provider_check,
+                "model": bool(provider_check["ok"] and provider_check.get("model")),
+                "skills": {"required": [], "prepared": True},
+                "tools": {"required": required_tools, "available": True},
+                "environment": environment,
+            },
         }
 
     @router.post("/api/agent-teams", status_code=status.HTTP_201_CREATED)
