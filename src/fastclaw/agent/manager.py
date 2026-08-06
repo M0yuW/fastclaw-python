@@ -134,7 +134,7 @@ def _default_tools(
         ListDirTool(workspace),
         WriteFileTool(workspace),
         WebFetchTool(runtime.web_http_client),
-        SpawnSubagentTool(bus),
+        SpawnSubagentTool(bus, tuple(profile.agent.config.get("teamSpecialistIds", ()))),
         WorldCupLedgerTool(data_root),
     ]
     if profile.skills:
@@ -592,6 +592,7 @@ class AgentRuntimeManager:
                 store = unit.require_store()
                 permitted = False
                 source_is_team_member = False
+                target_is_team_member = False
                 for team in await store.list_teams(context.user_id):
                     members = await store.list_team_members(team.id)
                     source = next(
@@ -601,6 +602,7 @@ class AgentRuntimeManager:
                         (member for member in members if member.agent_id == agent_id), None
                     )
                     source_is_team_member = source_is_team_member or source is not None
+                    target_is_team_member = target_is_team_member or target is not None
                     if team.status != "active":
                         continue
                     if (
@@ -612,7 +614,7 @@ class AgentRuntimeManager:
                     ):
                         permitted = True
                         break
-            if source_is_team_member and not permitted:
+            if (source_is_team_member or target_is_team_member) and not permitted:
                 raise AgentRunError("team delegation is restricted to active specialists")
         profile = self._profiles[agent_id]
         selection = await self.provider_selection(profile)
@@ -806,6 +808,12 @@ class AgentRuntimeManager:
                 f"Team: {team.name}\nStatus: {team.status}\n{roster}\n\n"
                 "Only the coordinator may delegate, and only to active specialists in this roster."
             )
+            if current.member_type == "coordinator":
+                effective_config["teamSpecialistIds"] = [
+                    member.agent_id
+                    for member in members
+                    if member.member_type == "specialist" and member.status == "active"
+                ]
             break
         system_prompt = "\n\n".join(prompt_parts).replace(
             str(self.config.legacy_data_root), str(self.config.data_root)
