@@ -9,6 +9,7 @@ from types import MappingProxyType
 
 import httpx
 
+from fastclaw.network import create_pinned_http_client
 from fastclaw.providers import Provider
 
 HTTPClientFactory = Callable[[], httpx.AsyncClient]
@@ -66,10 +67,13 @@ class Runtime:
         providers: tuple[Provider, ...] = (),
         *,
         http_client_factory: HTTPClientFactory = _default_http_client,
+        web_http_client_factory: HTTPClientFactory = create_pinned_http_client,
     ) -> None:
         self._providers: dict[str, Provider] = {}
         self._http_client_factory = http_client_factory
+        self._web_http_client_factory = web_http_client_factory
         self._http_client: httpx.AsyncClient | None = None
+        self._web_http_client: httpx.AsyncClient | None = None
         self._state = RuntimeState.CREATED
         self._lock = asyncio.Lock()
 
@@ -95,6 +99,14 @@ class Runtime:
         if self._state is not RuntimeState.RUNNING or self._http_client is None:
             raise RuntimeStateError("the HTTP client is only available while running")
         return self._http_client
+
+    @property
+    def web_http_client(self) -> httpx.AsyncClient:
+        """Return the DNS-pinned client dedicated to public web tools."""
+
+        if self._state is not RuntimeState.RUNNING or self._web_http_client is None:
+            raise RuntimeStateError("the web HTTP client is only available while running")
+        return self._web_http_client
 
     def register_provider(self, provider: Provider) -> None:
         """Register a provider before the first startup."""
@@ -123,6 +135,15 @@ class Runtime:
             except BaseException as exc:
                 self._state = RuntimeState.FAILED
                 raise RuntimeStartupError("http-client") from exc
+            try:
+                web_client = self._web_http_client_factory()
+            except BaseException as exc:
+                try:
+                    await client.aclose()
+                except BaseException:
+                    pass
+                self._state = RuntimeState.FAILED
+                raise RuntimeStartupError("web-http-client") from exc
 
             started: list[Provider] = []
             current_provider: Provider | None = None
@@ -141,6 +162,10 @@ class Runtime:
                     await client.aclose()
                 except BaseException:
                     pass
+                try:
+                    await web_client.aclose()
+                except BaseException:
+                    pass
                 self._state = RuntimeState.FAILED
                 if isinstance(exc, asyncio.CancelledError):
                     raise
@@ -148,6 +173,7 @@ class Runtime:
                 raise RuntimeStartupError(provider_name) from exc
 
             self._http_client = client
+            self._web_http_client = web_client
             self._state = RuntimeState.RUNNING
 
     async def stop(self) -> None:
@@ -182,6 +208,14 @@ class Runtime:
                     errors.append(exc)
                 finally:
                     self._http_client = None
+
+            if self._web_http_client is not None:
+                try:
+                    await self._web_http_client.aclose()
+                except BaseException as exc:
+                    errors.append(exc)
+                finally:
+                    self._web_http_client = None
 
             self._state = RuntimeState.FAILED if errors else RuntimeState.STOPPED
             if errors:

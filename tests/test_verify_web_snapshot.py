@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import runpy
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -22,8 +23,10 @@ verify_overlay_hashes = cast(OverlayVerifier, SCRIPT_GLOBALS["verify_overlay_has
 OVERLAY_PATHS = {
     "package.json",
     "pnpm-lock.yaml",
+    "src/app/agents/[id]/chat/page.tsx",
     "src/app/agents/page.tsx",
     "src/lib/api.ts",
+    "src/lib/chat-stream.ts",
 }
 
 
@@ -51,5 +54,5 @@ def test_overlay_hash_change_is_rejected(tmp_path: Path, name: str) -> None:
     with (web_root / name).open("ab") as overlay:
         overlay.write(b"\n")
 
-    with pytest.raises(RuntimeError, match=name.replace(".", r"\.")):
+    with pytest.raises(RuntimeError, match=re.escape(name)):
         verify_overlay_hashes(modified_files, web_root=web_root)

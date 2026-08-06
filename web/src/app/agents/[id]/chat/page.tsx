@@ -210,6 +210,7 @@ function buildChatMessages(history: ChatHistoryMessage[]): ChatMessage[] {
       const calls = h.toolCalls.map((tc) => ({
         ...tc,
         result: undefined as string | undefined,
+        isError: undefined as boolean | undefined,
         metadata: undefined as ToolResultMetadata | undefined,
       }));
       i++;
@@ -220,6 +221,7 @@ function buildChatMessages(history: ChatHistoryMessage[]): ChatMessage[] {
         if (call) {
           call.result = toolMsg.content;
           if (toolMsg.metadata) call.metadata = toolMsg.metadata;
+          call.isError = toolMsg.metadata?.isError;
         }
         i++;
       }
@@ -1374,6 +1376,7 @@ function ToolCallGroup({ msg, surfacedSrcs, agentId, sessionId }: { msg: ChatMes
 
   const tools = msg.toolCalls || [];
   const doneCount = tools.filter((tc) => tc.result != null).length;
+  const errorCount = tools.filter((tc) => tc.isError).length;
   const allDone = doneCount === tools.length;
 
   const toggleTool = (id: string) =>
@@ -1406,12 +1409,16 @@ function ToolCallGroup({ msg, surfacedSrcs, agentId, sessionId }: { msg: ChatMes
           >
             {!allDone ? (
               <div className="h-3.5 w-3.5 shrink-0 rounded-full border-2 border-amber-500 border-t-transparent animate-spin" />
+            ) : errorCount > 0 ? (
+              <X className="h-3.5 w-3.5 text-red-500 shrink-0" />
             ) : (
               <Wrench className="h-3.5 w-3.5 text-amber-500 shrink-0" />
             )}
             <span className="font-medium text-foreground">
               {allDone
-                ? `Executed ${tools.length} tool${tools.length > 1 ? "s" : ""}`
+                ? errorCount > 0
+                  ? `Executed ${tools.length} tool${tools.length > 1 ? "s" : ""} · ${errorCount} failed`
+                  : `Executed ${tools.length} tool${tools.length > 1 ? "s" : ""}`
                 : `Running tools (${doneCount}/${tools.length})...`}
             </span>
             <span className="text-muted-foreground/60 text-[11px] flex-1 text-left truncate">
@@ -1434,6 +1441,8 @@ function ToolCallGroup({ msg, surfacedSrcs, agentId, sessionId }: { msg: ChatMes
                   >
                     {tc.result === undefined ? (
                       <div className="h-3 w-3 shrink-0 rounded-full border-2 border-amber-500/60 border-t-transparent animate-spin" />
+                    ) : tc.isError ? (
+                      <X className="h-3 w-3 text-red-500 shrink-0" />
                     ) : (
                       <Check className="h-3 w-3 text-emerald-500 shrink-0" />
                     )}
@@ -1476,8 +1485,10 @@ function ToolCallGroup({ msg, surfacedSrcs, agentId, sessionId }: { msg: ChatMes
                       </div>
                       {tc.result != null ? (
                         <div>
-                          <p className="text-[10px] font-medium text-muted-foreground uppercase mb-1">Output</p>
-                          <pre className="text-xs font-mono bg-muted/50 rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-60">
+                          <p className={`text-[10px] font-medium uppercase mb-1 ${tc.isError ? "text-red-500" : "text-muted-foreground"}`}>
+                            {tc.isError ? "Error" : "Output"}
+                          </p>
+                          <pre className={`text-xs font-mono rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-60 ${tc.isError ? "bg-red-500/10 text-red-700 dark:text-red-300" : "bg-muted/50"}`}>
                             {tc.result.length > 2000 ? tc.result.slice(0, 2000) + "..." : tc.result}
                           </pre>
                         </div>

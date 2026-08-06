@@ -596,7 +596,7 @@ export async function deleteChatSession(agentId: string, sessionId: string) {
   return res.json();
 }
 
-export async function sendChat(agentId: string, sessionId: string, message: string): Promise<{ response: string }> {
+export async function sendChat(agentId: string, sessionId: string, message: string): Promise<{ reply: string }> {
   const res = await apiFetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -607,6 +607,7 @@ export async function sendChat(agentId: string, sessionId: string, message: stri
 
 export interface ToolResultMetadata {
   sandbox?: boolean;
+  isError?: boolean;
 }
 
 export interface ChatStreamEvent {
@@ -619,6 +620,7 @@ export interface ChatStreamEvent {
     name?: string;
     arguments?: string;
     result?: string;
+    isError?: boolean;
     message?: string;
     metadata?: ToolResultMetadata;
     turnId?: string;

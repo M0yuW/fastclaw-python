@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
+import pytest
 from fastapi import FastAPI
 
 from fastclaw.app import create_app
@@ -11,6 +12,16 @@ from fastclaw.providers import ChatRequest, ChatResponse, ProviderEvent, Provide
 from fastclaw.providers.stream import ProviderStream
 from fastclaw.runtime import Runtime, RuntimeState
 from fastclaw.storage import Database
+
+
+class TrackingDatabase(Database):
+    def __init__(self, url: str) -> None:
+        super().__init__(url)
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+        await super().close()
 
 
 class ProbeProvider:
@@ -118,3 +129,42 @@ async def test_readyz_rejects_running_runtime_without_any_usable_provider(tmp_pa
 
     assert response.status_code == 503
     assert response.json()["checks"]["providers"] is False
+
+
+async def test_lifespan_rolls_back_every_resource_when_agent_start_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_client = httpx.AsyncClient()
+    web_client = httpx.AsyncClient()
+    runtime = Runtime(
+        http_client_factory=lambda: provider_client,
+        web_http_client_factory=lambda: web_client,
+    )
+    settings = gateway_settings(tmp_path / "failed-start.db")
+    database = TrackingDatabase(settings.database_url)
+    app = create_app(runtime, settings=settings, database=database)
+    manager = app.state.agent_manager
+    manager_stopped = False
+    original_stop = manager.stop
+
+    async def fail_start() -> None:
+        raise OSError("fixture manager startup failed")
+
+    async def track_stop() -> None:
+        nonlocal manager_stopped
+        manager_stopped = True
+        await original_stop()
+
+    monkeypatch.setattr(manager, "start", fail_start)
+    monkeypatch.setattr(manager, "stop", track_stop)
+
+    with pytest.raises(OSError, match="fixture manager startup failed"):
+        async with app.router.lifespan_context(app):
+            raise AssertionError("lifespan yielded after failed startup")
+
+    assert manager_stopped
+    assert provider_client.is_closed
+    assert web_client.is_closed
+    assert database.closed
+    assert runtime.state is RuntimeState.STOPPED

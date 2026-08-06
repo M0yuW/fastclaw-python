@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -53,6 +54,7 @@ class AgentEvent(AgentModel):
     content: str = ""
     tool_call: ToolCall | None = None
     tool_result: str = ""
+    tool_metadata: dict[str, Any] = Field(default_factory=dict)
     is_error: bool = False
     error: str = ""
     message: ChatMessage | None = None

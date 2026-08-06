@@ -17,6 +17,12 @@ _REQUIRED_WHEEL_SUFFIXES = {
     "fastclaw/migrations/versions/20260805_01_initial_schema.py",
     "fastclaw/py.typed",
 }
+_REQUIRED_SDIST_SUFFIXES = {
+    "scripts/cutover_live_smoke.py",
+    "scripts/cutover_wiring_smoke.py",
+    "scripts/fixture_multiagent_provider.py",
+    "tests/fixtures/cutover-live-smoke.json",
+}
 _FORBIDDEN_SDIST_PARTS = {
     ".mypy_cache",
     ".next",
@@ -55,6 +61,13 @@ def verify_distribution(directory: Path) -> tuple[int, int]:
 
     with tarfile.open(sdist, "r:gz") as archive:
         sdist_names = archive.getnames()
+    missing_sdist = sorted(
+        suffix
+        for suffix in _REQUIRED_SDIST_SUFFIXES
+        if not any(name.endswith(suffix) for name in sdist_names)
+    )
+    if missing_sdist:
+        raise RuntimeError(f"sdist is missing required verification files: {missing_sdist}")
     forbidden = sorted(
         name for name in sdist_names if _FORBIDDEN_SDIST_PARTS.intersection(Path(name).parts)
     )

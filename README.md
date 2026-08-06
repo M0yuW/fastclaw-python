@@ -221,6 +221,25 @@ fastclaw cutover audit \
 The audit starts bundled plugins to verify their handshake, so the supplied
 data root must be a disposable copy rather than the live Go or Python root.
 
+After the audit is green and rotated Provider/ODDS credentials are configured,
+the credentialed business smoke can be run against the local Python Gateway.
+It writes uniquely named audit Sessions, accepts cookies only from environment
+variables, rejects the Go data directory, and records content hashes rather
+than model/tool payloads:
+
+```bash
+export FASTCLAW_CUTOVER_PRODUCTION_SESSION='<one-time production cookie>'
+export FASTCLAW_CUTOVER_BENCHMARK_SESSION='<one-time benchmark cookie>'
+python scripts/cutover_live_smoke.py \
+  --database ~/.fastclaw-python/fastclaw.db \
+  --acknowledge-live-cutover I_ACKNOWLEDGE_THIS_WRITES_CUTOVER_SESSIONS
+```
+
+Do not retain either cookie in shell history or an evidence report. A green
+run requires all four production/benchmark coordinator scenarios, 17 exact
+delegations, the World Cup ledger report, paired successful tools, terminal
+tasks, and tenant-correct persisted Session history.
+
 ## Release image and differential smoke
 
 `Dockerfile` produces a non-root Linux image with a read-only application

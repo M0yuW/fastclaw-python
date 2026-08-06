@@ -163,9 +163,47 @@ class AgentRunner:
                         yield event(AgentEventType.DONE, message=assistant)
                         return
 
-                    for call in assistant.tool_calls:
+                    parsed_calls = [self._parse_arguments(call) for call in assistant.tool_calls]
+                    call_names = tuple(call.function.name for call in assistant.tool_calls)
+                    if all(not error for _, error in parsed_calls) and self._tools.supports_batch(
+                        call_names, allowed=request.allowed_tools
+                    ):
+                        for call in assistant.tool_calls:
+                            yield event(AgentEventType.TOOL_CALL, tool_call=call)
+                        batch_results = await self._tools.execute_batch(
+                            call_names[0],
+                            tuple(arguments for arguments, _ in parsed_calls),
+                            context,
+                            allowed=request.allowed_tools,
+                            timeout_seconds=request.tool_timeout,
+                        )
+                        for call, result in zip(assistant.tool_calls, batch_results, strict=True):
+                            message_metadata = dict(result.metadata)
+                            if result.is_error:
+                                message_metadata["isError"] = True
+                            history.append(
+                                ChatMessage(
+                                    role=MessageRole.TOOL,
+                                    content=result.content,
+                                    tool_call_id=call.id,
+                                    name=call.function.name,
+                                    metadata=message_metadata,
+                                )
+                            )
+                            yield event(
+                                AgentEventType.TOOL_RESULT,
+                                tool_call=call,
+                                tool_result=result.content,
+                                tool_metadata=result.metadata,
+                                is_error=result.is_error,
+                            )
+                        continue
+
+                    for call, (arguments, parse_error) in zip(
+                        assistant.tool_calls, parsed_calls, strict=True
+                    ):
                         yield event(AgentEventType.TOOL_CALL, tool_call=call)
-                        arguments, parse_error = self._parse_arguments(call)
+                        result_metadata: dict[str, Any] = {}
                         if parse_error:
                             result_content = parse_error
                             is_error = True
@@ -180,20 +218,26 @@ class AgentRunner:
                             result_content = result.content
                             is_error = result.is_error
                             direct_return = result.direct_return
+                            result_metadata = result.metadata
                         if parse_error:
                             direct_return = False
+                        message_metadata = dict(result_metadata)
+                        if is_error:
+                            message_metadata["isError"] = True
                         history.append(
                             ChatMessage(
                                 role=MessageRole.TOOL,
                                 content=result_content,
                                 tool_call_id=call.id,
                                 name=call.function.name,
+                                metadata=message_metadata,
                             )
                         )
                         yield event(
                             AgentEventType.TOOL_RESULT,
                             tool_call=call,
                             tool_result=result_content,
+                            tool_metadata=result_metadata,
                             is_error=is_error,
                         )
                         if direct_return and not is_error:

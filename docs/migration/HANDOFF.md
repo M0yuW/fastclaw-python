@@ -14,26 +14,27 @@
 ```bash
 cd /Users/wangzheyu/.codex/worktrees/8e65/fastclaw/fastclaw-python
 git status                 # 提交切换验证更新后应为干净
-git log --oneline -1       # 当前为 cutover-verification 分支最新提交
+git log --oneline -1       # 当前为 completion-audit 分支最新提交
 ```
 
 | 项 | 值 |
 |---|---|
 | 工作树路径 | `/Users/wangzheyu/.codex/worktrees/8e65/fastclaw/fastclaw-python` |
-| 当前分支 | `codex/cutover-verification` |
-| 基线 | `main@e0ba077`（PR #1–#13 全部合并） |
-| `origin/main` | `e0ba077` |
+| 当前分支 | `codex/completion-audit` |
+| 基线 | `main@4f1df92`（PR #1–#14 全部合并） |
+| `origin/main` | `4f1df92` |
 | Python 服务 | 127.0.0.1:18954 正在运行；health 200，ready 503（仅 Provider false） |
 | Go 服务 | differential 后已优雅停止 |
 | 工作树 | 提交本轮验证证据后应干净 |
 
-本轮只在 `main` 之上补真实 differential 证据与状态文档；不改写已合并历史。
+本轮在 `main` 之上补隔离 smoke 证据、生命周期/DNS 安全收口、同轮批量委派和只读
+Provider 核对；不改写已合并历史。
 
 ---
 
 ## 2. 分支拓扑与 PR 状态
 
-历史堆叠已全部收口到 `main`。#9–#13 均使用 merge commit，逐层 retarget 后重跑
+历史堆叠已全部收口到 `main`。#9–#14 均使用 merge commit，逐层 retarget 后重跑
 CI，没有 rebase、force push 或删除 Go 历史。
 
 | PR | 分支 | 主题 | 状态 |
@@ -51,10 +52,11 @@ CI，没有 rebase、force push 或删除 Go 历史。
 | #11 | `codex/gateway-web-api` | Phase D Gateway/Web 兼容 API | MERGED |
 | #12 | `codex/plugin-finance-tools` | Phase E 插件协议 + finance tools | MERGED |
 | #13 | `codex/release-hardening` | Phase F/G 发布加固 + cutover audit | MERGED，9/9 CI 绿 |
+| #14 | `codex/cutover-verification` | 真实双服务基础 smoke + 证据 | MERGED，9/9 CI 绿 |
 
 **合并规则（不可违反）**：逐个 retarget 到 `main`，**不 rebase、不 force push**。原因是保住 PR 行内评论的锚点；一旦 rebase，历史评论全部失去位置，审查上下文不可恢复。父 PR 合并后子 PR 只做 base 切换 + 重跑 CI。
 
-实际合并顺序：`#9 → #10 → #11 → #12 → #13`。
+实际合并顺序：`#9 → #10 → #11 → #12 → #13 → #14`。
 
 ---
 
@@ -78,7 +80,7 @@ CI，没有 rebase、force push 或删除 Go 历史。
 | 9 | 发布加固与切换：PostgreSQL/wheel/Docker/Playwright/依赖审计/secret scan CI，Go 18953 vs Python 18954 differential，故障矩阵，结构化日志 | `phase-9-release-cutover.md` | #13 | 已合并，完整 CI 绿 |
 | 10 | 切换就绪与遗留收口：G 口径收口 / H 凭据轮换 / I 合并堆叠 / J 真实环境验证 / K 切换执行 | `phase-10-cutover-readiness.md` | 当前分支 | G/I 完成；J 部分完成；H/K 被凭据阻断 |
 
-代码规模：`src/fastclaw/` 55 个 Python 文件，`tests/` 26 个 Python 测试文件，finance plugin 另有 1 个来源契约测试文件。模块划分：`agent/`、`gateway/`、`migration/`、`orchestration/`、`plugin/`、`providers/`、`storage/`、`tools/`，以及顶层 `app.py`、`cli.py`、`cutover.py`、`differential.py`、`execution.py`、`identity.py`、`models.py`、`observability.py`、`runtime.py`、`skills.py`。
+代码规模：`src/fastclaw/` 56 个 Python 文件，`tests/` 27 个 Python 测试文件，finance plugin 另有 1 个来源契约测试文件。模块划分：`agent/`、`gateway/`、`migration/`、`orchestration/`、`plugin/`、`providers/`、`storage/`、`tools/`，以及顶层 `app.py`、`cli.py`、`cutover.py`、`differential.py`、`execution.py`、`identity.py`、`models.py`、`network.py`、`observability.py`、`runtime.py`、`skills.py`。
 
 ---
 
@@ -88,13 +90,13 @@ CI，没有 rebase、force push 或删除 Go 历史。
 
 | 命令 | 预期输出 |
 |---|---|
-| `pytest -q` | `129 passed, 1 skipped`（skip = 本机无 PostgreSQL 服务） |
+| `pytest -q` | `153 passed, 1 skipped`（skip = 本机无 PostgreSQL 服务） |
 | `(cd plugins/finance-tools && ../../.venv/bin/python -m unittest -v test_plugin.py)` | `10 passed` |
 | `ruff check .` | `All checks passed` |
-| `ruff format --check .` | `108 files already formatted` |
-| `mypy` | `Success: no issues found in 81 source files`（strict） |
+| `ruff format --check .` | `114 files already formatted` |
+| `mypy` | `Success: no issues found in 84 source files`（strict） |
 | `alembic upgrade head` && `alembic check` | 升级至 `20260805_01`，无漂移 |
-| `python scripts/verify_web_snapshot.py` | `86 unchanged + 4 declared overlays + 4 attributed additions` |
+| `python scripts/verify_web_snapshot.py` | `84 unchanged + 6 declared overlays + 4 attributed additions` |
 | `pnpm --dir web lint` / `build` | exit 0；build 产出 25 routes |
 
 注意：`alembic upgrade head` 会在工作树里生成 `fastclaw.db`，复跑后请删除，否则 `git status` 不干净。
@@ -104,10 +106,22 @@ Provider 凭据核对命令应报告 DeepSeek / OpenRouter / ODDS **三项均未
 CI（`.github/workflows/ci.yml`）的 job：`quality`（Python 3.12/3.13/3.14 + `alembic check`）、`web`（+ 快照校验）、`postgres`（postgres:17-alpine，`pytest -q -m postgres`）、`package`、`docker`、`security`（pip-audit + gitleaks）、`web-e2e`（Playwright，依赖其余全部）。
 
 `.github/workflows/differential.yml` 使用 `workflow_dispatch` + `runs-on: self-hosted`。
-2026-08-06 已完成真实双服务的未认证 health/status 子集，认证/SSE 仍未执行——见 5.2 J1。
+2026-08-06 已完成真实双服务的未认证 health/status 子集；随后在独立 disposable
+副本上完成真实 Go/Python 的认证、SSE、五次成功 coordinator 委派（各 6 个 Agent
+Session）、任务终态和慢流取消
+差分——见 5.2 J1。
 
-发行包已在本机实际构建：wheel 约 142 KiB、sdist 约 674 KiB，分别包含 70/220
-个文件。`scripts/verify_distribution.py` 会阻断缺失 Alembic/plugin/cutover 运行文件，
+同日还在独立 disposable Python 副本上完成了不使用旧密码/API key 的认证读取 smoke：
+管理员 cookie、2 用户、M0yuW 13 Agent、只读 actAs 下 benchmark 14 Agent 和
+coordinator 的 5 个 Session 均通过；证据见
+`evidence/authenticated-api-smoke-2026-08-06.json`。随后确定性 Provider 下的认证
+chat/SSE、工具与取消也已通过，见 `evidence/runtime-wiring-smoke-2026-08-06.json`。
+独立 Go/Python disposable 副本上的认证双服务差分见
+`evidence/differential-authenticated-2026-08-06.json`。
+
+发行包已在本机实际构建并通过 `twine check`：分别包含 71/232 个 wheel/sdist
+文件。`scripts/verify_distribution.py` 会阻断缺失 Alembic/plugin/cutover 运行文件、
+两个可复现 wiring smoke 脚本、credentialed live smoke 执行器及其固定 fixture，
 以及把 `node_modules`、`.next`、`out` 等本地 Web 产物混入 sdist 的回归。修复前
 sdist 曾达到约 105 MiB、21,901 个文件，因此这一检查不能只依赖 `twine check`。
 
@@ -121,11 +135,31 @@ sdist 曾达到约 105 MiB、21,901 个文件，因此这一检查不能只依�
 
 本阶段代码与文档变更已实现，完成验证后即可解除对应合并阻断：
 
-- **G1 Web 快照口径**统一为 `86 unchanged + 4 declared overlays + 4 attributed additions`，并由脚本输出和机械搜索共同锁定。
-- **G2 Web overlay 哈希**已写入 `web-python-overlays.json`；`verify_web_snapshot.py` 会校验全部 4 个 overlay，参数化测试逐一证明篡改会失败。
+- **G1 Web 快照口径**统一为 `84 unchanged + 6 declared overlays + 4 attributed additions`，并由脚本输出和机械搜索共同锁定。
+- **G2 Web overlay 哈希**已写入 `web-python-overlays.json`；`verify_web_snapshot.py` 会校验全部 6 个 overlay，参数化测试逐一证明篡改会失败。
 - **G3 可信身份契约**已由回归测试锁定：`spawn_subagent` schema 只能暴露 `agent_id` 与 `task`，模型提供的 user/root/call-path 字段不影响可信上下文；plugin 的 10 个 camelCase/snake_case 受保护名称均逐一拒绝。
-- **G4 differential 状态**已纠正：真实 Go/Python 的未认证 health/status 子集已执行并留证；认证 Agent/chat/SSE/Provider/工具/取消仍是切换硬前置。
+- **G4 differential 状态**已关闭：真实 Go/Python 的未认证 health/status 与认证身份、Agent/chat/SSE、5 对 ToolCall/ToolResult、任务终态和取消均已执行并留证；真实 Provider 异常与业务结果属于 J2/J3。
 - **G5 切换审计**已实现：`fastclaw cutover audit` 在一次性安全副本上核对 2 用户、27 Agent、模型来源、角色文件、tool policy、Skill、Provider、ODDS、plugin、FK/ACL/Session/channel 状态，并以退出码 2 阻断不完整切换。当前真实副本只剩三项集中凭据未配置。
+- **J3 wiring 子门禁**已完成：真实迁移 profile + disposable 数据 + 本地确定性 SSE
+  Provider 跑通四个 coordinator、18 对 ToolCall/ToolResult、账本 direct-return 和
+  HTTP Abort；无活动任务、跨租户 Session 或残缺 assistant 持久化。该证据不替代
+  真实 Provider/业务结果 smoke。
+- **J3 live 执行器**已完成：`scripts/cutover_live_smoke.py` 锁定四个 coordinator、
+  17 个目标专家与账本 report，拒绝任何 `tool_result.isError`、重复/失配 ToolCall、
+  跨租户 Session、非终态 task 或空回复。认证只从两个环境变量读取，输出只保留
+  内容 hash/字节数，不记录 cookie、模型内容或工具结果；必须提供精确的写入确认值，
+  且硬拒绝 Go 数据目录。当前只缺轮换后的凭据来实际执行。
+- **旧 coordinator prompt 兼容**已收口：只要 profile 可用 `spawn_subagent`，运行时
+  都追加权威契约，要求多个普通 `{agent_id, task}` ToolCall，明确禁止旧 SOUL 中的
+  `delegations/sharedContext/agentId` 包装；导入文件保持原始 hash 不变。
+- **ToolResult 假绿**已关闭：失败状态写入 SSE `isError` 和 Session metadata，Web
+  历史/实时界面均显示红色失败及失败计数；live smoke 对任一结构化工具错误 fail closed。
+- **批量委派门禁**已完成：同一模型轮次的多个 `spawn_subagent` 通过显式 BatchTool
+  协议进入 `MessageBus.batch()`；不同目标并行，结果按输入顺序回填。其他有副作用工具
+  不会被隐式并发，batch 错误仍只向模型暴露稳定分类与安全文案。
+- **Provider 核对只读语义**已锁定：`fastclaw providers check` 加载 27 个 profile 时
+  显式禁用 plugin 启动，不再触发 finance 状态库迁移；正式 Gateway 与 cutover audit
+  仍按原策略启动并检查 plugin。
 
 **阶段 H——凭据轮换**：交接文档中出现过的全部口令、DeepSeek key、OpenRouter key、ODDS key 全部轮换。这些凭据在 Phase B–E 全部开发过程中一直有效，暴露窗口随时间线性增长；既然确定要轮换，现在轮换严格优于切换时轮换。新值只经环境变量或 secret 注入，轮换记录只记「已轮换 + 时间 + 责任人」。
 
@@ -137,9 +171,9 @@ G 与 H 可并行，互不依赖。
 
 | 项 | 内容 | 缺什么 |
 |---|---|---|
-| J1 | 未认证 health/status 已通过；认证 Agent/chat/SSE/工具/取消仍需运行 | 轮换后的认证凭据 |
+| J1 | **已关闭**：独立 disposable Go/Python 副本的认证 HTTP/SSE、5 对 ToolCall/ToolResult、任务终态和慢流取消均通过 | — |
 | J2 | 真实 provider 异常语义：正常流 / 主动中断 / 429 / 5xx；重点核对 `cache_read_tokens`、`cache_write_tokens` 上报时机与累加值，以及 EOF 与畸形 SSE 是否被误判为成功。当前这些只在 MockTransport 下验过 | DeepSeek / OpenRouter 凭据 |
-| J3 | finance / World Cup / benchmark 三套固定 fixture 端到端 smoke，断言无悬挂 task、无重复 completion、无跨租户访问、无失配 ToolCall 历史 | 三项凭据 |
+| J3 | Runtime wiring fixture 已通过；finance / World Cup / benchmark 的真实 Provider/数据 smoke 仍需完成 | 三项凭据 |
 
 阻断解除前**不得进入阶段 K（切换执行）**。
 
@@ -167,24 +201,33 @@ I 依赖 G——否则把错误口径合入 `main`。
 | 会话数据流向 | 单向 Go → Python，Python 不回写 Go | Python 数据库格式为权威格式 |
 | Skill 依赖 | 运行时禁止自动安装，需显式 `fastclaw skills prepare` | 避免运行时网络与隐式环境变更 |
 | 未知端点 | 返回结构化 `unsupported`，不是模糊 404 | 让 Web 能区分「没实现」与「路径错」 |
+| Agent-scoped API key | 锁定 Go 会列出同租户全部 Agent；Python 只列出 ACL 明确允许的 Agent，并同样过滤任务 | 保留 Python 的安全强化，禁止为表面 parity 放宽 ACL |
+| 工具 SSE | Go 在每个 ToolCall 前发空 `content`；Python 不发空事件，并为 ToolResult 增加可选 `metadata` | `sse_compatible` 只归一化这两项；seq/done/共享字段/配对仍严格 |
 
 ---
 
-## 7. 未关闭的技术项
+## 7. 技术项与审查结论
 
-### 7.1 WebFetchTool DNS rebinding（低优先，**不得记为已关闭**）
+### 7.1 WebFetchTool DNS rebinding（已关闭）
 
-`src/fastclaw/tools/builtin.py:336-361` 解析主机名并检查全部返回地址 `is_global`，随后 `self._client.stream("GET", url, ...)` 用**主机名**再发一次请求——校验与连接是两次独立 DNS 查询。攻击者控制权威 DNS、返回短 TTL、第一次给公网 IP、第二次给 `169.254.169.254`，即可绕过。
+WebFetch 现使用独立的 pinned transport。URL 每跳解析后，全部地址必须为公网；
+network backend 只连接本次验证过的 IP，不进行第二次 DNS 查询。HTTP Host、TLS SNI
+和证书校验仍使用原主机名；环境代理、无 pin 连接与 Unix socket 均 fail closed。
 
-当前实现已挡住绝大多数现实攻击（直接给内网 IP、`localhost`、解析到内网的域名），rebinding 需要攻击者控制权威 DNS，故定低优先。修法：把校验通过的 IP 钉到连接上——连 IP、`Host` 头带原主机名、HTTPS 下 SNI 显式设为主机名；或用自定义 transport / resolver 钩子复用首次解析结果。
-
-状态：backlog。**任何报告都不得把此项标为已修复。**
+回归测试覆盖 IP fallback、无 pin 拒绝、Host/SNI 保真以及已有的私网/重定向矩阵。
+状态：已关闭。
 
 ### 7.2 Phase B 门禁需加强
 
 原路线的「benchmark coordinator 能通过 Mock Provider 调用指定 specialist」只覆盖 happy path。真正该守的是身份不可伪造，已在 G3 中补齐；本条在 G3 完成后关闭。
 
-### 7.3 历史审查报告中的两条误判（已撤销，勿再引用）
+### 7.3 启动失败与 shutdown 清理（已关闭）
+
+FastAPI lifespan 使用 `AsyncExitStack` 在每项启动前注册逆序清理。Agent manager
+启动失败时仍会 shutdown bus、停止 plugin、关闭两个 HTTP client 并释放数据库；
+manager shutdown 的单项异常不会跳过后续资源，最终以结构化聚合异常报告。
+
+### 7.4 历史审查报告中的两条误判（已撤销，勿再引用）
 
 - 「`_handlers[agent_id]` 跨租户静默覆盖」**是误判**。`orchestration/bus.py` 的 `register()` 有 `if agent_id in self._handlers: raise ValueError(...)`；且 Go 侧 `generateID("agt_")` 使 Agent ID 全局随机唯一，碰撞不可能。仅去重键补了 tenant 维度。
 - 「`batch()` 缺 `return_exceptions` 导致异常无人取回」中「异常无人取回」部分**未能复现**——CPython 的 `_done_callback` 会取回迟到的兄弟异常。成立的部分是提前退出、兄弟任务继续运行且结果被丢弃，已按批处理生命周期缺陷修复。
@@ -218,12 +261,14 @@ I 依赖 G——否则把错误口径合入 `main`。
 12. 敏感 provider 数据、绝对路径、SQL **不得进入模型可见的错误**（`bus.py:207-228` 的 `_safe_error` 按异常类型映射固定文案，未知异常只带 correlation_id）。
 13. `cancel_root` 是**显式 API**，不是任一等待者取消时的副作用；全仓仅 `agent/manager.py:221`（Stop 路径）调用。
 14. Docker 以非 root 只读运行（`USER 10001:10001`）。
+15. Provider 与 WebFetch 使用不同 HTTP client；WebFetch client 必须执行 DNS pin，
+    且 Runtime 启动失败或 shutdown 异常时两个 client 都必须被关闭。
 
 **流程**
 
-15. **不 rebase、不 force push、不改写历史**——保住 PR 行内评论锚点。
-16. differential 双服务**永远使用独立数据库**，绝不共享 SQLite 文件。
-17. 秘密只经环境变量或 secret 注入，**不写入任何文档、fixture、报告或数据库**。
+16. **不 rebase、不 force push、不改写历史**——保住 PR 行内评论锚点。
+17. differential 双服务**永远使用独立数据库**，绝不共享 SQLite 文件。
+18. 秘密只经环境变量或 secret 注入，**不写入任何文档、fixture、报告或数据库**。
 
 ---
 
@@ -253,4 +298,4 @@ I 依赖 G——否则把错误口径合入 `main`。
 | `docs/migration/alembic-schema-integrity.md` | 冻结 revision 与漂移门禁机制 |
 | `tests/fixtures/go792/README.md` | Go fixture 的再生成方法；bcrypt salt 与 SQLite 页布局不确定，故校验比对逻辑内容而非字节 |
 | `tests/fixtures/web-python-overlays.json` | Web overlay 清单（`referenceCommit` = `792417b…`） |
-| 主仓 `REVIEW-fastclaw-python-stacked-prs-2026-08-04.md` | 原始堆叠 PR 审查报告（F1–F12），含已撤销条目，引用时对照本手册 7.3 节 |
+| 主仓 `REVIEW-fastclaw-python-stacked-prs-2026-08-04.md` | 原始堆叠 PR 审查报告（F1–F12），含已撤销条目，引用时对照本手册 7.4 节 |

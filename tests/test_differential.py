@@ -53,6 +53,27 @@ async def test_differential_can_compare_status_for_legacy_plain_text_probe() -> 
     assert result["contract"] == "status-only"
 
 
+async def test_status_comparison_still_enforces_terminal_task_invariant() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = "running" if request.url.host == "go.test" else "completed"
+        return httpx.Response(200, json=[{"id": "task-1", "status": status}])
+
+    transport = httpx.MockTransport(handler)
+    case = DifferentialCase(
+        "tasks",
+        "GET",
+        "/api/tasks",
+        comparison="status",
+        require_terminal_tasks=True,
+    )
+    async with (
+        httpx.AsyncClient(base_url="https://go.test", transport=transport) as go,
+        httpx.AsyncClient(base_url="https://python.test", transport=transport) as python,
+    ):
+        with pytest.raises(DifferentialMismatch, match="non-terminal"):
+            await run_case(go, python, case)
+
+
 async def test_differential_can_compare_selected_semantics_across_legacy_shapes() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "go.test":
@@ -181,6 +202,84 @@ async def test_differential_validates_sse_order_and_tool_pairing() -> None:
             DifferentialCase("chat", "POST", "/api/chat/stream", stream=True),
         )
     assert result["events"] == 3
+    assert result["pythonEvents"] == 3
+    assert result["normalizedEvents"] == 3
+
+
+async def test_compatible_sse_accepts_empty_go_content_and_python_metadata() -> None:
+    go_events: list[dict[str, object]] = [
+        {"version": 2, "type": "content", "data": {"seq": 0, "content": ""}},
+        {
+            "version": 2,
+            "type": "tool_call",
+            "data": {"seq": 1, "id": "call", "name": "delegate", "arguments": "{}"},
+        },
+        {
+            "version": 2,
+            "type": "tool_result",
+            "data": {"seq": 2, "id": "call", "name": "delegate", "result": "ok"},
+        },
+        {"version": 2, "type": "done", "data": {"seq": 3}},
+    ]
+    python_events: list[dict[str, object]] = [
+        {
+            "version": 2,
+            "type": "tool_call",
+            "data": {"seq": 0, "id": "call", "name": "delegate", "arguments": "{}"},
+        },
+        {
+            "version": 2,
+            "type": "tool_result",
+            "data": {
+                "seq": 1,
+                "id": "call",
+                "name": "delegate",
+                "result": "ok",
+                "metadata": {"agentId": "specialist"},
+            },
+        },
+        {"version": 2, "type": "done", "data": {"seq": 2}},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        events = go_events if request.url.host == "go.test" else python_events
+        return httpx.Response(200, text=sse(events), headers={"content-type": "text/event-stream"})
+
+    transport = httpx.MockTransport(handler)
+    case = DifferentialCase(
+        "tool-stream",
+        "POST",
+        "/api/chat/stream",
+        stream=True,
+        comparison="sse_compatible",
+    )
+    async with (
+        httpx.AsyncClient(base_url="https://go.test", transport=transport) as go,
+        httpx.AsyncClient(base_url="https://python.test", transport=transport) as python,
+    ):
+        result = await run_case(go, python, case)
+
+    assert [item[1] for item in result["contract"]] == ["tool_call", "tool_result", "done"]
+    assert result["events"] == 4
+    assert result["pythonEvents"] == 3
+    assert result["normalizedEvents"] == 3
+
+    python_events[1] = {
+        **python_events[1],
+        "data": {
+            "seq": 1,
+            "id": "call",
+            "name": "delegate",
+            "result": "invalid tool arguments",
+            "metadata": {"agentId": "specialist"},
+        },
+    }
+    async with (
+        httpx.AsyncClient(base_url="https://go.test", transport=transport) as go,
+        httpx.AsyncClient(base_url="https://python.test", transport=transport) as python,
+    ):
+        with pytest.raises(DifferentialMismatch, match="tool semantics differ"):
+            await run_case(go, python, case)
 
 
 def test_differential_rejects_missing_tool_result_and_contract_drift() -> None:
@@ -201,3 +300,10 @@ def test_differential_rejects_missing_tool_result_and_contract_drift() -> None:
 
     with pytest.raises(DifferentialMismatch, match="non-terminal"):
         require_terminal_tasks([{"id": "task-1", "status": "running"}])
+
+    require_terminal_tasks(
+        [
+            {"id": "go-task", "status": "done"},
+            {"id": "python-task", "status": "completed"},
+        ]
+    )

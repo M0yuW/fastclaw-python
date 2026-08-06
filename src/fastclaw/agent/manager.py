@@ -54,6 +54,16 @@ _STANDARD_PROVIDERS: dict[str, tuple[str, str]] = {
     "openrouter": ("https://openrouter.ai/api/v1", "openai-compatible"),
 }
 
+_DELEGATION_TOOL_PROMPT = """## Runtime delegation contract
+
+`spawn_subagent` accepts exactly two arguments: `agent_id` and `task`. Tenant,
+session, root execution, and call-path identity are injected by the Runtime and
+must not be supplied by the model. To delegate several independent tasks in
+parallel, emit several ordinary `spawn_subagent` tool calls in the same
+assistant turn. Do not use legacy `delegations`, `sharedContext`, or `agentId`
+wrapper fields.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class AgentRuntimeConfig:
@@ -66,6 +76,7 @@ class AgentRuntimeConfig:
     default_model: str = ""
     max_concurrent: int = 8
     max_pending: int = 256
+    enable_plugins: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +96,14 @@ class ProviderSelection:
     model: str
     source: str
     config_id: str = ""
+
+
+class AgentManagerShutdownError(RuntimeError):
+    """Raised after every Agent manager resource has been asked to stop."""
+
+    def __init__(self, errors: list[BaseException]) -> None:
+        super().__init__(f"Agent manager shutdown completed with {len(errors)} error(s)")
+        self.errors = tuple(errors)
 
 
 class ToolFactory(Protocol):
@@ -114,7 +133,7 @@ def _default_tools(
         ReadFileTool(workspace),
         ListDirTool(workspace),
         WriteFileTool(workspace),
-        WebFetchTool(runtime.http_client),
+        WebFetchTool(runtime.web_http_client),
         SpawnSubagentTool(bus),
         WorldCupLedgerTool(data_root),
     ]
@@ -288,12 +307,16 @@ class AgentRuntimeManager:
         if self.runtime.state is not RuntimeState.RUNNING:
             raise RuntimeError("Agent manager requires a running Runtime")
         self.skill_catalog.discover()
-        plugin_config, plugin_environment, enabled_plugins = await self._plugin_settings()
-        self.plugin_manager.configurations = plugin_config
-        self.plugin_manager.environments = plugin_environment
-        self.plugin_manager.enabled = enabled_plugins
+        if self.config.enable_plugins:
+            plugin_config, plugin_environment, enabled_plugins = await self._plugin_settings()
+            self.plugin_manager.configurations = plugin_config
+            self.plugin_manager.environments = plugin_environment
+            self.plugin_manager.enabled = enabled_plugins
+        else:
+            self.plugin_manager.enabled = set()
         self.plugin_manager.discover()
-        await self.plugin_manager.start()
+        if self.config.enable_plugins:
+            await self.plugin_manager.start()
         async with UnitOfWork(self.database) as unit:
             store = unit.require_store()
             users = await store.list_users()
@@ -306,9 +329,18 @@ class AgentRuntimeManager:
         if self._closing:
             return
         self._closing = True
-        await self.bus.shutdown()
-        await self.plugin_manager.stop()
+        errors: list[BaseException] = []
+        try:
+            await self.bus.shutdown()
+        except BaseException as exc:
+            errors.append(exc)
+        try:
+            await self.plugin_manager.stop()
+        except BaseException as exc:
+            errors.append(exc)
         self._started = False
+        if errors:
+            raise AgentManagerShutdownError(errors)
 
     async def ensure_profile(self, agent: AgentRecord) -> AgentRuntimeProfile:
         async with self._profile_lock:
@@ -632,11 +664,25 @@ class AgentRuntimeManager:
             if isinstance(parsed, dict):
                 file_config = parsed
         defaults: dict[str, Any] = {}
-        for layer in default_layers:
+        for layer in default_layers[:2]:
             for record in layer:
                 if record.enabled and record.name == "agents.defaults":
                     defaults.update(record.data)
-        effective_config = {**defaults, **file_config, **agent.config}
+        agent_overrides: dict[str, Any] = {}
+        for record in default_layers[2]:
+            if record.enabled and record.name == "agents.defaults":
+                agent_overrides.update(record.data)
+        # Go's effective runtime order applies system/user defaults first,
+        # then the compatibility agent.json layer, followed by explicit
+        # Agent-scoped database settings and finally agents.config.  Keeping
+        # the Agent scope after agent.json prevents a stale imported system
+        # file from reviving an older Provider selection.
+        effective_config = {
+            **defaults,
+            **file_config,
+            **agent_overrides,
+            **agent.config,
+        }
         prompt_parts: list[str] = []
         for filename in ("SOUL.md", "IDENTITY.md", "USER.md", "MEMORY.md"):
             raw = files.get(filename)
@@ -695,6 +741,8 @@ class AgentRuntimeManager:
                 allowed_tools = frozenset(coordinator_tools)
             else:
                 allowed_tools = frozenset({"read_file", "web_fetch", "list_dir", "write_file"})
+        if allowed_tools is None or "spawn_subagent" in allowed_tools:
+            prompt_parts.append(_DELEGATION_TOOL_PROMPT.strip())
         system_prompt = "\n\n".join(prompt_parts).replace(
             str(self.config.legacy_data_root), str(self.config.data_root)
         )

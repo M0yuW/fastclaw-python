@@ -12,13 +12,21 @@
       "reason": "Lockfile for the Playwright dependency",
       "sha256": "fb1628fc7a2498a2f1530f375578fbcea48e4d734f6d344c4aa07b54ab50d1b0"
     },
+    "src/app/agents/[id]/chat/page.tsx": {
+      "reason": "Surface failed tool results instead of rendering successful status",
+      "sha256": "de800c9f61569bb6e07bba938c183b1736bdd26f5777af2da9442999d958020a"
+    },
     "src/app/agents/page.tsx": {
       "reason": "Read-only administrator actAs navigation",
       "sha256": "126d4b29dbafc2e69aea2933a7857f1236fcfc50a4cd38dfccbc0d56cb352940"
     },
     "src/lib/api.ts": {
-      "reason": "Read-only actAs propagation to Python API calls",
-      "sha256": "c8d60560a27c080eb0a3cc465663bc12c0d3877e8b2e922a9d25f3d54ac1446e"
+      "reason": "Read-only actAs, locked Go chat reply contract, and tool error wire type",
+      "sha256": "32181eab2620cd7da1a462872b08717306958ed2c2e4680ec7e810dda55fbc9b"
+    },
+    "src/lib/chat-stream.ts": {
+      "reason": "Preserve tool error state in the streaming reducer",
+      "sha256": "4bbef7121bb8e1669eb948c158ce8cd6ddefb88d3e38c33f037091f48c6cc5ad"
     }
   },
   "referenceCommit": "792417b86b5c12af1b99364865217a74f4d52f38"

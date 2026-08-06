@@ -190,6 +190,7 @@ def _web_event(event: AgentEvent) -> dict[str, Any]:
     }
     if event.type is AgentEventType.CONTENT_DELTA:
         data["delta"] = event.content
+        data["content"] = event.content
     elif event.type is AgentEventType.CONTENT:
         data["content"] = event.content
     elif event.type is AgentEventType.TOOL_CALL and event.tool_call is not None:
@@ -202,12 +203,45 @@ def _web_event(event: AgentEvent) -> dict[str, Any]:
         )
     elif event.type is AgentEventType.TOOL_RESULT:
         data["result"] = event.tool_result
+        if event.is_error:
+            data["isError"] = True
+        if event.tool_metadata:
+            data["metadata"] = event.tool_metadata
         if event.tool_call is not None:
             data["id"] = event.tool_call.id
             data["name"] = event.tool_call.function.name
     elif event.type is AgentEventType.ERROR:
         data["message"] = event.error
     return {"version": 2, "type": event.type.value, "data": data}
+
+
+def _web_history_message(message: dict[str, Any]) -> dict[str, Any]:
+    """Translate internal Provider ToolCalls to the locked Web history shape."""
+
+    payload = dict(message)
+    calls = message.get("toolCalls")
+    if not isinstance(calls, list):
+        return payload
+    flattened: list[dict[str, str]] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+            arguments = function.get("arguments", "{}")
+        else:
+            name = call.get("name")
+            arguments = call.get("arguments", "{}")
+        flattened.append(
+            {
+                "id": str(call.get("id") or ""),
+                "name": str(name or ""),
+                "arguments": str(arguments or "{}"),
+            }
+        )
+    payload["toolCalls"] = flattened
+    return payload
 
 
 def create_gateway_router(gateway: Gateway) -> APIRouter:
@@ -1151,7 +1185,13 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             session = await unit.require_store().get_session(
                 auth.identity.effective_user_id, agentId, sessionId
             )
-        return {"history": session.messages if session is not None else []}
+        return {
+            "history": (
+                [_web_history_message(message) for message in session.messages]
+                if session is not None
+                else []
+            )
+        }
 
     @router.get("/api/chat/sessions")
     async def chat_sessions(agentId: str, auth: AuthContext = auth_dependency) -> dict[str, Any]:
@@ -1274,10 +1314,16 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
 
     @router.get("/api/tasks")
     async def tasks(auth: AuthContext = auth_dependency) -> list[dict[str, Any]]:
-        if auth.identity.role != "super_admin" or auth.identity.auth_method == "apikey":
+        identity = auth.identity
+        if identity.auth_method != "apikey" and identity.role != "super_admin":
             raise HTTPException(status.HTTP_403_FORBIDDEN, "admin required")
         result: list[dict[str, Any]] = []
         for task in gateway.agent_manager.recent_tasks():
+            if identity.auth_method == "apikey" and (
+                task.user_id != identity.effective_user_id
+                or task.agent_id not in identity.api_key_agents
+            ):
+                continue
             item: dict[str, Any] = {
                 "id": task.id,
                 "agentId": task.agent_id,
@@ -1483,7 +1529,7 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             session_id=payload.session_id,
             message=payload.message,
         )
-        return {"response": str(message.content or "")}
+        return {"reply": str(message.content or "")}
 
     @router.post("/api/chat/stream")
     async def chat_stream(

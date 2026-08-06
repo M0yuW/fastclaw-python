@@ -20,14 +20,60 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("content-length", "0"))
         request = json.loads(self.rfile.read(length) or b"{}")
         messages = request.get("messages") or []
-        prompt = str(messages[-1].get("content") or "") if messages else ""
+        prompt = next(
+            (
+                str(message.get("content") or "")
+                for message in reversed(messages)
+                if message.get("role") == "user"
+            ),
+            "",
+        )
+        tool_messages = [message for message in messages if message.get("role") == "tool"]
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("cache-control", "no-cache")
         self.send_header("connection", "close")
         self.end_headers()
-        chunks = ["slow "] * 40 if "slow" in prompt.lower() else ["hello ", "world"]
         try:
+            if "tool failure" in prompt.lower():
+                payload = (
+                    {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "call-e2e-failure",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "read_file",
+                                                "arguments": json.dumps({"path": "../outside"}),
+                                            },
+                                        }
+                                    ]
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ]
+                    }
+                    if not tool_messages
+                    else {
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": "tool failure surfaced"},
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    }
+                )
+                self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
+                return
+            chunks = ["slow "] * 40 if "slow" in prompt.lower() else ["hello ", "world"]
             for index, content in enumerate(chunks):
                 payload = {
                     "choices": [

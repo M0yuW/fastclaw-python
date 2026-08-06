@@ -47,6 +47,22 @@ test("login, Agent, chat, Stop, history, files and skills", async ({ page, reque
   await page.reload();
   await expect(assistantReply).toBeVisible();
 
+  await composer.fill("tool failure");
+  await page.getByRole("button", { name: "Send message" }).click();
+  const failedGroup = page.getByRole("button", { name: /Executed 1 tool · 1 failed/ });
+  await expect(failedGroup).toBeVisible();
+  await failedGroup.click();
+  await page.getByRole("button", { name: /^read_file \.\.\/outside$/ }).click();
+  await expect(page.getByText("Error", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("paragraph").filter({ hasText: /^tool failure surfaced$/ }),
+  ).toBeVisible();
+  await page.reload();
+  await expect(failedGroup).toBeVisible();
+  await failedGroup.click();
+  await page.getByRole("button", { name: /^read_file \.\.\/outside$/ }).click();
+  await expect(page.getByText("Error", { exact: true })).toBeVisible();
+
   await composer.fill("slow response");
   await page.getByRole("button", { name: "Send message" }).click();
   const stop = page.getByRole("button", { name: "Stop generating" });

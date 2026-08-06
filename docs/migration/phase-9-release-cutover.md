@@ -65,9 +65,21 @@ That run does not close the cutover gate. The original fixture's unauthenticated
 `/v1/agents` case exposed a locked-Go launcher limitation: `cmd/fastclaw/main.go`
 constructs `GatewayCfg` with port and bind only, so the API server sees disabled
 zero-value HTTP endpoints and `/v1/agents` falls through to the SPA handler.
-The common smoke now compares only shared endpoints. Authenticated Agent/chat,
-SSE, Provider, tool and cancellation parity still require rotated credentials
-and a retained follow-up report.
+The common smoke initially compared only shared unauthenticated endpoints. A
+second run used independent disposable database/asset copies, a synthetic
+Agent-scoped API key, and the repository's deterministic Provider. All eight
+authenticated cases passed: identity, allowed-Agent access, non-stream chat,
+SSE content, five successful paired coordinator ToolCalls/ToolResults with six
+Agent Sessions on each Runtime, and terminal task state. Disconnecting a slow stream on each Runtime left zero active tasks and
+persisted no partial assistant. The retained report is
+`docs/migration/evidence/differential-authenticated-2026-08-06.json`.
+
+The tool fixture uses explicit `sse_compatible` comparison for two accepted
+wire differences only: locked Go emits empty `content` before ToolCalls, while
+Python adds optional ToolResult `metadata`. Sequence monotonicity, terminal
+`done`, event fields shared by both Runtimes, and ToolCall/ToolResult pairing
+remain strict. Live DeepSeek/OpenRouter behavior and business-result smoke still
+require rotated credentials.
 
 Local invocation:
 
@@ -77,6 +89,7 @@ FASTCLAW_DIFFERENTIAL_PYTHON_TOKEN=... \
 python scripts/differential_smoke.py \
   --go-base http://127.0.0.1:18953 \
   --python-base http://127.0.0.1:18954 \
+  --fixture tests/fixtures/differential-authenticated.json \
   --output differential-report.json
 ```
 

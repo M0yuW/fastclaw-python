@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "executedAt": "2026-08-06T15:21:57+08:00",
+  "fixture": "tests/fixtures/differential-authenticated.json",
+  "go": {
+    "commit": "792417b86b5c12af1b99364865217a74f4d52f38",
+    "baseUrl": "http://127.0.0.1:18953",
+    "data": "disposable online-backup copy"
+  },
+  "python": {
+    "commit": "0b4586111a65143046e097d150dddb7f1e5df3c6",
+    "baseUrl": "http://127.0.0.1:18955",
+    "data": "independent disposable online-backup copy"
+  },
+  "provider": {
+    "kind": "local deterministic OpenAI-compatible SSE fixture",
+    "baseUrl": "http://127.0.0.1:19004/v1",
+    "externalCredentialsUsed": false
+  },
+  "authentication": {
+    "kind": "synthetic Agent-scoped API key inserted only into disposable copies",
+    "tokenRetained": false,
+    "allowedAgents": ["finance-solo", "finance-coordinator"]
+  },
+  "sharedDatabase": false,
+  "sourceDataModified": false,
+  "results": [
+    {"name": "health", "status": 200},
+    {"name": "status", "status": 200, "equalPaths": ["configured", "running"]},
+    {
+      "name": "identity",
+      "status": 200,
+      "equalPaths": ["authMethod", "readOnly", "user.id", "user.role"]
+    },
+    {
+      "name": "allowed-agent",
+      "status": 200,
+      "equalPaths": ["agent.id", "agent.name"]
+    },
+    {"name": "chat", "status": 200, "equalPaths": ["reply"]},
+    {
+      "name": "chat-stream",
+      "status": 200,
+      "goEvents": 3,
+      "pythonEvents": 3,
+      "types": ["content_delta", "content", "done"]
+    },
+    {
+      "name": "chat-stream-tools",
+      "status": 200,
+      "goEvents": 18,
+      "pythonEvents": 13,
+      "normalizedEvents": 13,
+      "toolCalls": 5,
+      "toolResults": 5,
+      "paired": true,
+      "toolResultSemanticsEqual": true,
+      "goAgentSessions": 6,
+      "pythonAgentSessions": 6,
+      "terminalDone": true
+    },
+    {"name": "terminal-tasks", "status": 200, "activeTasks": 0}
+  ],
+  "cancellation": {
+    "go": {"sawDelta": true, "activeTasks": 0, "partialAssistantsPersisted": 0},
+    "python": {"sawDelta": true, "activeTasks": 0, "partialAssistantsPersisted": 0}
+  },
+  "acceptedDivergences": [
+    "Locked Go emits one empty content event before each ToolCall; sse_compatible ignores only empty content events.",
+    "Python preserves optional ToolResult metadata consumed by the Web; sse_compatible ignores only that additive field when comparing shared fields.",
+    "Locked Go lists all 14 same-tenant Agents for the Agent-scoped fixture key; Python lists only the two explicitly allowed Agents. Python's stricter ACL is retained."
+  ],
+  "limitations": [
+    "The local deterministic Provider verifies Runtime, HTTP, SSE, delegation and cancellation wiring, not live DeepSeek/OpenRouter behavior.",
+    "Finance, World Cup and benchmark business-result smoke still require rotated DeepSeek/OpenRouter/ODDS credentials."
+  ]
+}

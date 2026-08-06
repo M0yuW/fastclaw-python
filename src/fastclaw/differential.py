@@ -76,6 +76,36 @@ def sse_signature(events: tuple[dict[str, Any], ...]) -> tuple[Any, ...]:
     )
 
 
+def compatible_sse_signature(events: tuple[dict[str, Any], ...]) -> tuple[Any, ...]:
+    """Compare shared SSE v2 semantics while retaining safe Python extensions."""
+    signature: list[Any] = []
+    for event in events:
+        data = event.get("data") or {}
+        if event.get("type") == "content" and not data.get("content"):
+            # Locked Go emits an empty content event before each ToolCall.
+            continue
+        keys = set(data)
+        if event.get("type") == "tool_result":
+            # Python preserves optional ToolResult metadata consumed by the Web.
+            keys.discard("metadata")
+        signature.append((event.get("version"), event.get("type"), tuple(sorted(keys))))
+    return tuple(signature)
+
+
+def tool_semantics(events: tuple[dict[str, Any], ...]) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        (
+            str(event.get("type") or ""),
+            str((event.get("data") or {}).get("name") or ""),
+            str((event.get("data") or {}).get("result") or "")
+            if event.get("type") == "tool_result"
+            else "",
+        )
+        for event in events
+        if event.get("type") in {"tool_call", "tool_result"}
+    )
+
+
 def validate_sse(events: tuple[dict[str, Any], ...]) -> None:
     if not events or events[-1].get("type") != "done":
         raise DifferentialMismatch("SSE stream has no terminal done event")
@@ -112,7 +142,8 @@ def require_terminal_tasks(payload: Any) -> None:
     active = [
         str(item.get("id") or "")
         for item in tasks
-        if isinstance(item, dict) and item.get("status") not in {"completed", "failed", "cancelled"}
+        if isinstance(item, dict)
+        and item.get("status") not in {"done", "completed", "failed", "cancelled"}
     ]
     if active:
         raise DifferentialMismatch("task response contains non-terminal work")
@@ -144,7 +175,7 @@ async def capture(
         events = parse_sse(response.text)
         validate_sse(events)
         return CapturedResponse(status_code=response.status_code, events=events)
-    if case.comparison == "status":
+    if case.comparison == "status" and not case.require_terminal_tasks:
         return CapturedResponse(status_code=response.status_code)
     try:
         body = response.json()
@@ -169,6 +200,9 @@ async def run_case(
         raise DifferentialMismatch(
             f"{case.name}: status differs: Go={go.status_code}, Python={python.status_code}"
         )
+    if case.require_terminal_tasks:
+        require_terminal_tasks(go.json_body)
+        require_terminal_tasks(python.json_body)
     if case.comparison == "status":
         return {
             "name": case.name,
@@ -177,11 +211,10 @@ async def run_case(
             "events": 0,
             "contract": "status-only",
         }
-    if case.comparison not in {"json_shape", "selected"}:
+    if case.comparison not in {"json_shape", "selected", "sse_compatible"}:
         raise DifferentialMismatch(f"{case.name}: unknown comparison mode")
-    if case.require_terminal_tasks:
-        require_terminal_tasks(go.json_body)
-        require_terminal_tasks(python.json_body)
+    if case.comparison == "sse_compatible" and not case.stream:
+        raise DifferentialMismatch(f"{case.name}: sse_compatible requires a stream")
     go_contract: Any
     python_contract: Any
     if case.comparison == "selected":
@@ -192,20 +225,31 @@ async def run_case(
             path: json_shape(json_path(python.json_body, path)) for path in case.equal_paths
         }
     elif case.stream:
-        go_contract = sse_signature(go.events)
-        python_contract = sse_signature(python.events)
+        signature = (
+            compatible_sse_signature if case.comparison == "sse_compatible" else sse_signature
+        )
+        go_contract = signature(go.events)
+        python_contract = signature(python.events)
     else:
         go_contract = json_shape(go.json_body)
         python_contract = json_shape(python.json_body)
     if go_contract != python_contract:
         raise DifferentialMismatch(f"{case.name}: response contract differs")
+    if case.comparison == "sse_compatible" and tool_semantics(go.events) != tool_semantics(
+        python.events
+    ):
+        raise DifferentialMismatch(f"{case.name}: tool semantics differ")
     for path in case.equal_paths:
         if json_path(go.json_body, path) != json_path(python.json_body, path):
             raise DifferentialMismatch(f"{case.name}: semantic value differs at {path}")
-    return {
+    result = {
         "name": case.name,
         "status": go.status_code,
         "stream": case.stream,
         "events": len(go.events) if case.stream else 0,
         "contract": go_contract,
     }
+    if case.stream:
+        result["pythonEvents"] = len(python.events)
+        result["normalizedEvents"] = len(go_contract)
+    return result

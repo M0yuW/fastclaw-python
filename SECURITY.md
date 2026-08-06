@@ -14,3 +14,12 @@ mitigation.
 
 Maintainers will acknowledge a complete report within five business days and
 will coordinate remediation and disclosure with the reporter.
+
+## Outbound web fetch policy
+
+The built-in `web_fetch` tool accepts only HTTP(S) URLs without embedded
+credentials. Every redirect is resolved independently, and every returned IP
+must be globally routable. The Runtime pins the validated IPs at the TCP layer
+while preserving the original hostname for HTTP Host, TLS SNI, and certificate
+validation. Unpinned connections, Unix sockets, and environment proxies are
+denied by the dedicated web-fetch transport.

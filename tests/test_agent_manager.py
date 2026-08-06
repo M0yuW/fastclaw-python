@@ -8,7 +8,11 @@ from pathlib import Path
 import httpx
 import pytest
 
-from fastclaw.agent.manager import AgentRuntimeConfig, AgentRuntimeManager
+from fastclaw.agent.manager import (
+    AgentManagerShutdownError,
+    AgentRuntimeConfig,
+    AgentRuntimeManager,
+)
 from fastclaw.providers import (
     ChatRequest,
     ChatResponse,
@@ -144,6 +148,63 @@ async def close_manager(manager: AgentRuntimeManager, runtime: Runtime, database
     await database.close()
 
 
+async def test_manager_shutdown_attempts_plugin_cleanup_after_bus_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'shutdown.db'}")
+    runtime = Runtime()
+    manager = AgentRuntimeManager(database, runtime, AgentRuntimeConfig(data_root=tmp_path))
+    plugin_stopped = False
+
+    async def fail_bus_shutdown() -> None:
+        raise OSError("fixture bus shutdown failed")
+
+    async def track_plugin_stop() -> None:
+        nonlocal plugin_stopped
+        plugin_stopped = True
+
+    monkeypatch.setattr(manager.bus, "shutdown", fail_bus_shutdown)
+    monkeypatch.setattr(manager.plugin_manager, "stop", track_plugin_stop)
+
+    with pytest.raises(AgentManagerShutdownError) as error:
+        await manager.stop()
+
+    assert plugin_stopped
+    assert len(error.value.errors) == 1
+    assert isinstance(error.value.errors[0], OSError)
+
+
+async def test_manager_can_load_profiles_without_starting_plugins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'read-only-check.db'}")
+    await database.create_schema()
+    runtime = Runtime()
+    await runtime.start()
+    manager = AgentRuntimeManager(
+        database,
+        runtime,
+        AgentRuntimeConfig(data_root=tmp_path, enable_plugins=False),
+    )
+
+    async def unexpected_plugin_start() -> None:
+        raise AssertionError("read-only profile inspection started plugins")
+
+    monkeypatch.setattr(manager.plugin_manager, "start", unexpected_plugin_start)
+    try:
+        await manager.start()
+
+        assert manager.started
+        assert manager.plugin_manager.enabled == set()
+        assert all(not instance.process.running for instance in manager.plugin_manager.instances)
+    finally:
+        await manager.stop()
+        await runtime.stop()
+        await database.close()
+
+
 async def test_root_and_nested_runs_share_queue_without_deadlock(tmp_path: Path) -> None:
     now = datetime.now(UTC)
     coordinator = AgentRecord(
@@ -195,7 +256,17 @@ async def test_root_and_nested_runs_share_queue_without_deadlock(tmp_path: Path)
         assert coordinator_requests[0].max_tokens == 8192
         assert coordinator_requests[0].temperature == 0.1
         assert [tool.function.name for tool in coordinator_requests[0].tools] == ["spawn_subagent"]
+        assert "emit several ordinary `spawn_subagent` tool calls" in str(
+            coordinator_requests[0].messages[0].content
+        )
+        assert "Do not use legacy `delegations`, `sharedContext`, or `agentId`" in str(
+            coordinator_requests[0].messages[0].content
+        )
         assert specialist_requests[0].tools == ()
+        assert all(
+            "Runtime delegation contract" not in str(message.content)
+            for message in specialist_requests[0].messages
+        )
         async with UnitOfWork(database) as unit:
             store = unit.require_store()
             root_session = await store.get_session("user-1", coordinator.id, "shared-session")
@@ -443,5 +514,77 @@ async def test_agent_without_agent_json_inherits_system_defaults(tmp_path: Path)
 
         assert profile.agent.config["model"] == "deepseek/deepseek-v4-pro"
         assert profile.agent.config["maxToolIterations"] == 20
+    finally:
+        await close_manager(manager, runtime, database)
+
+
+async def test_agent_database_scope_overrides_stale_agent_json(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    agent = AgentRecord(
+        id="production-agent",
+        user_id="user-1",
+        name="Production Agent",
+        config={"description": "explicit agents.config value"},
+        created_at=now,
+        updated_at=now,
+    )
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'precedence.db'}")
+    await database.create_schema()
+    async with UnitOfWork(database) as unit:
+        store = unit.require_store()
+        await store.save_user(
+            UserRecord(
+                id="user-1",
+                username="fixture",
+                email="fixture@example.test",
+                password_hash="unused",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await store.save_agent(agent)
+        await store.save_agent_file(
+            AgentFileRecord(
+                agent_id=agent.id,
+                user_id=agent.user_id,
+                filename="agent.json",
+                data=b'{"model":"openrouter/legacy-model","temperature":0.4}',
+                updated_at=now,
+            )
+        )
+        await store.save_config(
+            ConfigRecord(
+                id="system-defaults",
+                kind="setting",
+                scope="system",
+                name="agents.defaults",
+                data={"model": "deepseek/system-default", "maxToolIterations": 10},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await store.save_config(
+            ConfigRecord(
+                id="agent-defaults",
+                kind="setting",
+                scope="agent",
+                scope_id=agent.id,
+                name="agents.defaults",
+                data={"model": "deepseek/deepseek-v4-pro", "maxToolIterations": 20},
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    runtime = Runtime()
+    await runtime.start()
+    manager = AgentRuntimeManager(database, runtime, AgentRuntimeConfig(data_root=tmp_path))
+    await manager.start()
+    try:
+        profile = await manager.profile(agent.id, agent.user_id)
+
+        assert profile.agent.config["model"] == "deepseek/deepseek-v4-pro"
+        assert profile.agent.config["maxToolIterations"] == 20
+        assert profile.agent.config["temperature"] == 0.4
+        assert profile.agent.config["description"] == "explicit agents.config value"
     finally:
         await close_manager(manager, runtime, database)

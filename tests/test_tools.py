@@ -6,10 +6,16 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import anyio
+import httpcore
 import httpx
 import pytest
 
 from fastclaw.execution import ExecutionContext
+from fastclaw.network import (
+    PinnedAsyncHTTPTransport,
+    PinnedNetworkBackend,
+    pinned_network_target,
+)
 from fastclaw.tools import (
     ExecTool,
     ListDirTool,
@@ -169,6 +175,104 @@ async def test_web_fetch_revalidates_redirect_destinations() -> None:
     assert result.is_error
     assert len(requests) == 1
     assert "non-public" in result.content
+
+
+class _FakeNetworkStream(httpcore.AsyncNetworkStream):
+    def __init__(self, payload: bytes = b"") -> None:
+        self.payload = payload
+        self.written = bytearray()
+        self.server_hostname: str | None = None
+
+    async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        del timeout
+        chunk = self.payload[:max_bytes]
+        self.payload = self.payload[max_bytes:]
+        return chunk
+
+    async def write(self, buffer: bytes, timeout: float | None = None) -> None:
+        del timeout
+        self.written.extend(buffer)
+
+    async def aclose(self) -> None:
+        return None
+
+    async def start_tls(
+        self,
+        ssl_context: object,
+        server_hostname: str | None = None,
+        timeout: float | None = None,
+    ) -> httpcore.AsyncNetworkStream:
+        del ssl_context, timeout
+        self.server_hostname = server_hostname
+        return self
+
+
+class _FakeNetworkBackend(httpcore.AsyncNetworkBackend):
+    def __init__(
+        self,
+        failing: frozenset[str] = frozenset(),
+        payload: bytes = b"",
+    ) -> None:
+        self.failing = failing
+        self.hosts: list[str] = []
+        self.stream = _FakeNetworkStream(payload)
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: object = None,
+    ) -> httpcore.AsyncNetworkStream:
+        del port, timeout, local_address, socket_options
+        self.hosts.append(host)
+        if host in self.failing:
+            raise httpcore.ConnectError("fixture connection failed")
+        return self.stream
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: object = None,
+    ) -> httpcore.AsyncNetworkStream:
+        del path, timeout, socket_options
+        raise AssertionError("Unix socket should not be used")
+
+    async def sleep(self, seconds: float) -> None:
+        del seconds
+
+
+async def test_pinned_network_backend_never_resolves_the_hostname_again() -> None:
+    delegate = _FakeNetworkBackend(failing=frozenset({"93.184.216.34"}))
+    backend = PinnedNetworkBackend(delegate)
+
+    with pinned_network_target(
+        "public.example",
+        443,
+        ("93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"),
+    ):
+        stream = await backend.connect_tcp("public.example", 443)
+
+    assert stream is delegate.stream
+    assert delegate.hosts == ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"]
+    with pytest.raises(httpcore.ConnectError, match="unpinned"):
+        await backend.connect_tcp("public.example", 443)
+
+
+async def test_pinned_transport_preserves_host_and_tls_sni() -> None:
+    delegate = _FakeNetworkBackend(payload=b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+    transport = PinnedAsyncHTTPTransport(delegate)
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pinned_network_target("public.example", 443, ("93.184.216.34",)):
+            response = await client.get("https://public.example/report")
+
+    assert response.text == "ok"
+    assert delegate.hosts == ["93.184.216.34"]
+    assert delegate.stream.server_hostname == "public.example"
+    assert b"Host: public.example\r\n" in delegate.stream.written
 
 
 @pytest.mark.asyncio
