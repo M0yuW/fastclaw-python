@@ -141,6 +141,12 @@ class TeamDelete(WireModel):
     revision: int
 
 
+class TeamMemberUpdate(WireModel):
+    agent_id: str
+    status: Literal["active", "archived"] = "active"
+    revision: int
+
+
 class AdminUserCreate(WireModel):
     username: str
     email: str

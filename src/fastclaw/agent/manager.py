@@ -205,10 +205,12 @@ class ManagedAgentStream(AsyncIterator[AgentEvent]):
                         )
                     )
             finally:
+                self._manager._untrack_root(self.context.agent_id, self.context.root_execution_id)
                 if not self._saw_done:
                     self._error = self._error or "agent stream ended without a terminal event"
                 self._events.put_nowait(self._STOP)
 
+        self._manager._track_root(self.context.agent_id, self.context.root_execution_id)
         self._task = asyncio.create_task(supervise())
 
     def __aiter__(self) -> ManagedAgentStream:
@@ -264,6 +266,7 @@ class AgentRuntimeManager:
         self.bus = InProcessMessageBus(self._queue)
         self._tool_factory = tool_factory
         self._profiles: dict[str, AgentRuntimeProfile] = {}
+        self._agent_roots: dict[str, set[str]] = {}
         self.skill_catalog = SkillCatalog(config.data_root / "skills")
         package_plugins = Path(__file__).resolve().parents[1] / "bundled_plugins"
         checkout_plugins = Path(__file__).resolve().parents[3] / "plugins"
@@ -454,6 +457,20 @@ class AgentRuntimeManager:
 
     async def cancel_root(self, root_execution_id: str) -> None:
         await self.bus.cancel_root(root_execution_id)
+
+    async def cancel_agent_roots(self, agent_ids: tuple[str, ...]) -> None:
+        roots = {root for agent_id in agent_ids for root in self._agent_roots.get(agent_id, set())}
+        await asyncio.gather(*(self.cancel_root(root) for root in roots))
+
+    def _track_root(self, agent_id: str, root_execution_id: str) -> None:
+        self._agent_roots.setdefault(agent_id, set()).add(root_execution_id)
+
+    def _untrack_root(self, agent_id: str, root_execution_id: str) -> None:
+        roots = self._agent_roots.get(agent_id)
+        if roots is not None:
+            roots.discard(root_execution_id)
+            if not roots:
+                self._agent_roots.pop(agent_id, None)
 
     async def readiness(self) -> dict[str, bool]:
         database_ready = False

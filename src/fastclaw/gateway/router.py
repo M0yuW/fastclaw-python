@@ -40,6 +40,7 @@ from fastclaw.gateway.models import (
     SystemFileWrite,
     TeamCreate,
     TeamDelete,
+    TeamMemberUpdate,
     TeamUpdate,
 )
 from fastclaw.gateway.service import (
@@ -731,6 +732,39 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             members = await store.list_team_members(team_id)
         for member in members:
             gateway.agent_manager.remove_profile(member.agent_id)
+        await gateway.agent_manager.cancel_agent_roots(tuple(member.agent_id for member in members))
+        return {"ok": True, "team": _team_json(updated, members)}
+
+    @router.patch("/api/agent-teams/{team_id}/members/{agent_id}")
+    async def update_team_member(
+        team_id: str, agent_id: str, payload: TeamMemberUpdate, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        require_mutation(auth)
+        if payload.agent_id != agent_id:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "member ID confirmation required")
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            team = await store.get_team(team_id)
+            if team is None or team.user_id != auth.identity.effective_user_id:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "team not found")
+            if team.revision != payload.revision:
+                raise HTTPException(status.HTTP_409_CONFLICT, "team revision conflict")
+            member = next(
+                (
+                    item
+                    for item in await store.list_team_members(team_id)
+                    if item.agent_id == agent_id
+                ),
+                None,
+            )
+            if member is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "team member not found")
+            await store.save_team_member(member.model_copy(update={"status": payload.status}))
+            updated = team.model_copy(
+                update={"revision": team.revision + 1, "updated_at": datetime.now(UTC)}
+            )
+            await store.save_team(updated)
+            members = await store.list_team_members(team_id)
         return {"ok": True, "team": _team_json(updated, members)}
 
     @router.post("/api/agent-teams/{team_id}/restore")
@@ -782,6 +816,8 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                 )
             members = await store.list_team_members(team_id)
             await store.delete_team(team_id)
+            for member in members:
+                await store.delete_agent(member.agent_id)
         for member in members:
             gateway.agent_manager.remove_profile(member.agent_id)
         return {"ok": True, "deleted": team_id}
