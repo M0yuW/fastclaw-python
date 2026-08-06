@@ -254,6 +254,10 @@ class AgentRuntimeManager:
         return len(self._profiles)
 
     @property
+    def pending_count(self) -> int:
+        return self._queue.pending_count
+
+    @property
     def profiles(self) -> Mapping[str, AgentRuntimeProfile]:
         return MappingProxyType(self._profiles)
 
@@ -296,6 +300,30 @@ class AgentRuntimeManager:
                 )
             self._profiles[agent.id] = profile
             return profile
+
+    async def reload_profile(self, agent: AgentRecord) -> AgentRuntimeProfile:
+        async with self._profile_lock:
+            profile = await self._load_profile(agent)
+            if agent.id not in self._profiles:
+                self.bus.register(
+                    user_id=agent.user_id,
+                    agent_id=agent.id,
+                    handler=partial(self._delegated_chat, agent.id),
+                )
+            self._profiles[agent.id] = profile
+            return profile
+
+    async def reload_profiles(self) -> None:
+        async with UnitOfWork(self.database) as unit:
+            store = unit.require_store()
+            users = await store.list_users()
+            agents = [agent for user in users for agent in await store.list_agents(user.id)]
+        for agent in agents:
+            await self.reload_profile(agent)
+
+    def remove_profile(self, agent_id: str) -> None:
+        self._profiles.pop(agent_id, None)
+        self.bus.unregister(agent_id)
 
     async def profile(self, agent_id: str, user_id: str) -> AgentRuntimeProfile:
         async with UnitOfWork(self.database) as unit:
@@ -416,7 +444,7 @@ class AgentRuntimeManager:
         selected = configs.get(provider_name)
         if selected is not None:
             data = selected.data
-            api_key = str(data.get("apiKey") or self._provider_env_key(selected.name))
+            api_key = self.provider_credential(selected.name)
             standard = _STANDARD_PROVIDERS.get(selected.name, ("", "openai-compatible"))
             api_base = str(data.get("apiBase") or standard[0])
             api_type = str(data.get("apiType") or standard[1])
@@ -434,7 +462,7 @@ class AgentRuntimeManager:
                 )
         default_provider = _STANDARD_PROVIDERS.get(provider_name)
         if default_provider is not None and model:
-            key = self._provider_env_key(provider_name)
+            key = self.provider_environment_key(provider_name)
             if key:
                 return ProviderSelection(
                     name=provider_name,
@@ -450,7 +478,9 @@ class AgentRuntimeManager:
             and model
             and (not provider_name or provider_name == self.config.default_provider_name)
         ):
-            key = self.config.default_provider_api_key or self._provider_env_key(provider_name)
+            key = self.config.default_provider_api_key or self.provider_environment_key(
+                provider_name
+            )
             if key:
                 return ProviderSelection(
                     name=self.config.default_provider_name,
@@ -544,7 +574,25 @@ class AgentRuntimeManager:
                 await store.list_configs(kind="setting", user_id=agent.user_id, agent_id=""),
                 await store.list_configs(kind="setting", user_id=agent.user_id, agent_id=agent.id),
             ]
-        files = {record.filename: record.data for record in records}
+        files: dict[str, bytes] = {}
+        asset_root = self.config.data_root / "agents" / agent.id
+        for filename in (
+            "agent.json",
+            "SOUL.md",
+            "IDENTITY.md",
+            "USER.md",
+            "MEMORY.md",
+            "TOOLS.md",
+            "BOOTSTRAP.md",
+            "HEARTBEAT.md",
+            "AGENTS.md",
+        ):
+            path = asset_root / filename
+            if path.is_file() and not path.is_symlink():
+                files[filename] = path.read_bytes()
+        # Database edits are deliberate runtime overrides; imported files stay
+        # byte-for-byte unchanged on disk for source-hash auditing.
+        files.update({record.filename: record.data for record in records})
         file_config: dict[str, Any] = {}
         raw_config = files.get("agent.json")
         if raw_config:
@@ -644,9 +692,17 @@ class AgentRuntimeManager:
         )
 
     @staticmethod
-    def _provider_env_key(name: str) -> str:
+    def provider_environment_key(name: str) -> str:
         normalized = re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_")
         return os.environ.get(f"FASTCLAW_PROVIDER_{normalized}_API_KEY", "")
+
+    def provider_credential(self, name: str) -> str:
+        configured = self.provider_environment_key(name)
+        if configured:
+            return configured
+        if name == self.config.default_provider_name:
+            return self.config.default_provider_api_key
+        return ""
 
     @staticmethod
     def safe_error(error: BaseException) -> str:

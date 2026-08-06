@@ -385,7 +385,7 @@ export default function AgentsPage() {
                   key={agent.id}
                   className="group flex h-full flex-col rounded-lg border border-border bg-card p-5 opacity-90 transition-colors hover:bg-muted/50 hover:opacity-100 cursor-pointer"
                   onClick={() =>
-                    (window.location.href = `/agents/${agent.id}/chat/`)
+                    (window.location.href = `/agents/${agent.id}/chat/?actAs=${encodeURIComponent(agent.userId || "")}`)
                   }
                 >
                   <div className="flex items-start justify-between mb-4">

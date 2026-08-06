@@ -14,6 +14,7 @@ ADDED_FILES = {"LICENSE", "SOURCE.md"}
 MISSING_FILES = {"next-env.d.ts"}
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "tests" / "fixtures" / "web-snapshot-792417b.json"
+OVERLAY_MANIFEST = ROOT / "tests" / "fixtures" / "web-python-overlays.json"
 
 
 def git(*arguments: str, cwd: Path = ROOT) -> bytes:
@@ -66,6 +67,7 @@ def generate(reference_repo: Path, output: Path) -> None:
 
 def verify(manifest_path: Path) -> None:
     manifest = json.loads(manifest_path.read_text())
+    overlay = json.loads(OVERLAY_MANIFEST.read_text())
     common: dict[str, str] = manifest["commonFiles"]
     if manifest["referenceCommit"] != REFERENCE_COMMIT:
         raise RuntimeError("snapshot manifest references the wrong Go commit")
@@ -75,9 +77,17 @@ def verify(manifest_path: Path) -> None:
         raise RuntimeError("snapshot added-file contract changed")
     if set(manifest["missingFiles"]) != MISSING_FILES:
         raise RuntimeError("snapshot missing-file contract changed")
+    if overlay["referenceCommit"] != REFERENCE_COMMIT:
+        raise RuntimeError("Web overlay references the wrong Go commit")
+    modified = set(overlay["modifiedFiles"])
+    additions = set(overlay["addedFiles"])
+    if not modified <= set(common):
+        raise RuntimeError(f"Web overlay modifies unknown files: {sorted(modified - set(common))}")
+    if additions & (set(common) | ADDED_FILES):
+        raise RuntimeError("Web overlay additions collide with snapshot files")
 
     tracked = {name.removeprefix("web/") for name in git("ls-files", "web").decode().splitlines()}
-    expected = set(common) | ADDED_FILES
+    expected = set(common) | ADDED_FILES | additions
     unexpected = sorted(tracked - expected)
     missing = sorted(expected - tracked)
     if unexpected or missing:
@@ -87,11 +97,17 @@ def verify(manifest_path: Path) -> None:
     mismatches = [
         name
         for name, expected_hash in common.items()
+        if name not in modified
         if sha256((ROOT / "web" / name).read_bytes()) != expected_hash
     ]
     if mismatches:
         raise RuntimeError(f"web snapshot hashes differ: {mismatches}")
-    print("Web snapshot verified: 90 common hashes, 2 additions, 1 ignored generated file")
+    print(
+        "Web snapshot verified: "
+        f"{len(common) - len(modified)} unchanged hashes, "
+        f"{len(modified)} declared Python overlays, "
+        f"{len(ADDED_FILES) + len(additions)} attributed additions"
+    )
 
 
 def main() -> None:

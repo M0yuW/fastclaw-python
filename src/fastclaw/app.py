@@ -1,18 +1,39 @@
 """FastAPI application factory."""
 
-from collections.abc import AsyncIterator
+import re
+from collections.abc import AsyncIterator, MutableMapping
 from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.responses import Response
 
 from fastclaw.agent.manager import AgentRuntimeConfig, AgentRuntimeManager
 from fastclaw.gateway import Gateway, GatewaySettings, create_gateway_router
 from fastclaw.models import HealthResponse, ReadinessResponse
 from fastclaw.runtime import Runtime, RuntimeState
 from fastclaw.storage import Database
+
+_EXPORTED_AGENT_ROUTE = re.compile(
+    r"^agents/[^/]+/(?P<section>chat|chats|customize|models|sessions|skills)/?$"
+)
+
+
+class ExportedNextStaticFiles(StaticFiles):
+    """Serve Next's exported `default` route for arbitrary Agent IDs."""
+
+    async def get_response(self, path: str, scope: MutableMapping[str, Any]) -> Response:
+        response = await super().get_response(path, scope)
+        if response.status_code != 404:
+            return response
+        match = _EXPORTED_AGENT_ROUTE.fullmatch(path)
+        if match is None:
+            return response
+        fallback = f"agents/default/{match.group('section')}/"
+        return await super().get_response(fallback, scope)
 
 
 def create_app(
@@ -128,7 +149,11 @@ def create_app(
 
     app.include_router(create_gateway_router(gateway))
     if app_settings.web_root is not None:
-        app.mount("/", StaticFiles(directory=app_settings.web_root, html=True), name="web")
+        app.mount(
+            "/",
+            ExportedNextStaticFiles(directory=app_settings.web_root, html=True),
+            name="web",
+        )
 
     return app
 

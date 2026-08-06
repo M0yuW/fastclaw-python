@@ -57,21 +57,24 @@ Open `http://127.0.0.1:18954/`. On a new database the Web UI redirects to
 are created atomically. Health and readiness probes remain available at
 `/healthz` and `/readyz`.
 
-The same Provider can instead be supplied by environment variables:
+Provider credentials are supplied centrally by environment variables. The
+database stores only non-sensitive endpoint, model, and scope configuration:
 
 ```bash
-FASTCLAW_PROVIDER_NAME=openai \
-FASTCLAW_PROVIDER_API_BASE=https://api.openai.com/v1 \
-FASTCLAW_PROVIDER_API_KEY=... \
-FASTCLAW_DEFAULT_MODEL=openai/gpt-5.5 \
+FASTCLAW_PROVIDER_DEEPSEEK_API_KEY=... \
+FASTCLAW_PROVIDER_OPENROUTER_API_KEY=... \
+ODDS_API_KEY=... \
 uvicorn fastclaw.app:app --host 127.0.0.1 --port 18954
 ```
 
+Use `fastclaw providers check --database-url ...` to report missing variables
+without printing their values. `/readyz` remains unavailable until every
+required Agent Provider and prepared Skill environment is usable.
+
 Cookie sessions are used by the Web UI. Programmatic clients can use a
 SHA-256-backed `Bearer fc_...` API key created under `/apikeys`; agent-type keys
-can access only their explicit Agent ACL. Provider secrets are masked by all
-read APIs and are only accepted on create/update or through the process
-environment.
+can access only their explicit Agent ACL. Provider create/update APIs reject
+plaintext credentials and identify the required environment variable.
 
 ## Implementing a provider
 
@@ -136,8 +139,24 @@ fastclaw migrate import-go \
 Remove `--dry-run` after checking the redacted report. The source is opened
 read-only and verified by SHA-256 before and after import. Repeating an import
 of the same source snapshot is a no-op. Go web sessions and plaintext secrets
-are deliberately not imported, so users must log in and configure credentials
-again.
+are deliberately not imported. Password and API-key hashes remain compatible,
+but browser sessions must log in again and Provider/channel credentials must be
+supplied centrally.
+
+After the database import, preview and import only assets owned by valid target
+Agents:
+
+```bash
+fastclaw migrate import-assets \
+  --source-root ~/.fastclaw \
+  --target-root ~/.fastclaw-python \
+  --database-url sqlite+aiosqlite:////Users/you/.fastclaw-python/fastclaw.db \
+  --dry-run
+```
+
+Prepare declared Skill dependencies explicitly with
+`fastclaw skills prepare --data-root ~/.fastclaw-python`; the Runtime never
+installs packages while handling a chat request.
 
 See [the phase 2 migration record](docs/migration/phase-2-data-identity.md) for
 the schema mapping, validation commands, and rollback boundary.

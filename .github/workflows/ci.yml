@@ -65,3 +65,40 @@ jobs:
       - name: Verify attributed snapshot
         working-directory: .
         run: python scripts/verify_web_snapshot.py
+
+  web-e2e:
+    runs-on: ubuntu-latest
+    needs: [quality, web]
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Install Runtime and Web dependencies
+        working-directory: .
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[server]"
+          cd web
+          pnpm install --frozen-lockfile
+      - name: Build exported Web application
+        run: pnpm build
+      - name: Install Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Playwright Gateway acceptance
+        env:
+          FASTCLAW_E2E_PYTHON: python
+        run: pnpm test:e2e

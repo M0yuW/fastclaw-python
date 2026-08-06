@@ -190,6 +190,16 @@ export function getAuthToken(): string {
 // is the primary credential for the web UI; the bearer is only used by
 // programmatic clients that put the token into localStorage manually.
 export async function apiFetch(url: string, init?: RequestInit): Promise<Response> {
+  // Preserve the administrator's explicit read-only tenant view across API
+  // requests. The server re-validates this on every request; this is only
+  // propagation, never an authorization decision.
+  if (typeof window !== "undefined") {
+    const actAs = new URLSearchParams(window.location.search).get("actAs");
+    if (actAs && url.startsWith("/")) {
+      const separator = url.includes("?") ? "&" : "?";
+      url = `${url}${separator}actAs=${encodeURIComponent(actAs)}`;
+    }
+  }
   const token = getAuthToken();
   const headers: Record<string, string> = {
     ...(init?.headers as Record<string, string> || {}),

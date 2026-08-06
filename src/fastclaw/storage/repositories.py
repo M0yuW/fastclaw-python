@@ -37,18 +37,21 @@ class UserRepository(Protocol):
     async def get_user_by_login(self, login: str) -> UserRecord | None: ...
     async def list_users(self) -> Sequence[UserRecord]: ...
     async def count_users(self) -> int: ...
+    async def delete_user(self, user_id: str) -> None: ...
 
 
 class AgentRepository(Protocol):
     async def save_agent(self, record: AgentRecord) -> None: ...
     async def get_agent(self, agent_id: str) -> AgentRecord | None: ...
     async def list_agents(self, user_id: str) -> Sequence[AgentRecord]: ...
+    async def delete_agent(self, agent_id: str) -> None: ...
 
 
 class SessionRepository(Protocol):
     async def save_session(self, record: SessionRecord) -> None: ...
     async def get_session(self, user_id: str, agent_id: str, key: str) -> SessionRecord | None: ...
     async def list_sessions(self, user_id: str, agent_id: str) -> Sequence[SessionRecord]: ...
+    async def delete_session(self, user_id: str, agent_id: str, key: str) -> None: ...
 
 
 class APIKeyRepository(Protocol):
@@ -99,6 +102,17 @@ class SQLAlchemyStore:
 
     async def count_users(self) -> int:
         return int(await self.session.scalar(select(func.count()).select_from(UserModel)) or 0)
+
+    async def delete_user(self, user_id: str) -> None:
+        await self.session.execute(
+            delete(ConfigModel).where(
+                or_(
+                    ConfigModel.user_id == user_id,
+                    (ConfigModel.scope == "user") & (ConfigModel.scope_id == user_id),
+                )
+            )
+        )
+        await self.session.execute(delete(UserModel).where(UserModel.id == user_id))
 
     async def save_web_session(self, record: WebSessionRecord) -> None:
         await self.session.merge(WebSessionModel(**record.model_dump()))
@@ -187,6 +201,17 @@ class SQLAlchemyStore:
         ).all()
         return [self._agent_record(model) for model in models]
 
+    async def delete_agent(self, agent_id: str) -> None:
+        await self.session.execute(
+            delete(ConfigModel).where(
+                or_(
+                    ConfigModel.agent_id == agent_id,
+                    (ConfigModel.scope == "agent") & (ConfigModel.scope_id == agent_id),
+                )
+            )
+        )
+        await self.session.execute(delete(AgentModel).where(AgentModel.id == agent_id))
+
     async def save_session(self, record: SessionRecord) -> None:
         await self.session.merge(SessionModel(**record.model_dump()))
 
@@ -203,6 +228,15 @@ class SQLAlchemyStore:
             )
         ).all()
         return [self._session_record(model) for model in models]
+
+    async def delete_session(self, user_id: str, agent_id: str, key: str) -> None:
+        await self.session.execute(
+            delete(SessionModel).where(
+                SessionModel.user_id == user_id,
+                SessionModel.agent_id == agent_id,
+                SessionModel.key == key,
+            )
+        )
 
     async def save_agent_file(self, record: AgentFileRecord) -> None:
         await self.session.merge(AgentFileModel(**record.model_dump()))
@@ -228,6 +262,29 @@ class SQLAlchemyStore:
             )
             for model in models
         ]
+
+    async def get_agent_file(
+        self, agent_id: str, user_id: str, filename: str
+    ) -> AgentFileRecord | None:
+        model = await self.session.get(AgentFileModel, (agent_id, user_id, filename))
+        if model is None:
+            return None
+        return AgentFileRecord(
+            agent_id=model.agent_id,
+            user_id=model.user_id,
+            filename=model.filename,
+            data=model.data,
+            updated_at=model.updated_at,
+        )
+
+    async def delete_agent_file(self, agent_id: str, user_id: str, filename: str) -> None:
+        await self.session.execute(
+            delete(AgentFileModel).where(
+                AgentFileModel.agent_id == agent_id,
+                AgentFileModel.user_id == user_id,
+                AgentFileModel.filename == filename,
+            )
+        )
 
     async def save_config(self, record: ConfigRecord) -> None:
         await self.session.merge(ConfigModel(**record.model_dump()))

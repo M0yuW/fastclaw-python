@@ -1,0 +1,13 @@
+{
+  "addedFiles": {
+    "e2e/runtime.spec.ts": "Python Gateway browser acceptance test",
+    "playwright.config.ts": "Python Gateway browser test orchestration"
+  },
+  "modifiedFiles": {
+    "package.json": "Playwright test command and dependency",
+    "pnpm-lock.yaml": "Lockfile for the Playwright dependency",
+    "src/app/agents/page.tsx": "Read-only administrator actAs navigation",
+    "src/lib/api.ts": "Read-only actAs propagation to Python API calls"
+  },
+  "referenceCommit": "792417b86b5c12af1b99364865217a74f4d52f38"
+}
