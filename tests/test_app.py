@@ -60,11 +60,13 @@ async def test_healthz_and_readyz_when_runtime_is_ready(tmp_path: Path) -> None:
     app = create_app(runtime, settings=settings, database=Database(settings.database_url))
 
     async with app_client(app) as client:
-        health = await client.get("/healthz")
+        health = await client.get("/healthz", headers={"x-correlation-id": "probe-123"})
         readiness = await client.get("/readyz")
 
     assert health.status_code == 200
     assert health.json() == {"status": "ok", "state": "running"}
+    assert health.headers["x-correlation-id"] == "probe-123"
+    assert readiness.headers["x-correlation-id"].startswith("req_")
     assert readiness.status_code == 200
     assert readiness.json() == {
         "status": "ready",

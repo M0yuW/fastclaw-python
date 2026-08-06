@@ -11,6 +11,7 @@ from typing import Annotated, Literal
 import typer
 
 from fastclaw.agent.manager import AgentRuntimeConfig, AgentRuntimeManager
+from fastclaw.cutover import audit_cutover
 from fastclaw.migration import AssetImportConflictError, import_assets, import_go_database
 from fastclaw.runtime import Runtime
 from fastclaw.skills import SkillCatalog
@@ -22,9 +23,11 @@ app = typer.Typer(help="FastClaw Python runtime tools.")
 migrate_app = typer.Typer(help="One-way data migration commands.")
 skills_app = typer.Typer(help="Discover and explicitly prepare Skill environments.")
 providers_app = typer.Typer(help="Check centralized Provider and Skill credentials.")
+cutover_app = typer.Typer(help="Audit a disposable copy before release cutover.")
 app.add_typer(migrate_app, name="migrate")
 app.add_typer(skills_app, name="skills")
 app.add_typer(providers_app, name="providers")
+app.add_typer(cutover_app, name="cutover")
 
 
 @migrate_app.command("import-go")
@@ -191,3 +194,30 @@ def check_providers(
             await database.close()
 
     typer.echo(json.dumps(asyncio.run(inspect()), indent=2, sort_keys=True))
+
+
+@cutover_app.command("audit")
+def cutover_audit(
+    database_url: Annotated[str, typer.Option(help="Disposable Python database URL.")],
+    data_root: Annotated[Path, typer.Option(exists=True, file_okay=False, resolve_path=True)],
+) -> None:
+    """Audit the locked 2-user/27-Agent production migration manifest."""
+
+    async def inspect() -> dict[str, object]:
+        database = Database(database_url)
+        runtime = Runtime()
+        manager = AgentRuntimeManager(database, runtime, AgentRuntimeConfig(data_root=data_root))
+        await runtime.start()
+        try:
+            await manager.start()
+            report = await audit_cutover(database, manager)
+            return report.model_dump(mode="json")
+        finally:
+            await manager.stop()
+            await runtime.stop()
+            await database.close()
+
+    payload = asyncio.run(inspect())
+    typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    if not payload["ready"]:
+        raise typer.Exit(code=2)

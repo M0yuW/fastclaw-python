@@ -1,7 +1,8 @@
 """FastAPI application factory."""
 
+import os
 import re
-from collections.abc import AsyncIterator, MutableMapping
+from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -14,6 +15,7 @@ from starlette.responses import Response
 from fastclaw.agent.manager import AgentRuntimeConfig, AgentRuntimeManager
 from fastclaw.gateway import Gateway, GatewaySettings, create_gateway_router
 from fastclaw.models import HealthResponse, ReadinessResponse
+from fastclaw.observability import configure_json_logging, use_correlation_id
 from fastclaw.runtime import Runtime, RuntimeState
 from fastclaw.storage import Database
 
@@ -43,6 +45,9 @@ def create_app(
     database: Database | None = None,
 ) -> FastAPI:
     """Create a FastAPI app bound to a runtime instance."""
+
+    if os.environ.get("FASTCLAW_LOG_FORMAT", "").lower() == "json":
+        configure_json_logging()
 
     app_runtime = runtime or Runtime()
     app_settings = settings or GatewaySettings.from_env()
@@ -87,6 +92,18 @@ def create_app(
     app.state.database = app_database
     app.state.gateway = gateway
     app.state.agent_manager = agent_manager
+
+    @app.middleware("http")
+    async def correlation_middleware(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        requested = request.headers.get("x-correlation-id", "")
+        trusted = requested if re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", requested) else ""
+        with use_correlation_id(trusted) as correlation_id:
+            response = await call_next(request)
+            response.headers["x-correlation-id"] = correlation_id
+            return response
 
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException) -> JSONResponse:

@@ -34,3 +34,7 @@ def require_execution() -> ExecutionContext:
     if context is None:
         raise RuntimeError("trusted execution context is missing")
     return context
+
+
+def current_execution() -> ExecutionContext | None:
+    return _execution.get()

@@ -9,9 +9,12 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI
 
+from fastclaw.agent import AgentEvent, AgentEventType
 from fastclaw.app import create_app
 from fastclaw.gateway import GatewaySettings
+from fastclaw.gateway.router import _web_event
 from fastclaw.identity import hash_api_key, hash_password
+from fastclaw.providers import FunctionCall, ToolCall
 from fastclaw.runtime import Runtime
 from fastclaw.storage import (
     AgentFileRecord,
@@ -82,6 +85,25 @@ async def login(client: httpx.AsyncClient) -> None:
     assert client.cookies.get("fastclaw_session")
 
 
+def test_sse_tool_result_preserves_call_identity_for_pairing() -> None:
+    call = ToolCall(id="call-1", function=FunctionCall(name="read_file", arguments="{}"))
+    payload = _web_event(
+        AgentEvent(
+            type=AgentEventType.TOOL_RESULT,
+            turn_id="turn-1",
+            message_id="message-1",
+            round=0,
+            seq=1,
+            tool_call=call,
+            tool_result="content",
+        )
+    )
+
+    assert payload["data"]["id"] == "call-1"
+    assert payload["data"]["name"] == "read_file"
+    assert payload["data"]["result"] == "content"
+
+
 async def test_onboard_cookie_auth_status_agents_and_masked_provider(tmp_path: Path) -> None:
     async with gateway_client(tmp_path / "gateway.db") as (client, database):
         root = await client.get("/")
@@ -102,6 +124,8 @@ async def test_onboard_cookie_auth_status_agents_and_masked_provider(tmp_path: P
         me = await client.get("/api/me")
         status = await client.get("/api/status")
         agents = await client.get("/api/agents")
+        v1_agents = await client.get("/v1/agents")
+        tasks = await client.get("/api/tasks")
         providers = await client.get("/api/providers")
         config = await client.get("/api/config")
         created_key = await client.post(
@@ -135,6 +159,16 @@ async def test_onboard_cookie_auth_status_agents_and_masked_provider(tmp_path: P
         assert status.json()["running"] is True
         assert status.json()["provider"]["apiKey"] == "prov****cret"
         assert agents.json()["agents"][0]["id"] == created["agentId"]
+        assert v1_agents.json() == {
+            "agents": [
+                {
+                    "id": created["agentId"],
+                    "name": "Analyst",
+                    "model": "fixture/model-1",
+                }
+            ]
+        }
+        assert tasks.json() == []
         serialized = json.dumps([providers.json(), config.json()])
         assert "provider-secret" not in serialized
         assert created_key.status_code == 201

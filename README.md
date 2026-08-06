@@ -207,6 +207,29 @@ under `~/.fastclaw-python/data`.
 
 See [the plugin and finance migration record](docs/migration/phase-8-plugins-finance.md).
 
+Before a release cutover, run the locked migration audit against a disposable
+copy of the Python database and data root. The command never prints credential
+values and exits with status 2 while any required Provider, Skill, plugin, role
+file, ACL/database, or 2-user/27-Agent manifest gate is incomplete:
+
+```bash
+fastclaw cutover audit \
+  --database-url sqlite+aiosqlite:////tmp/fastclaw-audit/fastclaw.db \
+  --data-root /tmp/fastclaw-audit
+```
+
+The audit starts bundled plugins to verify their handshake, so the supplied
+data root must be a disposable copy rather than the live Go or Python root.
+
+## Release image and differential smoke
+
+`Dockerfile` produces a non-root Linux image with a read-only application
+layer and `/data` as the only persistent volume. The manual differential
+workflow is designed to compare independent Go 18953 and Python 18954 instances
+without ever sharing SQLite. Its comparison logic is unit-tested, but a real
+dual-service run and retained report remain a hard cutover prerequisite. See
+[the release and cutover record](docs/migration/phase-9-release-cutover.md).
+
 ## License
 
 See [LICENSE](LICENSE).

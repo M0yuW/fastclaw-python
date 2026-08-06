@@ -55,14 +55,37 @@ Repository = "https://github.com/M0yuW/fastclaw-python"
 [tool.hatch.build.targets.wheel]
 packages = ["src/fastclaw"]
 
+[tool.hatch.build]
+exclude = [
+  "/.mypy_cache",
+  "/.pytest_cache",
+  "/.ruff_cache",
+  "/.venv",
+  "/build",
+  "/dist",
+  "/web/.next",
+  "/web/node_modules",
+  "/web/out",
+  "/web/playwright-report",
+  "/web/test-results",
+]
+
 [tool.hatch.build.targets.wheel.force-include]
 "alembic.ini" = "fastclaw/alembic.ini"
 "migrations" = "fastclaw/migrations"
+"plugins/finance-tools/plugin.py" = "fastclaw/bundled_plugins/finance-tools/plugin.py"
+"plugins/finance-tools/plugin.json" = "fastclaw/bundled_plugins/finance-tools/plugin.json"
+"plugins/finance-tools/README.md" = "fastclaw/bundled_plugins/finance-tools/README.md"
+"plugins/finance-tools/LICENSE" = "fastclaw/bundled_plugins/finance-tools/LICENSE"
+"plugins/finance-tools/SOURCE.md" = "fastclaw/bundled_plugins/finance-tools/SOURCE.md"
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+  "postgres: requires the dedicated FASTCLAW_POSTGRES_TEST_URL database",
+]
 
 [tool.ruff]
 line-length = 100

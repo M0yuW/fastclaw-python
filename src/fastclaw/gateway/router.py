@@ -202,6 +202,9 @@ def _web_event(event: AgentEvent) -> dict[str, Any]:
         )
     elif event.type is AgentEventType.TOOL_RESULT:
         data["result"] = event.tool_result
+        if event.tool_call is not None:
+            data["id"] = event.tool_call.id
+            data["name"] = event.tool_call.function.name
     elif event.type is AgentEventType.ERROR:
         data["message"] = event.error
     return {"version": 2, "type": event.type.value, "data": data}
@@ -1270,13 +1273,24 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         return await save_config({"tools": payload}, auth)
 
     @router.get("/api/tasks")
-    async def tasks(auth: AuthContext = auth_dependency) -> dict[str, Any]:
-        del auth
-        return {
-            "tasks": [],
-            "pending": gateway.agent_manager.pending_count,
-            "detail": "individual in-process tasks are intentionally not exposed",
-        }
+    async def tasks(auth: AuthContext = auth_dependency) -> list[dict[str, Any]]:
+        if auth.identity.role != "super_admin" or auth.identity.auth_method == "apikey":
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "admin required")
+        result: list[dict[str, Any]] = []
+        for task in gateway.agent_manager.recent_tasks():
+            item: dict[str, Any] = {
+                "id": task.id,
+                "agentId": task.agent_id,
+                "chatKey": task.chat_key,
+                "status": task.status,
+                "createdAt": task.created_at.isoformat(),
+            }
+            if task.started_at is not None and task.done_at is not None:
+                item["duration"] = int((task.done_at - task.started_at).total_seconds() * 1000)
+            if task.error:
+                item["error"] = task.error
+            result.append(item)
+        return result
 
     def unsupported(feature: str) -> JSONResponse:
         return JSONResponse(
@@ -1497,7 +1511,12 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
     @router.get("/v1/agents")
     async def v1_agents(auth: AuthContext = auth_dependency) -> dict[str, Any]:
         result = await list_agents(auth)
-        return {"object": "list", "data": result["agents"]}
+        return {
+            "agents": [
+                {"id": item["id"], "name": item["name"], "model": item["model"]}
+                for item in result["agents"]
+            ]
+        }
 
     @router.post("/v1/chat/completions")
     async def v1_chat(

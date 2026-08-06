@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -113,6 +114,52 @@ async def test_sqlite_defaults_and_repository_round_trip(tmp_path: Path) -> None
                 kind="provider", user_id="user-1", agent_id="agent-1"
             )
             assert configs[0].data == {"model": "test-model"}
+    finally:
+        await database.close()
+
+
+async def test_sqlite_wal_serializes_concurrent_session_writes(tmp_path: Path) -> None:
+    database = Database(database_url(tmp_path / "concurrent.db"))
+    await database.create_schema()
+    try:
+        async with UnitOfWork(database) as unit:
+            store = unit.require_store()
+            await store.save_user(
+                UserRecord(
+                    id="concurrent-user",
+                    username="concurrent",
+                    email="concurrent@example.test",
+                    password_hash="fixture",
+                )
+            )
+            await store.save_agent(
+                AgentRecord(
+                    id="concurrent-agent",
+                    user_id="concurrent-user",
+                    name="Concurrent Agent",
+                )
+            )
+
+        async def write(index: int) -> None:
+            async with UnitOfWork(database) as unit:
+                await unit.require_store().save_session(
+                    SessionRecord(
+                        user_id="concurrent-user",
+                        agent_id="concurrent-agent",
+                        key=f"session-{index:02d}",
+                        messages=[{"role": "user", "content": str(index)}],
+                        message_count=1,
+                    )
+                )
+
+        await asyncio.wait_for(asyncio.gather(*(write(index) for index in range(32))), timeout=8)
+
+        async with UnitOfWork(database) as unit:
+            records = await unit.require_store().list_sessions(
+                "concurrent-user", "concurrent-agent"
+            )
+        assert len(records) == 32
+        assert {record.key for record in records} == {f"session-{index:02d}" for index in range(32)}
     finally:
         await database.close()
 

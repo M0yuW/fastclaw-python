@@ -30,6 +30,31 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def verify_overlay_hashes(modified_files: dict[str, Any], *, web_root: Path = ROOT / "web") -> None:
+    expected_keys = {"reason", "sha256"}
+    invalid = [
+        name
+        for name, details in modified_files.items()
+        if not isinstance(details, dict)
+        or set(details) != expected_keys
+        or not isinstance(details["reason"], str)
+        or not details["reason"]
+        or not isinstance(details["sha256"], str)
+        or len(details["sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in details["sha256"])
+    ]
+    if invalid:
+        raise RuntimeError(f"Web overlay entries must contain reason and SHA-256: {invalid}")
+
+    mismatches = [
+        name
+        for name, details in modified_files.items()
+        if sha256((web_root / name).read_bytes()) != details["sha256"]
+    ]
+    if mismatches:
+        raise RuntimeError(f"Web overlay hashes differ: {mismatches}")
+
+
 def generate(reference_repo: Path, output: Path) -> None:
     names = (
         git(
@@ -79,7 +104,8 @@ def verify(manifest_path: Path) -> None:
         raise RuntimeError("snapshot missing-file contract changed")
     if overlay["referenceCommit"] != REFERENCE_COMMIT:
         raise RuntimeError("Web overlay references the wrong Go commit")
-    modified = set(overlay["modifiedFiles"])
+    modified_files: dict[str, Any] = overlay["modifiedFiles"]
+    modified = set(modified_files)
     additions = set(overlay["addedFiles"])
     if not modified <= set(common):
         raise RuntimeError(f"Web overlay modifies unknown files: {sorted(modified - set(common))}")
@@ -102,10 +128,11 @@ def verify(manifest_path: Path) -> None:
     ]
     if mismatches:
         raise RuntimeError(f"web snapshot hashes differ: {mismatches}")
+    verify_overlay_hashes(modified_files)
     print(
         "Web snapshot verified: "
-        f"{len(common) - len(modified)} unchanged hashes, "
-        f"{len(modified)} declared Python overlays, "
+        f"{len(common) - len(modified)} unchanged + "
+        f"{len(modified)} declared overlays + "
         f"{len(ADDED_FILES) + len(additions)} attributed additions"
     )
 
