@@ -3,7 +3,7 @@
 import os
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -73,19 +73,14 @@ def create_app(
         app.state.database = app_database
         app.state.gateway = gateway
         app.state.agent_manager = agent_manager
-        await app_database.create_schema()
-        await app_runtime.start()
-        await agent_manager.start()
-        try:
+        async with AsyncExitStack() as stack:
+            stack.push_async_callback(app_database.close)
+            await app_database.create_schema()
+            await app_runtime.start()
+            stack.push_async_callback(app_runtime.stop)
+            stack.push_async_callback(agent_manager.stop)
+            await agent_manager.start()
             yield
-        finally:
-            try:
-                await agent_manager.stop()
-            finally:
-                try:
-                    await app_runtime.stop()
-                finally:
-                    await app_database.close()
 
     app = FastAPI(title="FastClaw", version="0.1.0", lifespan=lifespan)
     app.state.runtime = app_runtime

@@ -139,7 +139,7 @@ def check_providers(
         manager = AgentRuntimeManager(
             database,
             runtime,
-            AgentRuntimeConfig(data_root=data_root),
+            AgentRuntimeConfig(data_root=data_root, enable_plugins=False),
         )
         await runtime.start()
         try:

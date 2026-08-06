@@ -46,15 +46,21 @@ def assert_runtime_state(runtime: Runtime, expected: RuntimeState) -> None:
 async def test_runtime_starts_and_stops_in_dependency_order() -> None:
     events: list[str] = []
     client = httpx.AsyncClient()
+    web_client = httpx.AsyncClient()
     first = FakeProvider("first", events)
     second = FakeProvider("second", events)
-    runtime = Runtime((first, second), http_client_factory=lambda: client)
+    runtime = Runtime(
+        (first, second),
+        http_client_factory=lambda: client,
+        web_http_client_factory=lambda: web_client,
+    )
 
     await runtime.start()
     await runtime.start()
 
     assert_runtime_state(runtime, RuntimeState.RUNNING)
     assert runtime.http_client is client
+    assert runtime.web_http_client is web_client
     assert await runtime.is_ready()
 
     await runtime.stop()
@@ -62,6 +68,7 @@ async def test_runtime_starts_and_stops_in_dependency_order() -> None:
 
     assert_runtime_state(runtime, RuntimeState.STOPPED)
     assert client.is_closed
+    assert web_client.is_closed
     assert events == [
         "start:first",
         "start:second",
@@ -75,9 +82,11 @@ async def test_runtime_starts_and_stops_in_dependency_order() -> None:
 async def test_runtime_rolls_back_started_providers_on_failure() -> None:
     events: list[str] = []
     client = httpx.AsyncClient()
+    web_client = httpx.AsyncClient()
     runtime = Runtime(
         (FakeProvider("first", events), FakeProvider("broken", events, fail_start=True)),
         http_client_factory=lambda: client,
+        web_http_client_factory=lambda: web_client,
     )
 
     with pytest.raises(RuntimeStartupError, match="broken"):
@@ -85,7 +94,26 @@ async def test_runtime_rolls_back_started_providers_on_failure() -> None:
 
     assert_runtime_state(runtime, RuntimeState.FAILED)
     assert client.is_closed
+    assert web_client.is_closed
     assert events == ["start:first", "start:broken", "stop:first"]
+
+
+async def test_runtime_closes_provider_client_when_web_client_creation_fails() -> None:
+    client = httpx.AsyncClient()
+
+    def fail_web_client() -> httpx.AsyncClient:
+        raise OSError("fixture web client startup failed")
+
+    runtime = Runtime(
+        http_client_factory=lambda: client,
+        web_http_client_factory=fail_web_client,
+    )
+
+    with pytest.raises(RuntimeStartupError, match="web-http-client"):
+        await runtime.start()
+
+    assert client.is_closed
+    assert_runtime_state(runtime, RuntimeState.FAILED)
 
 
 async def test_provider_registration_is_unique_and_pre_start_only() -> None:

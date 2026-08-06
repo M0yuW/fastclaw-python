@@ -121,6 +121,54 @@ def final_round() -> tuple[ProviderEvent, ...]:
     )
 
 
+def batch_tool_round() -> tuple[ProviderEvent, ...]:
+    return (
+        ProviderEvent(
+            type=ProviderEventType.TOOL_CALL_DELTA,
+            tool_index=0,
+            tool_name="batch_echo",
+            tool_arguments='{"text":"first"}',
+        ),
+        ProviderEvent(
+            type=ProviderEventType.TOOL_CALL_DELTA,
+            tool_index=1,
+            tool_name="batch_echo",
+            tool_arguments='{"text":"second"}',
+        ),
+        ProviderEvent(type=ProviderEventType.DONE, finish_reason="tool_calls"),
+    )
+
+
+class BatchEchoTool:
+    definition = ToolDefinition(
+        function=ToolFunction(
+            name="batch_echo",
+            parameters={
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+        )
+    )
+
+    def __init__(self) -> None:
+        self.batches: list[tuple[str, ...]] = []
+
+    async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
+        del arguments, context
+        raise AssertionError("batch-capable tool was executed serially")
+
+    async def execute_many(
+        self,
+        arguments: tuple[dict[str, Any], ...],
+        context: ExecutionContext,
+    ) -> tuple[ToolResult, ...]:
+        del context
+        texts = tuple(str(item["text"]) for item in arguments)
+        self.batches.append(texts)
+        return tuple(ToolResult(content=text.upper()) for text in texts)
+
+
 def test_chat_request_cannot_carry_tenant_identity() -> None:
     with pytest.raises(ValidationError, match="userId"):
         AgentRunRequest.model_validate({"model": "fixture", "message": "hello", "userId": "forged"})
@@ -163,6 +211,34 @@ async def test_react_loop_calls_provider_once_per_round_and_persists_final_histo
         "assistant",
     ]
     assert saved.messages[1]["_raw"]["tool_calls"][0]["function"]["name"] == "echo"
+
+
+@pytest.mark.asyncio
+async def test_react_loop_uses_ordered_batch_protocol_for_one_model_round() -> None:
+    provider = ScriptedProvider([batch_tool_round(), final_round()])
+    persistence = StubPersistence()
+    tool = BatchEchoTool()
+    stream = AgentRunner(provider, ToolRegistry([tool]), persistence).stream(
+        AgentRunRequest(model="fixture", message="batch"),
+        run_context(),
+    )
+
+    events = [event async for event in stream]
+
+    assert stream.result().content == "finished"
+    assert tool.batches == [("first", "second")]
+    assert [event.type for event in events] == [
+        AgentEventType.TOOL_CALL,
+        AgentEventType.TOOL_CALL,
+        AgentEventType.TOOL_RESULT,
+        AgentEventType.TOOL_RESULT,
+        AgentEventType.CONTENT_DELTA,
+        AgentEventType.CONTENT,
+        AgentEventType.DONE,
+    ]
+    assert [
+        message.content for message in provider.requests[1].messages if message.role.value == "tool"
+    ] == ["FIRST", "SECOND"]
 
 
 class BlockingProvider(ScriptedProvider):

@@ -5,13 +5,13 @@ from __future__ import annotations
 from typing import Any
 
 from fastclaw.execution import ExecutionContext
-from fastclaw.orchestration.bus import InProcessMessageBus
+from fastclaw.orchestration.bus import DelegationRequest, MessageBus
 from fastclaw.providers import ToolDefinition, ToolFunction
 from fastclaw.tools import ToolResult
 
 
 class SpawnSubagentTool:
-    def __init__(self, bus: InProcessMessageBus) -> None:
+    def __init__(self, bus: MessageBus) -> None:
         self._bus = bus
         self.definition = ToolDefinition(
             function=ToolFunction(
@@ -38,3 +38,42 @@ class SpawnSubagentTool:
             content=result.value,
             metadata={"correlationId": result.correlation_id},
         )
+
+    async def execute_many(
+        self,
+        arguments: tuple[dict[str, Any], ...],
+        context: ExecutionContext,
+    ) -> tuple[ToolResult, ...]:
+        requests: list[DelegationRequest] = []
+        request_indexes: list[int] = []
+        results: list[ToolResult | None] = [None] * len(arguments)
+        for index, item in enumerate(arguments):
+            agent_id = item.get("agent_id")
+            task = item.get("task")
+            if not isinstance(agent_id, str) or not agent_id or not isinstance(task, str):
+                results[index] = ToolResult(
+                    content="invalid delegation arguments",
+                    is_error=True,
+                )
+                continue
+            requests.append(DelegationRequest(agent_id=agent_id, task=task))
+            request_indexes.append(index)
+
+        outcomes = await self._bus.batch(context, requests)
+        for index, outcome in zip(request_indexes, outcomes, strict=True):
+            if outcome.result is not None:
+                results[index] = ToolResult(
+                    content=outcome.result.value,
+                    metadata={"correlationId": outcome.result.correlation_id},
+                )
+                continue
+            assert outcome.error is not None
+            results[index] = ToolResult(
+                content=f"{outcome.error.code}: {outcome.error.message}",
+                is_error=True,
+                metadata={
+                    "errorCode": outcome.error.code,
+                    "correlationId": outcome.error.correlation_id,
+                },
+            )
+        return tuple(result for result in results if result is not None)

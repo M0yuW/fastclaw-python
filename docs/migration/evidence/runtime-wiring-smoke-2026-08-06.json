@@ -1,0 +1,71 @@
+{
+  "schemaVersion": 1,
+  "executedAt": "2026-08-06T14:34:00+08:00",
+  "candidate": {
+    "baseCommit": "4f1df925994aca92de56b29d7cd23e528fa96445",
+    "branch": "codex/completion-audit",
+    "gatewayBaseUrl": "http://127.0.0.1:18955",
+    "providerBaseUrl": "http://127.0.0.1:19002/v1"
+  },
+  "isolation": {
+    "database": "sqlite online backup in a disposable directory",
+    "assets": "copy-on-write clone including prepared Skill environments",
+    "provider": "deterministic local OpenAI-compatible SSE fixture",
+    "sharedWithRunningPython": false,
+    "sharedWithGo": false,
+    "usedProductionCredentials": false
+  },
+  "scenarios": [
+    {
+      "name": "finance-production",
+      "coordinator": "coordinator",
+      "delegatedAgents": 2,
+      "toolCalls": 2,
+      "toolResults": 2,
+      "persistedAgentSessions": 3,
+      "doneEvents": 1
+    },
+    {
+      "name": "worldcup-production",
+      "coordinator": "coordinator-wc",
+      "delegatedAgents": 6,
+      "toolCalls": 7,
+      "toolResults": 7,
+      "persistedAgentSessions": 7,
+      "worldcupLedgerDirectReturn": true,
+      "doneEvents": 1
+    },
+    {
+      "name": "finance-benchmark",
+      "coordinator": "Finance Research Coordinator",
+      "delegatedAgents": 5,
+      "toolCalls": 5,
+      "toolResults": 5,
+      "persistedAgentSessions": 6,
+      "doneEvents": 1
+    },
+    {
+      "name": "runtime-benchmark",
+      "coordinator": "Runtime Benchmark Coordinator",
+      "delegatedAgents": 4,
+      "toolCalls": 4,
+      "toolResults": 4,
+      "persistedAgentSessions": 5,
+      "doneEvents": 1
+    }
+  ],
+  "invariants": {
+    "toolCallResultPairsMatched": true,
+    "activeTasksAfterCompletion": 0,
+    "crossTenantSessions": 0,
+    "duplicateDoneEvents": 0,
+    "abortObservedContentDelta": true,
+    "activeTasksAfterAbort": 0,
+    "partialAssistantPersistedAfterAbort": false
+  },
+  "limitations": [
+    "This proves the migrated profiles, Gateway, SSE, MessageBus, TaskQueue, persistence, direct-return and cancellation wiring without production secrets.",
+    "The Provider responses and specialist results are deterministic fixtures, not real DeepSeek or OpenRouter output.",
+    "Finance market data, World Cup ODDS access and production-quality benchmark answers remain blocked on rotated credentials."
+  ]
+}

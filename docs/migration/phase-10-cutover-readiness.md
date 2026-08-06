@@ -1,8 +1,8 @@
 # 后续开发计划：切换就绪与遗留收口
 
 - 制定日期：2026-08-06
-- 当前分支：`codex/cutover-verification`（从已合并的 `main@e0ba077` 创建）
-- 当前基线：PR #1–#13 已合并；Python 18954 正在运行
+- 当前分支：`codex/completion-audit`（从已合并的 `main@4f1df92` 创建）
+- 当前基线：PR #1–#14 已合并；Python 18954 正在运行
 - 参考 Go 实现：`792417b86b5c12af1b99364865217a74f4d52f38`（只读）
 
 本文档接续 `phase-1` 至 `phase-9`。前九阶段和合并工作已经完成；当前主题是把
@@ -17,13 +17,13 @@
 
 | 项目 | 结果 |
 |---|---|
-| `pytest -q` | 129 passed, 1 skipped（PostgreSQL 本机无服务） |
+| `pytest -q` | 142 passed, 1 skipped（PostgreSQL 本机无服务） |
 | `ruff check .` | All checks passed |
-| `ruff format --check .` | 108 files already formatted |
-| `mypy` | Success: no issues found in 81 source files |
+| `ruff format --check .` | 112 files already formatted |
+| `mypy` | Success: no issues found in 83 source files |
 | `alembic upgrade head` + `alembic check` | 升级至 `20260805_01`，无漂移 |
 | `scripts/verify_web_snapshot.py` | 86 unchanged + 4 declared overlays + 4 attributed additions |
-| 分支状态 | 无 upstream，未 rebase，未 force push |
+| 分支状态 | 从 `main@4f1df92` 追加提交，未 rebase，未 force push |
 
 抽查确认到位的修复：
 
@@ -113,16 +113,16 @@
 
 ## 4. 阶段 I：合并现有堆叠（已完成）
 
-PR #1–#13 已按 `#9 → #10 → #11 → #12 → #13` 全部合并。每一级均把最新
+PR #1–#14 已按 `#9 → #10 → #11 → #12 → #13 → #14` 全部合并。每一级均把最新
 `main` 以 merge commit 向前合入、retarget 到 `main` 并重跑 CI；全程没有 rebase
-或 force push。最终 `main` 为 `e0ba077`。
+或 force push。当前 `main` 为 `4f1df92`。
 
 - 每次父 PR 合并后，子 PR 均已 retarget 并重跑 Python 3.12/3.13/3.14、Web、
   Alembic、快照及该分支可用的后续门禁。
 - 最终 #13 在 `main` 基线上通过 PostgreSQL、package、Docker、security 与
   Playwright 在内的 9/9 CI。
 
-**验收**：已完成，`main@e0ba077` 工作树可干净检出。
+**验收**：已完成，`main@4f1df92` 工作树可干净检出。
 
 ---
 
@@ -150,6 +150,13 @@ credential 清空状态；任何 blocker 都返回退出码 2。审计会启动 
 会把该路径交给 SPA，而不是 JSON API；默认 fixture 已改为真实可执行的共同端点。
 本轮仅关闭未认证基础探针，认证 Agent/chat、SSE、Provider、工具与取消仍待凭据。
 
+同日又在 disposable Python 副本的 18955 上，用只写入副本的一次性 Web session
+完成认证 API smoke：管理员身份、2 用户、M0yuW 的 13 Agent、只读 actAs 下的
+benchmark 14 Agent，以及 coordinator 的 5 个 Session 均通过。该验证不使用旧密码
+或 API key，证据见 `evidence/authenticated-api-smoke-2026-08-06.json`。因此认证读取
+链已关闭。随后在同一隔离策略下以确定性 Provider 跑通认证 chat/SSE、工具和取消；
+真实双服务认证差分与真实 Provider 行为仍待轮换后凭据。
+
 ### J2 · 真实 provider 异常语义
 
 当前 usage / cache token 累加、EOF、畸形 SSE、429/5xx 全部只在 MockTransport 下验过。Phase F 的「Provider EOF/429/5xx 故障矩阵」若同为 mock，则本项状态不变。
@@ -165,6 +172,23 @@ credential 清空状态；任何 blocker 都返回退出码 2。审计会启动 
 - 断言无悬挂 task、无重复 completion、无跨租户访问、无失配 ToolCall 历史。
 
 **验收**：三套 smoke 全绿且上述四项断言成立。
+
+2026-08-06 已先完成不依赖生产凭据的 Runtime wiring smoke。它使用真实迁移 profile
+和 disposable 数据副本，通过本地确定性 OpenAI-compatible SSE Provider 运行：生产
+金融 coordinator、世界杯 coordinator（6 个专家 + 账本 direct-return）、金融
+benchmark coordinator、Runtime benchmark coordinator。18 个 ToolCall/ToolResult
+全部配对，每条流恰好一个 done，跨租户 Session 为 0，结束后活动任务为 0；另以慢流
+验证 HTTP Abort 后 Provider/任务取消且残缺 assistant 不落库。证据见
+`evidence/runtime-wiring-smoke-2026-08-06.json`。
+
+这关闭的是 Runtime/Gateway 接线门禁，不替代真实 DeepSeek/OpenRouter/ODDS 的业务
+结果验收；真实三套 smoke 仍是阶段 K 前置。
+
+复现入口为 `scripts/fixture_multiagent_provider.py` 与
+`scripts/cutover_wiring_smoke.py`。后者会写入测试 Session，必须显式传入
+`--acknowledge-disposable-copy`，且硬拒绝默认 Go/Python live 数据库路径；两个脚本均
+被 sdist 完整性门禁锁定。session cookie 只应使用写入副本的一次性值，不得使用或
+记录旧账号口令/API key。
 
 ---
 
@@ -197,20 +221,47 @@ credential 清空状态；任何 blocker 都返回退出码 2。审计会启动 
 
 ---
 
-## 8. 未关闭的技术项
+## 8. 技术项收口
 
-### 8.1 WebFetchTool DNS rebinding（低优先，需记录）
+### 8.1 WebFetchTool DNS rebinding（已关闭）
 
-`tools/builtin.py:336-361` 解析主机名并检查全部返回地址 `is_global`，随后 `self._client.stream("GET", url, ...)` 用**主机名**再发一次请求——校验与连接是两次独立 DNS 查询。攻击者控制权威 DNS、返回短 TTL、第一次给公网 IP、第二次给 `169.254.169.254`，即可绕过。
+旧实现先解析并检查全部地址，再让 HTTPX 按主机名做第二次 DNS 查询，存在
+DNS rebinding 窗口。现已为 WebFetch 配置独立的、禁用环境代理的 HTTP client：
 
-当前实现已挡住绝大多数现实攻击（直接给内网 IP、`localhost`、解析到内网的域名），rebinding 需要攻击者控制权威 DNS。
+- 每一跳先解析，任一地址非公网即拒绝；
+- 已验证的地址通过 `ContextVar` 绑定到当前请求；
+- 自定义 httpcore network backend 只向这些 IP 建立 TCP 连接，不再次解析域名；
+- 原主机名继续用于 HTTP `Host`、TLS SNI 与证书校验；
+- 无 pin 的连接和 Unix socket fail closed，HTTP/2 与环境代理关闭；
+- Provider 继续使用原共享 client，不受 WebFetch 安全 transport 影响。
 
-- 修法：把校验通过的 IP 钉到连接上——连 IP、`Host` 头带原主机名，HTTPS 下 SNI 显式设为主机名；或用自定义 transport / resolver 钩子复用首次解析结果。
-- 状态：backlog，**不得记为已关闭**。
+测试锁定 TCP 目标、多个公网 IP fallback、无 pin 拒绝、Host/SNI 保真、私网和逐跳
+重定向拒绝。状态：**已关闭**。
 
 ### 8.2 Phase B 门禁需加强
 
 原路线的「benchmark coordinator 能通过 Mock Provider 调用指定 specialist」只覆盖 happy path。真正该守的是身份不可伪造，已在 G3 中补齐；本条在 G3 完成后关闭。
+
+### 8.3 启动失败与 shutdown 清理（已关闭）
+
+Lifespan 现用 `AsyncExitStack` 在启动阶段逐项注册逆序清理；Agent manager 尚未完成
+启动就失败时，也会尝试停止 bus/plugin、关闭 Provider/WebFetch 两个 HTTP client
+并释放数据库。manager shutdown 会收集单项清理异常，继续关闭其余资源后统一报告。
+
+### 8.4 同轮多 Agent 委派（已关闭）
+
+底层 `MessageBus.batch()` 原本已并发、保序并脱敏错误，但 `AgentRunner` 未调用它，
+所以模型同轮发出的多个委派仍会串行。现新增显式 `BatchTool` 协议，仅安全声明该能力
+的工具可批量执行；`spawn_subagent` 将请求交给 `MessageBus.batch()`。不同目标并行、
+同目标仍受队列 FIFO 约束，结果按 ToolCall 输入顺序写回。文件、exec、账本等普通工具
+继续串行，避免隐式扩大副作用。
+
+### 8.5 Provider 核对命令的只读语义（已关闭）
+
+凭据核对只需要 Agent profile、Provider 选择和 Skill 状态，旧实现仍会启动 finance
+plugin，从而执行状态库 migration。`fastclaw providers check` 现以
+`enable_plugins=False` 加载 manager，plugin 不启动、不写状态库；正式 Gateway 与
+`fastclaw cutover audit` 保持 plugin 启用。回归测试锁定该差异。
 
 ---
 

@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "executedAt": "2026-08-06T14:05:00+08:00",
+  "candidate": {
+    "baseCommit": "4f1df925994aca92de56b29d7cd23e528fa96445",
+    "branch": "codex/completion-audit",
+    "baseUrl": "http://127.0.0.1:18955"
+  },
+  "data": {
+    "database": "sqlite online backup in a disposable directory",
+    "assets": "copy-on-write clone including agents, workspaces, skills, skill-envs and plugin data",
+    "sharedWithRunningPython": false,
+    "sharedWithGo": false
+  },
+  "authentication": {
+    "method": "cookie",
+    "fixture": "synthetic Web session inserted only into the disposable database",
+    "usedPassword": false,
+    "usedApiKey": false
+  },
+  "results": {
+    "users": 2,
+    "adminRole": "super_admin",
+    "productionAgents": 13,
+    "benchmarkAgentsViaReadOnlyActAs": 14,
+    "productionAgentNamesMatched": true,
+    "benchmarkAgentNamesMatched": true,
+    "coordinatorSessions": 5,
+    "requiredSkillEnvironmentsPrepared": true,
+    "financePluginRunning": true,
+    "financePluginTools": 17,
+    "foreignKeyErrors": 0
+  },
+  "remainingBlockers": [
+    "DeepSeek Provider credential is not configured.",
+    "OpenRouter Provider credential is not configured.",
+    "ODDS_API_KEY is not configured.",
+    "Authenticated chat/SSE and finance, World Cup and benchmark workflow smoke were not run."
+  ]
+}

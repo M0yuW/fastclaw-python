@@ -1,6 +1,7 @@
 """Single-agent runtime public API."""
 
 from fastclaw.agent.manager import (
+    AgentManagerShutdownError,
     AgentRuntimeConfig,
     AgentRuntimeManager,
     AgentRuntimeProfile,
@@ -14,6 +15,7 @@ from fastclaw.agent.runner import AgentRunner, AgentStream
 __all__ = [
     "AgentEvent",
     "AgentEventType",
+    "AgentManagerShutdownError",
     "AgentRunError",
     "AgentRunRequest",
     "AgentRunner",

@@ -8,7 +8,11 @@ from pathlib import Path
 import httpx
 import pytest
 
-from fastclaw.agent.manager import AgentRuntimeConfig, AgentRuntimeManager
+from fastclaw.agent.manager import (
+    AgentManagerShutdownError,
+    AgentRuntimeConfig,
+    AgentRuntimeManager,
+)
 from fastclaw.providers import (
     ChatRequest,
     ChatResponse,
@@ -142,6 +146,63 @@ async def close_manager(manager: AgentRuntimeManager, runtime: Runtime, database
     await manager.stop()
     await runtime.stop()
     await database.close()
+
+
+async def test_manager_shutdown_attempts_plugin_cleanup_after_bus_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'shutdown.db'}")
+    runtime = Runtime()
+    manager = AgentRuntimeManager(database, runtime, AgentRuntimeConfig(data_root=tmp_path))
+    plugin_stopped = False
+
+    async def fail_bus_shutdown() -> None:
+        raise OSError("fixture bus shutdown failed")
+
+    async def track_plugin_stop() -> None:
+        nonlocal plugin_stopped
+        plugin_stopped = True
+
+    monkeypatch.setattr(manager.bus, "shutdown", fail_bus_shutdown)
+    monkeypatch.setattr(manager.plugin_manager, "stop", track_plugin_stop)
+
+    with pytest.raises(AgentManagerShutdownError) as error:
+        await manager.stop()
+
+    assert plugin_stopped
+    assert len(error.value.errors) == 1
+    assert isinstance(error.value.errors[0], OSError)
+
+
+async def test_manager_can_load_profiles_without_starting_plugins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'read-only-check.db'}")
+    await database.create_schema()
+    runtime = Runtime()
+    await runtime.start()
+    manager = AgentRuntimeManager(
+        database,
+        runtime,
+        AgentRuntimeConfig(data_root=tmp_path, enable_plugins=False),
+    )
+
+    async def unexpected_plugin_start() -> None:
+        raise AssertionError("read-only profile inspection started plugins")
+
+    monkeypatch.setattr(manager.plugin_manager, "start", unexpected_plugin_start)
+    try:
+        await manager.start()
+
+        assert manager.started
+        assert manager.plugin_manager.enabled == set()
+        assert all(not instance.process.running for instance in manager.plugin_manager.instances)
+    finally:
+        await manager.stop()
+        await runtime.stop()
+        await database.close()
 
 
 async def test_root_and_nested_runs_share_queue_without_deadlock(tmp_path: Path) -> None:

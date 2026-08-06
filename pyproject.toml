@@ -26,6 +26,7 @@ dependencies = [
   "asyncpg>=0.30,<1.0",
   "bcrypt>=4.3,<6.0",
   "fastapi>=0.116,<1.0",
+  "httpcore>=1.0.9,<1.1",
   "httpx>=0.28,<1.0",
   "pydantic>=2.11,<3.0",
   "python-multipart>=0.0.20,<1.0",
@@ -96,6 +97,8 @@ select = ["ASYNC", "B", "E", "F", "I", "RUF", "UP"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["ASYNC230"]
+"tests/test_tools.py" = ["ASYNC109", "ASYNC230"]
+"src/fastclaw/network.py" = ["ASYNC109"]
 "plugins/finance-tools/*.py" = ["E501", "RUF001"]
 
 [tool.mypy]

@@ -20,10 +20,18 @@ import anyio
 import httpx
 
 from fastclaw.execution import ExecutionContext
+from fastclaw.network import pinned_network_target
 from fastclaw.providers import ToolDefinition, ToolFunction
 from fastclaw.tools.base import ToolResult
 
 HostResolver = Callable[[str, int], Awaitable[Sequence[str]]]
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicTarget:
+    host: str
+    port: int
+    addresses: tuple[str, ...]
 
 
 class ReadFileTool:
@@ -311,40 +319,42 @@ class WebFetchTool:
         del context
         url = str(arguments["url"])
         for redirect_index in range(self._max_redirects + 1):
-            denial = await self._validate_public_url(url)
+            target, denial = await self._validate_public_url(url)
             if denial:
                 return ToolResult(content=denial, is_error=True)
-            async with self._client.stream("GET", url, follow_redirects=False) as response:
-                if response.is_redirect:
-                    location = response.headers.get("location")
-                    if not location:
-                        return ToolResult(content="redirect has no location", is_error=True)
-                    if redirect_index == self._max_redirects:
-                        return ToolResult(content="redirect limit exceeded", is_error=True)
-                    url = urljoin(str(response.url), location)
-                    continue
-                response.raise_for_status()
-                body = bytearray()
-                async for chunk in response.aiter_bytes():
-                    remaining = self._max_bytes - len(body)
-                    body.extend(chunk[:remaining])
-                    if len(chunk) > remaining:
-                        return ToolResult(content="response exceeds size limit", is_error=True)
-                return ToolResult(content=body.decode(errors="replace"))
+            assert target is not None
+            with pinned_network_target(target.host, target.port, target.addresses):
+                async with self._client.stream("GET", url, follow_redirects=False) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            return ToolResult(content="redirect has no location", is_error=True)
+                        if redirect_index == self._max_redirects:
+                            return ToolResult(content="redirect limit exceeded", is_error=True)
+                        url = urljoin(str(response.url), location)
+                        continue
+                    response.raise_for_status()
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        remaining = self._max_bytes - len(body)
+                        body.extend(chunk[:remaining])
+                        if len(chunk) > remaining:
+                            return ToolResult(content="response exceeds size limit", is_error=True)
+                    return ToolResult(content=body.decode(errors="replace"))
         raise AssertionError("redirect loop terminated unexpectedly")
 
-    async def _validate_public_url(self, url: str) -> str:
+    async def _validate_public_url(self, url: str) -> tuple[_PublicTarget | None, str]:
         parsed = urlsplit(url)
         if parsed.scheme not in {"http", "https"}:
-            return "URL scheme is denied"
+            return None, "URL scheme is denied"
         if parsed.username is not None or parsed.password is not None:
-            return "URL credentials are denied"
+            return None, "URL credentials are denied"
         if parsed.hostname is None:
-            return "URL host is required"
+            return None, "URL host is required"
         try:
             port = parsed.port or (443 if parsed.scheme == "https" else 80)
         except ValueError:
-            return "URL port is invalid"
+            return None, "URL port is invalid"
         try:
             literal = ipaddress.ip_address(parsed.hostname)
             addresses: Sequence[str] = (str(literal),)
@@ -352,15 +362,15 @@ class WebFetchTool:
             try:
                 addresses = tuple(await self._resolver(parsed.hostname, port))
             except OSError:
-                return "URL host could not be resolved"
+                return None, "URL host could not be resolved"
         if not addresses:
-            return "URL host could not be resolved"
+            return None, "URL host could not be resolved"
         try:
             if any(not ipaddress.ip_address(address).is_global for address in addresses):
-                return "URL host resolves to a non-public address"
+                return None, "URL host resolves to a non-public address"
         except ValueError:
-            return "URL host resolver returned an invalid address"
-        return ""
+            return None, "URL host resolver returned an invalid address"
+        return _PublicTarget(parsed.hostname, port, tuple(addresses)), ""
 
     @staticmethod
     async def _resolve_host(host: str, port: int) -> Sequence[str]:

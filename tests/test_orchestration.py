@@ -79,6 +79,77 @@ async def test_spawn_subagent_ignores_model_supplied_identity() -> None:
 
 
 @pytest.mark.asyncio
+async def test_spawn_subagent_batch_runs_different_targets_in_parallel_and_keeps_order() -> None:
+    bus = InProcessMessageBus(AsyncTaskQueue(max_concurrent=2))
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+    started: set[str] = set()
+
+    async def handler(task: str, child: ExecutionContext) -> str:
+        del child
+        started.add(task)
+        if len(started) == 2:
+            both_started.set()
+        await release.wait()
+        return task.upper()
+
+    bus.register(user_id="user-1", agent_id="left", handler=handler)
+    bus.register(user_id="user-1", agent_id="right", handler=handler)
+    tool = SpawnSubagentTool(bus)
+    pending = asyncio.create_task(
+        tool.execute_many(
+            (
+                {"agent_id": "left", "task": "first"},
+                {"agent_id": "right", "task": "second"},
+            ),
+            context(),
+        )
+    )
+    try:
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        release.set()
+        results = await pending
+
+        assert [result.content for result in results] == ["FIRST", "SECOND"]
+        assert all(not result.is_error for result in results)
+    finally:
+        release.set()
+        if not pending.done():
+            pending.cancel()
+        await bus.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_spawn_subagent_batch_isolates_and_sanitizes_item_errors() -> None:
+    bus = InProcessMessageBus()
+
+    async def failure(task: str, child: ExecutionContext) -> str:
+        del task, child
+        raise RuntimeError("database /private/secret.db on internal.example failed")
+
+    bus.register(user_id="user-1", agent_id="failure", handler=failure)
+    tool = SpawnSubagentTool(bus)
+    try:
+        results = await tool.execute_many(
+            (
+                {"agent_id": "failure", "task": "first"},
+                {"agent_id": "missing", "task": "second"},
+                {"agent_id": "", "task": "third"},
+            ),
+            context(),
+        )
+
+        assert [result.is_error for result in results] == [True, True, True]
+        assert "handler_error: delegated task failed" in results[0].content
+        assert "unknown_agent: target agent is unavailable" == results[1].content
+        assert results[2].content == "invalid delegation arguments"
+        assert all("/private" not in result.content for result in results)
+        assert all("internal.example" not in result.content for result in results)
+    finally:
+        await bus.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_nested_delegation_does_not_deadlock_at_max_concurrent_one() -> None:
     bus = InProcessMessageBus(AsyncTaskQueue(max_concurrent=1))
 

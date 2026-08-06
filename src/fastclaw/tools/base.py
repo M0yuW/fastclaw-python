@@ -25,3 +25,14 @@ class Tool(Protocol):
     def definition(self) -> ToolDefinition: ...
 
     async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult: ...
+
+
+@runtime_checkable
+class BatchTool(Tool, Protocol):
+    """A tool that can safely execute one model round as an ordered batch."""
+
+    async def execute_many(
+        self,
+        arguments: tuple[dict[str, Any], ...],
+        context: ExecutionContext,
+    ) -> tuple[ToolResult, ...]: ...

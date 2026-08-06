@@ -163,9 +163,41 @@ class AgentRunner:
                         yield event(AgentEventType.DONE, message=assistant)
                         return
 
-                    for call in assistant.tool_calls:
+                    parsed_calls = [self._parse_arguments(call) for call in assistant.tool_calls]
+                    call_names = tuple(call.function.name for call in assistant.tool_calls)
+                    if all(not error for _, error in parsed_calls) and self._tools.supports_batch(
+                        call_names, allowed=request.allowed_tools
+                    ):
+                        for call in assistant.tool_calls:
+                            yield event(AgentEventType.TOOL_CALL, tool_call=call)
+                        batch_results = await self._tools.execute_batch(
+                            call_names[0],
+                            tuple(arguments for arguments, _ in parsed_calls),
+                            context,
+                            allowed=request.allowed_tools,
+                            timeout_seconds=request.tool_timeout,
+                        )
+                        for call, result in zip(assistant.tool_calls, batch_results, strict=True):
+                            history.append(
+                                ChatMessage(
+                                    role=MessageRole.TOOL,
+                                    content=result.content,
+                                    tool_call_id=call.id,
+                                    name=call.function.name,
+                                )
+                            )
+                            yield event(
+                                AgentEventType.TOOL_RESULT,
+                                tool_call=call,
+                                tool_result=result.content,
+                                is_error=result.is_error,
+                            )
+                        continue
+
+                    for call, (arguments, parse_error) in zip(
+                        assistant.tool_calls, parsed_calls, strict=True
+                    ):
                         yield event(AgentEventType.TOOL_CALL, tool_call=call)
-                        arguments, parse_error = self._parse_arguments(call)
                         if parse_error:
                             result_content = parse_error
                             is_error = True
