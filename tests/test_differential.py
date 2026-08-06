@@ -53,6 +53,27 @@ async def test_differential_can_compare_status_for_legacy_plain_text_probe() -> 
     assert result["contract"] == "status-only"
 
 
+async def test_status_comparison_still_enforces_terminal_task_invariant() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = "running" if request.url.host == "go.test" else "completed"
+        return httpx.Response(200, json=[{"id": "task-1", "status": status}])
+
+    transport = httpx.MockTransport(handler)
+    case = DifferentialCase(
+        "tasks",
+        "GET",
+        "/api/tasks",
+        comparison="status",
+        require_terminal_tasks=True,
+    )
+    async with (
+        httpx.AsyncClient(base_url="https://go.test", transport=transport) as go,
+        httpx.AsyncClient(base_url="https://python.test", transport=transport) as python,
+    ):
+        with pytest.raises(DifferentialMismatch, match="non-terminal"):
+            await run_case(go, python, case)
+
+
 async def test_differential_can_compare_selected_semantics_across_legacy_shapes() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "go.test":

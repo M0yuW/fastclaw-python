@@ -17,8 +17,8 @@
       "sha256": "126d4b29dbafc2e69aea2933a7857f1236fcfc50a4cd38dfccbc0d56cb352940"
     },
     "src/lib/api.ts": {
-      "reason": "Read-only actAs propagation to Python API calls",
-      "sha256": "c8d60560a27c080eb0a3cc465663bc12c0d3877e8b2e922a9d25f3d54ac1446e"
+      "reason": "Read-only actAs propagation and locked Go chat reply contract",
+      "sha256": "af62af7befb50778c252957f3d73ae4f2a1c79a160e445b252f70acfc5d3c14e"
     }
   },
   "referenceCommit": "792417b86b5c12af1b99364865217a74f4d52f38"

@@ -190,6 +190,7 @@ def _web_event(event: AgentEvent) -> dict[str, Any]:
     }
     if event.type is AgentEventType.CONTENT_DELTA:
         data["delta"] = event.content
+        data["content"] = event.content
     elif event.type is AgentEventType.CONTENT:
         data["content"] = event.content
     elif event.type is AgentEventType.TOOL_CALL and event.tool_call is not None:
@@ -202,6 +203,8 @@ def _web_event(event: AgentEvent) -> dict[str, Any]:
         )
     elif event.type is AgentEventType.TOOL_RESULT:
         data["result"] = event.tool_result
+        if event.tool_metadata:
+            data["metadata"] = event.tool_metadata
         if event.tool_call is not None:
             data["id"] = event.tool_call.id
             data["name"] = event.tool_call.function.name
@@ -1274,10 +1277,16 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
 
     @router.get("/api/tasks")
     async def tasks(auth: AuthContext = auth_dependency) -> list[dict[str, Any]]:
-        if auth.identity.role != "super_admin" or auth.identity.auth_method == "apikey":
+        identity = auth.identity
+        if identity.auth_method != "apikey" and identity.role != "super_admin":
             raise HTTPException(status.HTTP_403_FORBIDDEN, "admin required")
         result: list[dict[str, Any]] = []
         for task in gateway.agent_manager.recent_tasks():
+            if identity.auth_method == "apikey" and (
+                task.user_id != identity.effective_user_id
+                or task.agent_id not in identity.api_key_agents
+            ):
+                continue
             item: dict[str, Any] = {
                 "id": task.id,
                 "agentId": task.agent_id,
@@ -1483,7 +1492,7 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             session_id=payload.session_id,
             message=payload.message,
         )
-        return {"response": str(message.content or "")}
+        return {"reply": str(message.content or "")}
 
     @router.post("/api/chat/stream")
     async def chat_stream(

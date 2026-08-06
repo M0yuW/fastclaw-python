@@ -190,6 +190,7 @@ class AgentRunner:
                                 AgentEventType.TOOL_RESULT,
                                 tool_call=call,
                                 tool_result=result.content,
+                                tool_metadata=result.metadata,
                                 is_error=result.is_error,
                             )
                         continue
@@ -198,6 +199,7 @@ class AgentRunner:
                         assistant.tool_calls, parsed_calls, strict=True
                     ):
                         yield event(AgentEventType.TOOL_CALL, tool_call=call)
+                        result_metadata: dict[str, Any] = {}
                         if parse_error:
                             result_content = parse_error
                             is_error = True
@@ -212,6 +214,7 @@ class AgentRunner:
                             result_content = result.content
                             is_error = result.is_error
                             direct_return = result.direct_return
+                            result_metadata = result.metadata
                         if parse_error:
                             direct_return = False
                         history.append(
@@ -226,6 +229,7 @@ class AgentRunner:
                             AgentEventType.TOOL_RESULT,
                             tool_call=call,
                             tool_result=result_content,
+                            tool_metadata=result_metadata,
                             is_error=is_error,
                         )
                         if direct_return and not is_error:

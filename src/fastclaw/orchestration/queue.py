@@ -44,6 +44,7 @@ class JobState(StrEnum):
 @dataclass(frozen=True, slots=True)
 class TaskSnapshot:
     id: str
+    user_id: str
     agent_id: str
     chat_key: str
     status: str
@@ -323,6 +324,7 @@ class AsyncTaskQueue:
     ) -> TaskSnapshot:
         return TaskSnapshot(
             id=f"task-{job.generation}",
+            user_id=job.target[0],
             agent_id=job.target[1],
             chat_key=job.root_execution_id,
             status=status,

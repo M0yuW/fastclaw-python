@@ -601,6 +601,7 @@ async def test_task_snapshots_keep_safe_recent_terminal_state() -> None:
     await asyncio.sleep(0)
 
     snapshots = queue.recent_tasks()
+    assert snapshots[0].user_id == "user"
     assert len(snapshots) == 1
     assert snapshots[0].agent_id == "agent"
     assert snapshots[0].chat_key == "root"

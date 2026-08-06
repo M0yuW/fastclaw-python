@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 from fastapi import FastAPI
@@ -14,6 +15,7 @@ from fastclaw.app import create_app
 from fastclaw.gateway import GatewaySettings
 from fastclaw.gateway.router import _web_event
 from fastclaw.identity import hash_api_key, hash_password
+from fastclaw.orchestration import TaskSnapshot
 from fastclaw.providers import FunctionCall, ToolCall
 from fastclaw.runtime import Runtime
 from fastclaw.storage import (
@@ -30,7 +32,7 @@ from fastclaw.storage import (
 @asynccontextmanager
 async def gateway_client(
     path: Path, *, transport: httpx.AsyncBaseTransport | None = None
-) -> AsyncIterator[tuple[httpx.AsyncClient, Database]]:
+) -> AsyncIterator[tuple[httpx.AsyncClient, Database, FastAPI]]:
     settings = GatewaySettings(
         database_url=f"sqlite+aiosqlite:///{path}",
         data_root=path.parent / "data",
@@ -52,7 +54,7 @@ async def gateway_client(
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://test"
         ) as client:
-            yield client, database
+            yield client, database, app
 
 
 async def onboard(client: httpx.AsyncClient) -> dict[str, str]:
@@ -96,16 +98,34 @@ def test_sse_tool_result_preserves_call_identity_for_pairing() -> None:
             seq=1,
             tool_call=call,
             tool_result="content",
+            tool_metadata={"sandbox": True},
         )
     )
 
     assert payload["data"]["id"] == "call-1"
     assert payload["data"]["name"] == "read_file"
     assert payload["data"]["result"] == "content"
+    assert payload["data"]["metadata"] == {"sandbox": True}
+
+
+def test_sse_content_delta_preserves_legacy_content_alias() -> None:
+    payload = _web_event(
+        AgentEvent(
+            type=AgentEventType.CONTENT_DELTA,
+            turn_id="turn-1",
+            message_id="message-1",
+            round=0,
+            seq=0,
+            content="delta",
+        )
+    )
+
+    assert payload["data"]["delta"] == "delta"
+    assert payload["data"]["content"] == "delta"
 
 
 async def test_onboard_cookie_auth_status_agents_and_masked_provider(tmp_path: Path) -> None:
-    async with gateway_client(tmp_path / "gateway.db") as (client, database):
+    async with gateway_client(tmp_path / "gateway.db") as (client, database, _app):
         root = await client.get("/")
         before = await client.get("/api/status")
         created = await onboard(client)
@@ -184,8 +204,8 @@ async def test_onboard_cookie_auth_status_agents_and_masked_provider(tmp_path: P
         assert denied.status_code == 401
 
 
-async def test_bearer_api_key_enforces_agent_acl(tmp_path: Path) -> None:
-    async with gateway_client(tmp_path / "acl.db") as (client, database):
+async def test_bearer_api_key_enforces_agent_acl(tmp_path: Path, monkeypatch: Any) -> None:
+    async with gateway_client(tmp_path / "acl.db") as (client, database, app):
         created = await onboard(client)
         now = datetime.now(UTC)
         async with UnitOfWork(database) as unit:
@@ -212,13 +232,47 @@ async def test_bearer_api_key_enforces_agent_acl(tmp_path: Path) -> None:
             await store.set_api_key_agents("key-1", [created["agentId"]])
 
         headers = {"Authorization": "Bearer fc_agent_secret"}
+        task_time = datetime.now(UTC)
+        monkeypatch.setattr(
+            app.state.agent_manager,
+            "recent_tasks",
+            lambda: (
+                TaskSnapshot(
+                    id="allowed-task",
+                    user_id=created["userId"],
+                    agent_id=created["agentId"],
+                    chat_key="allowed-root",
+                    status="completed",
+                    created_at=task_time,
+                ),
+                TaskSnapshot(
+                    id="denied-agent-task",
+                    user_id=created["userId"],
+                    agent_id="agent-denied",
+                    chat_key="denied-root",
+                    status="completed",
+                    created_at=task_time,
+                ),
+                TaskSnapshot(
+                    id="other-user-task",
+                    user_id="other-user",
+                    agent_id=created["agentId"],
+                    chat_key="other-root",
+                    status="completed",
+                    created_at=task_time,
+                ),
+            ),
+        )
         agents = await client.get("/api/agents", headers=headers)
         allowed = await client.get(f"/api/agents/{created['agentId']}", headers=headers)
         denied = await client.get("/api/agents/agent-denied", headers=headers)
+        tasks = await client.get("/api/tasks", headers=headers)
 
         assert [item["id"] for item in agents.json()["agents"]] == [created["agentId"]]
         assert allowed.status_code == 200
         assert denied.status_code == 404
+        assert tasks.status_code == 200
+        assert [item["id"] for item in tasks.json()] == ["allowed-task"]
 
 
 async def test_chat_stream_and_history_use_configured_provider(tmp_path: Path) -> None:
@@ -241,7 +295,11 @@ async def test_chat_stream_and_history_use_configured_provider(tmp_path: Path) -
         return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
 
     transport = httpx.MockTransport(provider_handler)
-    async with gateway_client(tmp_path / "chat.db", transport=transport) as (client, database):
+    async with gateway_client(tmp_path / "chat.db", transport=transport) as (
+        client,
+        database,
+        _app,
+    ):
         tested = await client.post(
             "/api/test-provider",
             json={
@@ -299,11 +357,20 @@ async def test_chat_stream_and_history_use_configured_provider(tmp_path: Path) -
             "/api/chat/history",
             params={"agentId": created["agentId"], "sessionId": "session-1"},
         )
+        non_stream = await client.post(
+            "/api/chat",
+            json={
+                "agentId": created["agentId"],
+                "sessionId": "session-2",
+                "message": "say hello without streaming",
+            },
+        )
 
         assert tested.json() == {"ok": True}
         assert stored_test.json() == {"ok": True}
         assert response.status_code == 200
-        assert len(imported_prompts) == 1
+        assert non_stream.json() == {"reply": "hello world"}
+        assert len(imported_prompts) == 2
         assert "You are the imported analyst." in imported_prompts[0]
         assert "Name: Imported Analyst" in imported_prompts[0]
         events = [
@@ -325,7 +392,7 @@ async def test_chat_stream_and_history_use_configured_provider(tmp_path: Path) -
 
 
 async def test_admin_act_as_is_tenant_scoped_and_read_only(tmp_path: Path) -> None:
-    async with gateway_client(tmp_path / "admin.db") as (client, database):
+    async with gateway_client(tmp_path / "admin.db") as (client, database, _app):
         created = await onboard(client)
         now = datetime.now(UTC)
         async with UnitOfWork(database) as unit:
@@ -385,7 +452,7 @@ async def test_admin_act_as_is_tenant_scoped_and_read_only(tmp_path: Path) -> No
 
 async def test_agent_system_files_config_and_workspace_listing(tmp_path: Path) -> None:
     database_path = tmp_path / "files.db"
-    async with gateway_client(database_path) as (client, _):
+    async with gateway_client(database_path) as (client, _, _app):
         created = await onboard(client)
         agent_id = created["agentId"]
         base_dir = tmp_path / "data" / "agents" / agent_id
@@ -439,7 +506,7 @@ async def test_agent_system_files_config_and_workspace_listing(tmp_path: Path) -
 
 
 async def test_session_management_config_and_unsupported_envelopes(tmp_path: Path) -> None:
-    async with gateway_client(tmp_path / "sessions.db") as (client, database):
+    async with gateway_client(tmp_path / "sessions.db") as (client, database, _app):
         created = await onboard(client)
         now = datetime.now(UTC)
         async with UnitOfWork(database) as unit:
@@ -494,13 +561,13 @@ async def test_session_management_config_and_unsupported_envelopes(tmp_path: Pat
 
 async def test_plugin_enablement_persists_across_gateway_restart(tmp_path: Path) -> None:
     database_path = tmp_path / "plugin-persistence.db"
-    async with gateway_client(database_path) as (client, _database):
+    async with gateway_client(database_path) as (client, _database, _app):
         await onboard(client)
         await login(client)
         response = await client.put("/api/plugins/finance-tools", json={"enabled": False})
         assert response.status_code == 200
 
-    async with gateway_client(database_path) as (client, _database):
+    async with gateway_client(database_path) as (client, _database, _app):
         await login(client)
         response = await client.get("/api/plugins")
 

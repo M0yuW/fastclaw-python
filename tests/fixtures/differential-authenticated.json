@@ -1,0 +1,63 @@
+{
+  "source": "M0yuW/fastclaw@m0yuw-project:792417b",
+  "authentication": "runtime-specific disposable API keys",
+  "cases": [
+    {
+      "name": "health",
+      "method": "GET",
+      "path": "/healthz",
+      "comparison": "status"
+    },
+    {
+      "name": "status",
+      "method": "GET",
+      "path": "/api/status",
+      "comparison": "selected",
+      "equalPaths": ["configured", "running"]
+    },
+    {
+      "name": "identity",
+      "method": "GET",
+      "path": "/api/me",
+      "comparison": "selected",
+      "equalPaths": ["authMethod", "readOnly", "user.id", "user.role"]
+    },
+    {
+      "name": "allowed-agent",
+      "method": "GET",
+      "path": "/api/agents/finance-solo",
+      "comparison": "selected",
+      "equalPaths": ["agent.id", "agent.name"]
+    },
+    {
+      "name": "chat",
+      "method": "POST",
+      "path": "/api/chat",
+      "body": {
+        "agentId": "finance-solo",
+        "sessionId": "differential-authenticated-chat",
+        "message": "fixed authenticated differential fixture"
+      },
+      "comparison": "selected",
+      "equalPaths": ["reply"]
+    },
+    {
+      "name": "chat-stream",
+      "method": "POST",
+      "path": "/api/chat/stream",
+      "body": {
+        "agentId": "finance-solo",
+        "sessionId": "differential-authenticated-stream",
+        "message": "fixed authenticated differential fixture"
+      },
+      "stream": true
+    },
+    {
+      "name": "terminal-tasks",
+      "method": "GET",
+      "path": "/api/tasks",
+      "comparison": "status",
+      "requireTerminalTasks": true
+    }
+  ]
+}

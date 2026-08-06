@@ -144,7 +144,7 @@ async def capture(
         events = parse_sse(response.text)
         validate_sse(events)
         return CapturedResponse(status_code=response.status_code, events=events)
-    if case.comparison == "status":
+    if case.comparison == "status" and not case.require_terminal_tasks:
         return CapturedResponse(status_code=response.status_code)
     try:
         body = response.json()
@@ -169,6 +169,9 @@ async def run_case(
         raise DifferentialMismatch(
             f"{case.name}: status differs: Go={go.status_code}, Python={python.status_code}"
         )
+    if case.require_terminal_tasks:
+        require_terminal_tasks(go.json_body)
+        require_terminal_tasks(python.json_body)
     if case.comparison == "status":
         return {
             "name": case.name,
@@ -179,9 +182,6 @@ async def run_case(
         }
     if case.comparison not in {"json_shape", "selected"}:
         raise DifferentialMismatch(f"{case.name}: unknown comparison mode")
-    if case.require_terminal_tasks:
-        require_terminal_tasks(go.json_body)
-        require_terminal_tasks(python.json_body)
     go_contract: Any
     python_contract: Any
     if case.comparison == "selected":

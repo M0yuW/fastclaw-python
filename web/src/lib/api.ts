@@ -596,7 +596,7 @@ export async function deleteChatSession(agentId: string, sessionId: string) {
   return res.json();
 }
 
-export async function sendChat(agentId: string, sessionId: string, message: string): Promise<{ response: string }> {
+export async function sendChat(agentId: string, sessionId: string, message: string): Promise<{ reply: string }> {
   const res = await apiFetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
