@@ -48,7 +48,10 @@ async def app_client(app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
 
 
 def gateway_settings(path: Path) -> GatewaySettings:
-    return GatewaySettings(database_url=f"sqlite+aiosqlite:///{path}")
+    return GatewaySettings(
+        database_url=f"sqlite+aiosqlite:///{path}",
+        data_root=path.parent / "data",
+    )
 
 
 async def test_healthz_and_readyz_when_runtime_is_ready(tmp_path: Path) -> None:
@@ -72,6 +75,7 @@ async def test_healthz_and_readyz_when_runtime_is_ready(tmp_path: Path) -> None:
             "agent_manager": True,
             "providers": True,
             "skills": True,
+            "plugins": True,
         },
     }
     assert runtime.state is RuntimeState.STOPPED
@@ -98,6 +102,7 @@ async def test_readyz_returns_503_when_a_provider_is_not_ready(tmp_path: Path) -
             "agent_manager": True,
             "providers": False,
             "skills": True,
+            "plugins": True,
         },
     }
 

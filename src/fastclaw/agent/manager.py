@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from functools import partial
@@ -32,6 +33,7 @@ from fastclaw.orchestration import (
     TaskResult,
     WaitTicket,
 )
+from fastclaw.plugin import PluginManager
 from fastclaw.providers import ChatMessage, Provider, create_provider
 from fastclaw.runtime import Runtime, RuntimeState
 from fastclaw.skills import Skill, SkillCatalog, SkillError
@@ -93,6 +95,7 @@ class ToolFactory(Protocol):
         data_root: Path,
         legacy_data_root: Path,
         catalog: SkillCatalog,
+        plugins: PluginManager,
     ) -> ToolRegistry: ...
 
 
@@ -103,6 +106,7 @@ def _default_tools(
     data_root: Path,
     legacy_data_root: Path,
     catalog: SkillCatalog,
+    plugins: PluginManager,
 ) -> ToolRegistry:
     workspace = data_root / "workspaces" / profile.agent.id
     tools: list[Any] = [
@@ -115,6 +119,7 @@ def _default_tools(
     ]
     if profile.skills:
         tools.append(SkillScriptTool(catalog, profile.skills, forbidden_roots=(legacy_data_root,)))
+    tools.extend(plugins.tools())
     return ToolRegistry(tools)
 
 
@@ -240,6 +245,12 @@ class AgentRuntimeManager:
         self._tool_factory = tool_factory
         self._profiles: dict[str, AgentRuntimeProfile] = {}
         self.skill_catalog = SkillCatalog(config.data_root / "skills")
+        bundled_plugins = Path(__file__).resolve().parents[3] / "plugins"
+        self.plugin_manager = PluginManager(
+            (bundled_plugins,),
+            data_root=config.data_root,
+            enabled={"finance-tools"},
+        )
         self._skill_errors: dict[str, str] = {}
         self._profile_lock = asyncio.Lock()
         self._started = False
@@ -271,6 +282,12 @@ class AgentRuntimeManager:
         if self.runtime.state is not RuntimeState.RUNNING:
             raise RuntimeError("Agent manager requires a running Runtime")
         self.skill_catalog.discover()
+        plugin_config, plugin_environment, enabled_plugins = await self._plugin_settings()
+        self.plugin_manager.configurations = plugin_config
+        self.plugin_manager.environments = plugin_environment
+        self.plugin_manager.enabled = enabled_plugins
+        self.plugin_manager.discover()
+        await self.plugin_manager.start()
         async with UnitOfWork(self.database) as unit:
             store = unit.require_store()
             users = await store.list_users()
@@ -284,6 +301,7 @@ class AgentRuntimeManager:
             return
         self._closing = True
         await self.bus.shutdown()
+        await self.plugin_manager.stop()
         self._started = False
 
     async def ensure_profile(self, agent: AgentRecord) -> AgentRuntimeProfile:
@@ -421,6 +439,10 @@ class AgentRuntimeManager:
                 for profile in self._profiles.values()
                 for skill in profile.skills
             ),
+            "plugins": all(
+                not instance.enabled or instance.process.running
+                for instance in self.plugin_manager.instances
+            ),
         }
 
     async def provider_selection(
@@ -534,6 +556,7 @@ class AgentRuntimeManager:
             self.config.data_root,
             self.config.legacy_data_root,
             self.skill_catalog,
+            self.plugin_manager,
         )
         runner = AgentRunner(provider, tools, DatabaseSessionPersistence(self.database))
         final: ChatMessage | None = None
@@ -653,9 +676,12 @@ class AgentRuntimeManager:
             if isinstance(configured, list):
                 allowed_tools = frozenset(str(item) for item in configured)
             elif skills:
-                allowed_tools = frozenset(
-                    {"exec", "read_file", "web_fetch", "list_dir", "write_file"}
-                )
+                allowed = {"exec", "read_file", "web_fetch", "list_dir", "write_file"}
+                if any(skill.name.startswith("findata-toolkit") for skill in skills):
+                    allowed.update(
+                        tool.definition.function.name for tool in self.plugin_manager.tools()
+                    )
+                allowed_tools = frozenset(allowed)
             elif "coordinator" in agent.name.lower():
                 coordinator_tools = {"spawn_subagent"}
                 if agent.name.lower() == "coordinator-wc":
@@ -672,6 +698,53 @@ class AgentRuntimeManager:
             allowed_tools=allowed_tools,
             skills=tuple(skills),
         )
+
+    async def _plugin_settings(
+        self,
+    ) -> tuple[
+        dict[str, dict[str, Any]],
+        dict[str, dict[str, str]],
+        set[str],
+    ]:
+        config: dict[str, Any] = {
+            "finskillsPath": str(self.config.data_root / "skills"),
+            "serenitySkillPath": str(self.config.data_root / "skills" / "serenity-skill"),
+            "stateDbPath": str(self.config.data_root / "data" / "finance-tools.db"),
+            "pythonBin": sys.executable,
+            "timeoutSeconds": 45,
+        }
+        environment: dict[str, str] = {}
+        for skill_name, config_name in (
+            ("findata-toolkit-us", "usPythonBin"),
+            ("findata-toolkit-cn", "cnPythonBin"),
+            ("serenity-skill", "serenityPythonBin"),
+        ):
+            try:
+                skill = self.skill_catalog.require(skill_name)
+            except SkillError:
+                continue
+            try:
+                config[config_name] = str(self.skill_catalog.interpreter(skill))
+            except SkillError:
+                pass
+            for name in skill.environment_names:
+                value = os.environ.get(name)
+                if value:
+                    environment[name] = value
+        odds_key = os.environ.get("ODDS_API_KEY")
+        if odds_key:
+            environment["ODDS_API_KEY"] = odds_key
+        async with UnitOfWork(self.database) as unit:
+            records = await unit.require_store().list_configs(
+                kind="plugin", user_id="", agent_id=""
+            )
+        record = next((item for item in records if item.name == "finance-tools"), None)
+        if record is not None:
+            timeout = record.data.get("timeoutSeconds")
+            if isinstance(timeout, int) and 1 <= timeout <= 300:
+                config["timeoutSeconds"] = timeout
+        enabled = {"finance-tools"} if record is None or record.enabled else set()
+        return {"finance-tools": config}, {"finance-tools": environment}, enabled
 
     @staticmethod
     def _request(profile: AgentRuntimeProfile, model: str, message: str) -> AgentRunRequest:

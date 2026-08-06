@@ -31,7 +31,9 @@ jobs:
       - name: Mypy
         run: mypy
       - name: Tests
-        run: pytest
+        run: |
+          pytest
+          python -m unittest discover -s plugins/finance-tools -p 'test_*.py'
       - name: Alembic schema drift
         if: matrix.python-version == '3.12'
         env:

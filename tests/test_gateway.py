@@ -432,7 +432,14 @@ async def test_session_management_config_and_unsupported_envelopes(tmp_path: Pat
         leaked_config = await client.post(
             "/api/config", json={"providers": {"deepseek": {"apiKey": "plaintext"}}}
         )
-        unsupported = await client.get("/api/plugins")
+        plugins = await client.get("/api/plugins")
+        disabled_plugin = await client.put("/api/plugins/finance-tools", json={"enabled": False})
+        persisted_plugin = await client.get("/api/plugins")
+        rejected_plugin_path = await client.put(
+            "/api/plugins/finance-tools",
+            json={"config": {"pythonBin": "/tmp/attacker"}},
+        )
+        unsupported = await client.get("/api/channels")
         deleted = await client.delete(
             "/api/chat/sessions/session-1", params={"agentId": created["agentId"]}
         )
@@ -441,6 +448,28 @@ async def test_session_management_config_and_unsupported_envelopes(tmp_path: Pat
         assert sessions.json()["sessions"][0]["title"] == "Renamed"
         assert safe_config.json() == {"ok": True}
         assert leaked_config.status_code == 400
+        assert plugins.json()[0]["id"] == "finance-tools"
+        assert plugins.json()[0]["status"] == "running"
+        assert disabled_plugin.json()["plugin"]["enabled"] is False
+        assert persisted_plugin.json()[0]["status"] == "stopped"
+        assert rejected_plugin_path.status_code == 400
         assert unsupported.status_code == 501
         assert unsupported.json()["code"] == "not_implemented"
         assert deleted.json() == {"ok": True}
+
+
+async def test_plugin_enablement_persists_across_gateway_restart(tmp_path: Path) -> None:
+    database_path = tmp_path / "plugin-persistence.db"
+    async with gateway_client(database_path) as (client, _database):
+        await onboard(client)
+        await login(client)
+        response = await client.put("/api/plugins/finance-tools", json={"enabled": False})
+        assert response.status_code == 200
+
+    async with gateway_client(database_path) as (client, _database):
+        await login(client)
+        response = await client.get("/api/plugins")
+
+        assert response.status_code == 200
+        assert response.json()[0]["enabled"] is False
+        assert response.json()[0]["status"] == "stopped"
