@@ -87,6 +87,52 @@ async def login(client: httpx.AsyncClient) -> None:
     assert client.cookies.get("fastclaw_session")
 
 
+async def test_team_api_is_idempotent_and_enforces_lifecycle(tmp_path: Path) -> None:
+    async with gateway_client(tmp_path / "teams.db") as (client, database, _):
+        await onboard(client)
+        await login(client)
+        creation = {
+            "name": "Custom research",
+            "templateKey": "custom",
+            "clientRequestId": "team-request-1",
+            "specialists": [{"key": "research", "name": "Research specialist"}],
+        }
+        first = await client.post("/api/agent-teams", json=creation)
+        second = await client.post("/api/agent-teams", json=creation)
+        assert first.status_code == second.status_code == 201
+        team = first.json()["team"]
+        assert second.json()["team"]["id"] == team["id"]
+        assert len(team["members"]) == 2
+
+        conflict = await client.patch(
+            f"/api/agent-teams/{team['id']}", json={"name": "no", "revision": 0}
+        )
+        assert conflict.status_code == 409
+        added = await client.post(
+            f"/api/agent-teams/{team['id']}/members",
+            json={"key": "review", "name": "Review specialist", "revision": team["revision"]},
+        )
+        assert added.status_code == 201
+        team = (await client.get(f"/api/agent-teams/{team['id']}")).json()["team"]
+        archived = await client.post(
+            f"/api/agent-teams/{team['id']}/archive", json={"revision": team["revision"]}
+        )
+        assert archived.status_code == 200
+        deleted = await client.request(
+            "DELETE",
+            f"/api/agent-teams/{team['id']}",
+            json={"teamId": team["id"], "revision": archived.json()["team"]["revision"]},
+        )
+        assert deleted.status_code == 200
+        async with UnitOfWork(database) as unit:
+            store = unit.require_store()
+            assert await store.get_team(team["id"]) is None
+            deleted_agents = [
+                await store.get_agent(member["agentId"]) for member in team["members"]
+            ]
+            assert all(agent is None for agent in deleted_agents)
+
+
 def test_sse_tool_result_preserves_call_identity_for_pairing() -> None:
     call = ToolCall(id="call-1", function=FunctionCall(name="read_file", arguments="{}"))
     payload = _web_event(
