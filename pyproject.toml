@@ -55,6 +55,21 @@ Repository = "https://github.com/M0yuW/fastclaw-python"
 [tool.hatch.build.targets.wheel]
 packages = ["src/fastclaw"]
 
+[tool.hatch.build]
+exclude = [
+  "/.mypy_cache",
+  "/.pytest_cache",
+  "/.ruff_cache",
+  "/.venv",
+  "/build",
+  "/dist",
+  "/web/.next",
+  "/web/node_modules",
+  "/web/out",
+  "/web/playwright-report",
+  "/web/test-results",
+]
+
 [tool.hatch.build.targets.wheel.force-include]
 "alembic.ini" = "fastclaw/alembic.ini"
 "migrations" = "fastclaw/migrations"

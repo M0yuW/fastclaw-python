@@ -2,7 +2,7 @@
 
 - 制定日期：2026-08-06
 - 当前分支：`codex/release-hardening`（G 阶段完成后提交，工作树应干净）
-- 当前基线提交：`4c9bc98` 加本轮 G 阶段收口提交
+- 当前基线：`codex/release-hardening` 最新提交（包含 G 阶段与切换审计/发行包加固）
 - 参考 Go 实现：`792417b86b5c12af1b99364865217a74f4d52f38`（只读）
 
 本文档接续 `phase-1` 至 `phase-9`。前九阶段完成的是**代码实现**；本计划的主题是把「实现完成」推进到「可切换」，并收口三类遗留：报告口径与代码不一致、验证手段存在盲区、以及被外部额度阻断的真实环境验证。
@@ -15,10 +15,10 @@
 
 | 项目 | 结果 |
 |---|---|
-| `pytest -q` | 120 passed, 1 skipped（PostgreSQL 本机无服务） |
+| `pytest -q` | 126 passed, 1 skipped（PostgreSQL 本机无服务） |
 | `ruff check .` | All checks passed |
-| `ruff format --check .` | 104 files already formatted |
-| `mypy` | Success: no issues found in 78 source files |
+| `ruff format --check .` | 108 files already formatted |
+| `mypy` | Success: no issues found in 81 source files |
 | `alembic upgrade head` + `alembic check` | 升级至 `20260805_01`，无漂移 |
 | `scripts/verify_web_snapshot.py` | 86 unchanged + 4 declared overlays + 4 attributed additions |
 | 分支状态 | 无 upstream，未 rebase，未 force push |
@@ -120,6 +120,12 @@ PR #1–#8 已合并。剩余顺序为 `#9 → #10 → #11 → Phase E → Phase
 ---
 
 ## 5. 阶段 J：真实环境验证（当前被外部额度阻断）
+
+先对一次性安全副本运行 `fastclaw cutover audit`。该命令固定核对 2 用户、
+M0yuW 13 Agent、benchmark 14 Agent、26 个角色文件 profile、模型来源、benchmark
+工具策略、Skill 环境、Provider、ODDS、plugin、数据库 FK、Session 与 channel
+credential 清空状态；任何 blocker 都返回退出码 2。审计会启动 bundled plugin
+完成握手，因此禁止直接指向 Go 或线上 Python 数据根。
 
 以下三项都需要宿主端口权限与集中凭据，是切换的硬前置。阻断解除前不得进入阶段 K。
 

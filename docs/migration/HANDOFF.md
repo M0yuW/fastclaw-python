@@ -21,13 +21,13 @@ git log --oneline -1       # 应为当前 release-hardening 分支最新提交
 |---|---|
 | 工作树路径 | `/Users/wangzheyu/.codex/worktrees/8e65/fastclaw/fastclaw-python` |
 | 当前分支 | `codex/release-hardening` |
-| HEAD | `4c9bc98` 加本轮 G 阶段收口提交 |
+| HEAD | 以 `git log --oneline -1` 为准；当前包含 G 阶段与切换审计/发行包加固 |
 | `origin/main` | `4c284d1` |
 | 未推送提交数 | 以 `git rev-list --count origin/main..HEAD` 为准 |
 | upstream | **未配置**——从未 push、从未 rebase、从未 force push |
 | 工作树 | G 阶段提交后应干净 |
 
-`origin/main..HEAD` 至少包含以下 7 个功能提交，另加 G 阶段收口提交（新→旧）：
+`origin/main..HEAD` 至少包含以下 7 个功能提交，另加 G 阶段收口与切换审计/发行包加固提交（新→旧）：
 
 ```
 4c9bc98  Restore Go agent and tool event contracts
@@ -96,7 +96,7 @@ origin/main (4c284d1)
 | 9 | 发布加固与切换：PostgreSQL/wheel/Docker/Playwright/依赖审计/secret scan CI，Go 18953 vs Python 18954 differential，故障矩阵，结构化日志 | `phase-9-release-cutover.md` | 待建（`codex/release-hardening`） | 本地完成，未推送 |
 | 10 | 切换就绪与遗留收口：G 口径收口 / H 凭据轮换 / I 合并堆叠 / J 真实环境验证 / K 切换执行 | `phase-10-cutover-readiness.md` | 当前分支 | G 已实现并验证；H–K 待外部条件 |
 
-代码规模：`src/fastclaw/` 54 个 Python 文件，`tests/` 24 个 Python 测试文件，finance plugin 另有 1 个来源契约测试文件。模块划分：`agent/`、`gateway/`、`migration/`、`orchestration/`、`plugin/`、`providers/`、`storage/`、`tools/`，以及顶层 `app.py`、`cli.py`、`differential.py`、`execution.py`、`identity.py`、`models.py`、`observability.py`、`runtime.py`、`skills.py`。
+代码规模：`src/fastclaw/` 55 个 Python 文件，`tests/` 26 个 Python 测试文件，finance plugin 另有 1 个来源契约测试文件。模块划分：`agent/`、`gateway/`、`migration/`、`orchestration/`、`plugin/`、`providers/`、`storage/`、`tools/`，以及顶层 `app.py`、`cli.py`、`cutover.py`、`differential.py`、`execution.py`、`identity.py`、`models.py`、`observability.py`、`runtime.py`、`skills.py`。
 
 ---
 
@@ -106,11 +106,11 @@ origin/main (4c284d1)
 
 | 命令 | 预期输出 |
 |---|---|
-| `pytest -q` | `120 passed, 1 skipped`（skip = 本机无 PostgreSQL 服务） |
+| `pytest -q` | `126 passed, 1 skipped`（skip = 本机无 PostgreSQL 服务） |
 | `(cd plugins/finance-tools && ../../.venv/bin/python -m unittest -v test_plugin.py)` | `10 passed` |
 | `ruff check .` | `All checks passed` |
-| `ruff format --check .` | `104 files already formatted` |
-| `mypy` | `Success: no issues found in 78 source files`（strict） |
+| `ruff format --check .` | `108 files already formatted` |
+| `mypy` | `Success: no issues found in 81 source files`（strict） |
 | `alembic upgrade head` && `alembic check` | 升级至 `20260805_01`，无漂移 |
 | `python scripts/verify_web_snapshot.py` | `86 unchanged + 4 declared overlays + 4 attributed additions` |
 | `pnpm --dir web lint` / `build` | exit 0；build 产出 25 routes |
@@ -122,6 +122,11 @@ Provider 凭据核对命令应报告 DeepSeek / OpenRouter / ODDS **三项均未
 CI（`.github/workflows/ci.yml`）的 job：`quality`（Python 3.12/3.13/3.14 + `alembic check`）、`web`（+ 快照校验）、`postgres`（postgres:17-alpine，`pytest -q -m postgres`）、`package`、`docker`、`security`（pip-audit + gitleaks）、`web-e2e`（Playwright，依赖其余全部）。
 
 `.github/workflows/differential.yml` 目前只有 `workflow_dispatch` + `runs-on: self-hosted`，**从未对真实双服务运行过**——见 5.2 J1。
+
+发行包已在本机实际构建：wheel 约 142 KiB、sdist 约 674 KiB，分别包含 70/220
+个文件。`scripts/verify_distribution.py` 会阻断缺失 Alembic/plugin/cutover 运行文件，
+以及把 `node_modules`、`.next`、`out` 等本地 Web 产物混入 sdist 的回归。修复前
+sdist 曾达到约 105 MiB、21,901 个文件，因此这一检查不能只依赖 `twine check`。
 
 ---
 
@@ -137,6 +142,7 @@ CI（`.github/workflows/ci.yml`）的 job：`quality`（Python 3.12/3.13/3.14 + 
 - **G2 Web overlay 哈希**已写入 `web-python-overlays.json`；`verify_web_snapshot.py` 会校验全部 4 个 overlay，参数化测试逐一证明篡改会失败。
 - **G3 可信身份契约**已由回归测试锁定：`spawn_subagent` schema 只能暴露 `agent_id` 与 `task`，模型提供的 user/root/call-path 字段不影响可信上下文；plugin 的 10 个 camelCase/snake_case 受保护名称均逐一拒绝。
 - **G4 differential 状态**已纠正：`tests/test_differential.py` 通过 `httpx.MockTransport` 覆盖比对逻辑，真实 fixture 只由运行脚本加载；Go/Python 双服务尚未实际执行，真实运行与报告仍是切换硬前置。
+- **G5 切换审计**已实现：`fastclaw cutover audit` 在一次性安全副本上核对 2 用户、27 Agent、模型来源、角色文件、tool policy、Skill、Provider、ODDS、plugin、FK/ACL/Session/channel 状态，并以退出码 2 阻断不完整切换。当前真实副本只剩三项集中凭据未配置。
 
 **阶段 H——凭据轮换**：交接文档中出现过的全部口令、DeepSeek key、OpenRouter key、ODDS key 全部轮换。这些凭据在 Phase B–E 全部开发过程中一直有效，暴露窗口随时间线性增长；既然确定要轮换，现在轮换严格优于切换时轮换。新值只经环境变量或 secret 注入，轮换记录只记「已轮换 + 时间 + 责任人」。
 

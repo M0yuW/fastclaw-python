@@ -110,6 +110,7 @@ jobs:
           python -m pip install build twine
           python -m build
           python -m twine check dist/*
+          python scripts/verify_distribution.py dist
           python -m venv "${{ runner.temp }}/wheel-smoke"
           "${{ runner.temp }}/wheel-smoke/bin/pip" install dist/*.whl
           cd "${{ runner.temp }}"

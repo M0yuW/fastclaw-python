@@ -7,6 +7,14 @@ container, runs PostgreSQL 17 integration tests, audits installed dependencies,
 scans repository history for secrets, and keeps the existing Python 3.12–3.14,
 Alembic, Web build, and Playwright gates.
 
+Distribution verification is structural, not just metadata-based. Hatch
+explicitly excludes local Web build/dependency trees, and
+`scripts/verify_distribution.py` enforces size limits, required bundled
+Alembic/plugin/cutover files, and the absence of `node_modules`, `.next`,
+`out`, or test-report caches. This was added after a local build proved that
+`twine check` would accept a 105 MiB sdist containing 21,901 generated files;
+the corrected artifact is about 674 KiB with 220 source files.
+
 The container is a multi-stage Python 3.12/Node 22 build. The final image runs
 as UID/GID 10001, stores mutable data only in `/data`, embeds the attributed
 Web export and finance plugin in read-only application layers, and exposes only
