@@ -27,9 +27,9 @@ ENV FASTCLAW_DATA_ROOT=/data \
 RUN groupadd --system --gid 10001 fastclaw \
     && useradd --system --uid 10001 --gid fastclaw --home-dir /data fastclaw \
     && install -d -o fastclaw -g fastclaw -m 0700 /data /opt/fastclaw/web
-COPY --from=python-builder /build/dist/*.whl /tmp/fastclaw.whl
-RUN python -m pip install --no-cache-dir /tmp/fastclaw.whl 'uvicorn>=0.35,<1.0' \
-    && rm /tmp/fastclaw.whl
+COPY --from=python-builder /build/dist/*.whl /tmp/
+RUN python -m pip install --no-cache-dir /tmp/fastclaw-*.whl 'uvicorn>=0.35,<1.0' \
+    && rm /tmp/fastclaw-*.whl
 COPY --from=web-builder --chown=fastclaw:fastclaw /build/web/out/ /opt/fastclaw/web/
 USER 10001:10001
 WORKDIR /data
