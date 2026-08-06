@@ -53,6 +53,18 @@
       "stream": true
     },
     {
+      "name": "chat-stream-tools",
+      "method": "POST",
+      "path": "/api/chat/stream",
+      "body": {
+        "agentId": "finance-coordinator",
+        "sessionId": "differential-authenticated-tools-v3",
+        "message": "fixed authenticated tool differential fixture"
+      },
+      "stream": true,
+      "comparison": "sse_compatible"
+    },
+    {
       "name": "terminal-tasks",
       "method": "GET",
       "path": "/api/tasks",

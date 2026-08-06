@@ -202,6 +202,67 @@ async def test_differential_validates_sse_order_and_tool_pairing() -> None:
             DifferentialCase("chat", "POST", "/api/chat/stream", stream=True),
         )
     assert result["events"] == 3
+    assert result["pythonEvents"] == 3
+    assert result["normalizedEvents"] == 3
+
+
+async def test_compatible_sse_accepts_empty_go_content_and_python_metadata() -> None:
+    go_events: list[dict[str, object]] = [
+        {"version": 2, "type": "content", "data": {"seq": 0, "content": ""}},
+        {
+            "version": 2,
+            "type": "tool_call",
+            "data": {"seq": 1, "id": "call", "name": "delegate", "arguments": "{}"},
+        },
+        {
+            "version": 2,
+            "type": "tool_result",
+            "data": {"seq": 2, "id": "call", "name": "delegate", "result": "ok"},
+        },
+        {"version": 2, "type": "done", "data": {"seq": 3}},
+    ]
+    python_events: list[dict[str, object]] = [
+        {
+            "version": 2,
+            "type": "tool_call",
+            "data": {"seq": 0, "id": "call", "name": "delegate", "arguments": "{}"},
+        },
+        {
+            "version": 2,
+            "type": "tool_result",
+            "data": {
+                "seq": 1,
+                "id": "call",
+                "name": "delegate",
+                "result": "ok",
+                "metadata": {"agentId": "specialist"},
+            },
+        },
+        {"version": 2, "type": "done", "data": {"seq": 2}},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        events = go_events if request.url.host == "go.test" else python_events
+        return httpx.Response(200, text=sse(events), headers={"content-type": "text/event-stream"})
+
+    transport = httpx.MockTransport(handler)
+    case = DifferentialCase(
+        "tool-stream",
+        "POST",
+        "/api/chat/stream",
+        stream=True,
+        comparison="sse_compatible",
+    )
+    async with (
+        httpx.AsyncClient(base_url="https://go.test", transport=transport) as go,
+        httpx.AsyncClient(base_url="https://python.test", transport=transport) as python,
+    ):
+        result = await run_case(go, python, case)
+
+    assert [item[1] for item in result["contract"]] == ["tool_call", "tool_result", "done"]
+    assert result["events"] == 4
+    assert result["pythonEvents"] == 3
+    assert result["normalizedEvents"] == 3
 
 
 def test_differential_rejects_missing_tool_result_and_contract_drift() -> None:

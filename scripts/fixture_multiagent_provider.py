@@ -75,6 +75,11 @@ class FixtureHandler(BaseHTTPRequestHandler):
         )
         tool_messages = [message for message in messages if message.get("role") == "tool"]
         scenario = next((item for item in SCENARIOS if item[0] in system), None)
+        if "authenticated tool differential fixture" in user_prompt:
+            # Locked Go and Python assemble role files into different system
+            # prompt layouts. The explicit fixture marker selects the same
+            # coordinator behavior without weakening production matching.
+            scenario = SCENARIOS[2]
 
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
