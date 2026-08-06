@@ -58,7 +58,7 @@
       "path": "/api/chat/stream",
       "body": {
         "agentId": "finance-coordinator",
-        "sessionId": "differential-authenticated-tools-v3",
+        "sessionId": "differential-authenticated-tools-v6",
         "message": "fixed authenticated tool differential fixture"
       },
       "stream": true,

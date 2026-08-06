@@ -264,6 +264,23 @@ async def test_compatible_sse_accepts_empty_go_content_and_python_metadata() -> 
     assert result["pythonEvents"] == 3
     assert result["normalizedEvents"] == 3
 
+    python_events[1] = {
+        **python_events[1],
+        "data": {
+            "seq": 1,
+            "id": "call",
+            "name": "delegate",
+            "result": "invalid tool arguments",
+            "metadata": {"agentId": "specialist"},
+        },
+    }
+    async with (
+        httpx.AsyncClient(base_url="https://go.test", transport=transport) as go,
+        httpx.AsyncClient(base_url="https://python.test", transport=transport) as python,
+    ):
+        with pytest.raises(DifferentialMismatch, match="tool semantics differ"):
+            await run_case(go, python, case)
+
 
 def test_differential_rejects_missing_tool_result_and_contract_drift() -> None:
     incomplete = parse_sse(
@@ -283,3 +300,10 @@ def test_differential_rejects_missing_tool_result_and_contract_drift() -> None:
 
     with pytest.raises(DifferentialMismatch, match="non-terminal"):
         require_terminal_tasks([{"id": "task-1", "status": "running"}])
+
+    require_terminal_tasks(
+        [
+            {"id": "go-task", "status": "done"},
+            {"id": "python-task", "status": "completed"},
+        ]
+    )

@@ -92,6 +92,20 @@ def compatible_sse_signature(events: tuple[dict[str, Any], ...]) -> tuple[Any, .
     return tuple(signature)
 
 
+def tool_semantics(events: tuple[dict[str, Any], ...]) -> tuple[tuple[str, str, str], ...]:
+    return tuple(
+        (
+            str(event.get("type") or ""),
+            str((event.get("data") or {}).get("name") or ""),
+            str((event.get("data") or {}).get("result") or "")
+            if event.get("type") == "tool_result"
+            else "",
+        )
+        for event in events
+        if event.get("type") in {"tool_call", "tool_result"}
+    )
+
+
 def validate_sse(events: tuple[dict[str, Any], ...]) -> None:
     if not events or events[-1].get("type") != "done":
         raise DifferentialMismatch("SSE stream has no terminal done event")
@@ -128,7 +142,8 @@ def require_terminal_tasks(payload: Any) -> None:
     active = [
         str(item.get("id") or "")
         for item in tasks
-        if isinstance(item, dict) and item.get("status") not in {"completed", "failed", "cancelled"}
+        if isinstance(item, dict)
+        and item.get("status") not in {"done", "completed", "failed", "cancelled"}
     ]
     if active:
         raise DifferentialMismatch("task response contains non-terminal work")
@@ -220,6 +235,10 @@ async def run_case(
         python_contract = json_shape(python.json_body)
     if go_contract != python_contract:
         raise DifferentialMismatch(f"{case.name}: response contract differs")
+    if case.comparison == "sse_compatible" and tool_semantics(go.events) != tool_semantics(
+        python.events
+    ):
+        raise DifferentialMismatch(f"{case.name}: tool semantics differ")
     for path in case.equal_paths:
         if json_path(go.json_body, path) != json_path(python.json_body, path):
             raise DifferentialMismatch(f"{case.name}: semantic value differs at {path}")

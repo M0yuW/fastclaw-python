@@ -80,6 +80,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
             # prompt layouts. The explicit fixture marker selects the same
             # coordinator behavior without weakening production matching.
             scenario = SCENARIOS[2]
+        agent_id_key = _spawn_agent_id_key(request.get("tools") or [])
 
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
@@ -90,7 +91,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
         if "cancel-wiring-smoke" in user_prompt:
             self._slow_stream()
             return
-        payload = self._next_payload(scenario, tool_messages)
+        payload = self._next_payload(scenario, tool_messages, agent_id_key)
         self.wfile.write(_event(payload))
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
@@ -120,6 +121,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
     def _next_payload(
         scenario: tuple[str, tuple[str, ...], bool] | None,
         tool_messages: list[dict[str, Any]],
+        agent_id_key: str,
     ) -> dict[str, Any]:
         if scenario is None:
             return {
@@ -137,7 +139,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
             return _tool_payload(
                 f"call-{delegated}",
                 "spawn_subagent",
-                {"agent_id": targets[delegated], "task": f"fixture delegation {delegated}"},
+                {agent_id_key: targets[delegated], "task": f"fixture delegation {delegated}"},
             )
         if direct_ledger:
             return _tool_payload("call-ledger", "worldcup_ledger", {"operation": "report"})
@@ -174,6 +176,18 @@ def _tool_payload(call_id: str, name: str, arguments: dict[str, Any]) -> dict[st
             }
         ]
     }
+
+
+def _spawn_agent_id_key(tools: list[dict[str, Any]]) -> str:
+    for tool in tools:
+        function = tool.get("function") or {}
+        if function.get("name") != "spawn_subagent":
+            continue
+        parameters = function.get("parameters") or {}
+        properties = parameters.get("properties") or {}
+        if "agentId" in properties:
+            return "agentId"
+    return "agent_id"
 
 
 def main() -> None:
