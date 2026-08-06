@@ -78,7 +78,7 @@ async def test_postgres_alembic_repository_acl_and_json_round_trip() -> None:
 
         async with database.session() as session:
             assert await session.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "20260806_01"
+                "20260806_02"
             )
         async with UnitOfWork(database) as unit:
             store = unit.require_store()
