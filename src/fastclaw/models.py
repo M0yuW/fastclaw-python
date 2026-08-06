@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from fastclaw.runtime import RuntimeState
 
@@ -24,3 +24,4 @@ class ReadinessResponse(BaseModel):
     status: Literal["ready", "not_ready"]
     state: RuntimeState
     providers: dict[str, bool]
+    checks: dict[str, bool] = Field(default_factory=dict)

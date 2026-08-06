@@ -35,7 +35,8 @@ async def test_read_file_is_confined_to_workspace(tmp_path: Path) -> None:
 
     assert result.content == "safe"
     assert denied.is_error
-    assert "ValueError" in denied.content
+    assert "tool 'read_file' failed (reference " in denied.content
+    assert "outside" not in denied.content
 
 
 @pytest.mark.asyncio

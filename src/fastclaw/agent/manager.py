@@ -1,0 +1,549 @@
+"""Application-scoped Agent execution manager.
+
+The manager is the single entry point for root chat runs and delegated runs.  It
+owns the in-process queue/message bus and keeps provider and tool lifecycles out
+of the HTTP gateway.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
+from functools import partial
+from pathlib import Path
+from typing import Any, Protocol
+from uuid import uuid4
+
+from sqlalchemy import text
+
+from fastclaw.agent.models import AgentEvent, AgentEventType, AgentRunError, AgentRunRequest
+from fastclaw.agent.persistence import DatabaseSessionPersistence
+from fastclaw.agent.runner import AgentRunner
+from fastclaw.execution import ExecutionContext
+from fastclaw.orchestration import (
+    AsyncTaskQueue,
+    InProcessMessageBus,
+    SpawnSubagentTool,
+    TaskResult,
+    WaitTicket,
+)
+from fastclaw.providers import ChatMessage, Provider, create_provider
+from fastclaw.runtime import Runtime, RuntimeState
+from fastclaw.storage import AgentRecord, ConfigRecord, Database, UnitOfWork
+from fastclaw.tools import ReadFileTool, ToolRegistry, WebFetchTool
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRuntimeConfig:
+    data_root: Path
+    default_provider_name: str = ""
+    default_provider_api_key: str = ""
+    default_provider_api_base: str = ""
+    default_provider_api_type: str = "openai-compatible"
+    default_model: str = ""
+    max_concurrent: int = 8
+    max_pending: int = 256
+
+
+@dataclass(frozen=True, slots=True)
+class AgentRuntimeProfile:
+    agent: AgentRecord
+    system_prompt: str
+    allowed_tools: frozenset[str] | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderSelection:
+    name: str
+    api_key: str
+    api_base: str
+    api_type: str
+    model: str
+    source: str
+    config_id: str = ""
+
+
+class ToolFactory(Protocol):
+    def __call__(
+        self,
+        profile: AgentRuntimeProfile,
+        bus: InProcessMessageBus,
+        runtime: Runtime,
+        data_root: Path,
+    ) -> ToolRegistry: ...
+
+
+def _default_tools(
+    profile: AgentRuntimeProfile,
+    bus: InProcessMessageBus,
+    runtime: Runtime,
+    data_root: Path,
+) -> ToolRegistry:
+    workspace = data_root / "workspaces" / profile.agent.id
+    return ToolRegistry(
+        (
+            ReadFileTool(workspace),
+            WebFetchTool(runtime.http_client),
+            SpawnSubagentTool(bus),
+        )
+    )
+
+
+class ManagedAgentStream(AsyncIterator[AgentEvent]):
+    """A root run whose producer is owned by the shared task queue."""
+
+    _STOP = object()
+
+    def __init__(
+        self,
+        *,
+        manager: AgentRuntimeManager,
+        context: ExecutionContext,
+        model: str,
+        producer: Callable[[Callable[[AgentEvent], None]], Awaitable[TaskResult]],
+    ) -> None:
+        self._manager = manager
+        self.context = context
+        self.model = model
+        self._events: asyncio.Queue[AgentEvent | object] = asyncio.Queue()
+        self._result: ChatMessage | None = None
+        self._error = ""
+        self._closed = False
+        self._saw_error = False
+        self._saw_done = False
+
+        def emit(event: AgentEvent) -> None:
+            if event.type is AgentEventType.ERROR:
+                self._saw_error = True
+            if event.type is AgentEventType.DONE:
+                self._saw_done = True
+            self._events.put_nowait(event)
+
+        async def supervise() -> None:
+            try:
+                await producer(emit)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not self._saw_error:
+                    turn_id = str(uuid4())
+                    message_id = str(uuid4())
+                    reason = AgentRuntimeManager.safe_error(exc)
+                    emit(
+                        AgentEvent(
+                            type=AgentEventType.ERROR,
+                            turn_id=turn_id,
+                            message_id=message_id,
+                            round=0,
+                            seq=0,
+                            error=reason,
+                            is_error=True,
+                        )
+                    )
+                    emit(
+                        AgentEvent(
+                            type=AgentEventType.DONE,
+                            turn_id=turn_id,
+                            message_id=message_id,
+                            round=0,
+                            seq=1,
+                            is_error=True,
+                        )
+                    )
+            finally:
+                if not self._saw_done:
+                    self._error = self._error or "agent stream ended without a terminal event"
+                self._events.put_nowait(self._STOP)
+
+        self._task = asyncio.create_task(supervise())
+
+    def __aiter__(self) -> ManagedAgentStream:
+        return self
+
+    async def __anext__(self) -> AgentEvent:
+        item = await self._events.get()
+        if item is self._STOP:
+            self._closed = True
+            raise StopAsyncIteration
+        assert isinstance(item, AgentEvent)
+        if item.type is AgentEventType.ERROR:
+            self._error = item.error
+        if item.type is AgentEventType.DONE and item.message is not None:
+            self._result = item.message
+        return item
+
+    def result(self) -> ChatMessage:
+        if self._error:
+            raise AgentRunError(self._error)
+        if self._result is None:
+            raise AgentRunError("agent stream did not complete successfully")
+        return self._result
+
+    async def aclose(self) -> None:
+        if self._closed and self._task.done():
+            return
+        self._closed = True
+        await self._manager.cancel_root(self.context.root_execution_id)
+        if not self._task.done():
+            self._task.cancel()
+        await asyncio.gather(self._task, return_exceptions=True)
+
+
+class AgentRuntimeManager:
+    """Own profiles, providers, tools, queueing, delegation, and cancellation."""
+
+    def __init__(
+        self,
+        database: Database,
+        runtime: Runtime,
+        config: AgentRuntimeConfig,
+        *,
+        tool_factory: ToolFactory = _default_tools,
+    ) -> None:
+        self.database = database
+        self.runtime = runtime
+        self.config = config
+        self._queue = AsyncTaskQueue(
+            max_concurrent=config.max_concurrent,
+            max_pending=config.max_pending,
+        )
+        self.bus = InProcessMessageBus(self._queue)
+        self._tool_factory = tool_factory
+        self._profiles: dict[str, AgentRuntimeProfile] = {}
+        self._profile_lock = asyncio.Lock()
+        self._started = False
+        self._closing = False
+
+    @property
+    def started(self) -> bool:
+        return self._started and not self._closing
+
+    @property
+    def profile_count(self) -> int:
+        return len(self._profiles)
+
+    async def start(self) -> None:
+        if self._started:
+            return
+        if self.runtime.state is not RuntimeState.RUNNING:
+            raise RuntimeError("Agent manager requires a running Runtime")
+        async with UnitOfWork(self.database) as unit:
+            store = unit.require_store()
+            users = await store.list_users()
+            agents = [agent for user in users for agent in await store.list_agents(user.id)]
+        for agent in agents:
+            await self.ensure_profile(agent)
+        self._started = True
+
+    async def stop(self) -> None:
+        if self._closing:
+            return
+        self._closing = True
+        await self.bus.shutdown()
+        self._started = False
+
+    async def ensure_profile(self, agent: AgentRecord) -> AgentRuntimeProfile:
+        async with self._profile_lock:
+            current = self._profiles.get(agent.id)
+            if current is not None and current.agent.updated_at == agent.updated_at:
+                return current
+            profile = await self._load_profile(agent)
+            if current is None:
+                self.bus.register(
+                    user_id=agent.user_id,
+                    agent_id=agent.id,
+                    handler=partial(self._delegated_chat, agent.id),
+                )
+            self._profiles[agent.id] = profile
+            return profile
+
+    async def profile(self, agent_id: str, user_id: str) -> AgentRuntimeProfile:
+        async with UnitOfWork(self.database) as unit:
+            agent = await unit.require_store().get_agent(agent_id)
+        if agent is None or agent.user_id != user_id:
+            raise LookupError("agent not found")
+        return await self.ensure_profile(agent)
+
+    async def stream(
+        self,
+        *,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        message: str,
+        requested_model: str = "",
+        root_execution_id: str = "",
+    ) -> ManagedAgentStream:
+        self._require_running()
+        profile = await self.profile(agent_id, user_id)
+        selection = await self.provider_selection(profile, requested_model)
+        context = ExecutionContext(
+            user_id=user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            root_execution_id=root_execution_id or f"run_{uuid4().hex}",
+            call_path=(agent_id,),
+        )
+        request = self._request(profile, selection.model, message)
+
+        async def producer(emit: Callable[[AgentEvent], None]) -> TaskResult:
+            ticket: WaitTicket | None = None
+
+            async def execute() -> TaskResult:
+                value = await self._run(profile, selection, request, context, emit)
+                return TaskResult(correlation_id=f"run_{uuid4().hex}", value=value)
+
+            try:
+                ticket = await self._queue.submit(
+                    target=(user_id, agent_id),
+                    dedup_key=(user_id, context.root_execution_id, agent_id, message),
+                    root_execution_id=context.root_execution_id,
+                    inherit_slot=False,
+                    handler=execute,
+                )
+                return await ticket.result()
+            except asyncio.CancelledError:
+                if ticket is not None:
+                    await ticket.release(cancel=True)
+                raise
+            finally:
+                if ticket is not None:
+                    await ticket.release()
+
+        return ManagedAgentStream(
+            manager=self,
+            context=context,
+            model=selection.model,
+            producer=producer,
+        )
+
+    async def chat(self, **values: str) -> ChatMessage:
+        stream = await self.stream(**values)
+        try:
+            async for _ in stream:
+                pass
+            return stream.result()
+        finally:
+            await stream.aclose()
+
+    async def cancel_root(self, root_execution_id: str) -> None:
+        await self.bus.cancel_root(root_execution_id)
+
+    async def readiness(self) -> dict[str, bool]:
+        database_ready = False
+        try:
+            async with self.database.session() as session:
+                database_ready = (await session.scalar(text("SELECT 1"))) == 1
+        except Exception:
+            database_ready = False
+        provider_status = await self.runtime.readiness()
+        provider_ready = any(provider_status.values())
+        if not provider_ready and self._profiles:
+            checks = await asyncio.gather(
+                *(self._selection_is_configured(profile) for profile in self._profiles.values())
+            )
+            provider_ready = bool(checks) and all(checks)
+        return {
+            "database": database_ready,
+            "agent_manager": self.started,
+            "providers": provider_ready,
+            # Phase C replaces this with validation of every referenced skill.
+            # An empty skill set has no missing dependency.
+            "skills": True,
+        }
+
+    async def provider_selection(
+        self, profile: AgentRuntimeProfile, requested_model: str = ""
+    ) -> ProviderSelection:
+        agent = profile.agent
+        model = requested_model or str(agent.config.get("model") or self.config.default_model)
+        provider_name = (
+            model.split("/", 1)[0] if "/" in model else self.config.default_provider_name
+        )
+        if provider_name in self.runtime.providers and model:
+            return ProviderSelection(
+                name=provider_name,
+                api_key="",
+                api_base="",
+                api_type="runtime",
+                model=model,
+                source="runtime",
+            )
+        configs = await self._provider_configs(agent.user_id, agent.id)
+        selected = configs.get(provider_name)
+        if selected is not None:
+            data = selected.data
+            api_key = str(data.get("apiKey") or self._provider_env_key(selected.name))
+            api_base = str(data.get("apiBase") or "")
+            api_type = str(data.get("apiType") or "openai-compatible")
+            configured_model = str(data.get("model") or "")
+            model = model or configured_model
+            if api_key and api_base and model:
+                return ProviderSelection(
+                    name=selected.name,
+                    api_key=api_key,
+                    api_base=api_base,
+                    api_type=api_type,
+                    model=model,
+                    source=selected.scope,
+                    config_id=selected.id,
+                )
+        if (
+            self.config.default_provider_name
+            and self.config.default_provider_api_base
+            and model
+            and (not provider_name or provider_name == self.config.default_provider_name)
+        ):
+            key = self.config.default_provider_api_key or self._provider_env_key(provider_name)
+            if key:
+                return ProviderSelection(
+                    name=self.config.default_provider_name,
+                    api_key=key,
+                    api_base=self.config.default_provider_api_base,
+                    api_type=self.config.default_provider_api_type,
+                    model=model,
+                    source="environment",
+                )
+        raise RuntimeError("no usable provider is configured for this agent")
+
+    async def _selection_is_configured(self, profile: AgentRuntimeProfile) -> bool:
+        try:
+            await self.provider_selection(profile)
+        except RuntimeError:
+            return False
+        return True
+
+    async def _provider_configs(self, user_id: str, agent_id: str) -> dict[str, ConfigRecord]:
+        async with UnitOfWork(self.database) as unit:
+            store = unit.require_store()
+            layers = [
+                await store.list_configs(kind="provider", user_id="", agent_id=""),
+                await store.list_configs(kind="provider", user_id=user_id, agent_id=""),
+                await store.list_configs(kind="provider", user_id=user_id, agent_id=agent_id),
+            ]
+        configs: dict[str, ConfigRecord] = {}
+        for layer in layers:
+            configs.update({item.name: item for item in layer if item.enabled})
+        return configs
+
+    async def _delegated_chat(self, agent_id: str, task: str, context: ExecutionContext) -> str:
+        profile = self._profiles[agent_id]
+        selection = await self.provider_selection(profile)
+        request = self._request(profile, selection.model, task)
+        return await self._run(profile, selection, request, context, lambda event: None)
+
+    async def _run(
+        self,
+        profile: AgentRuntimeProfile,
+        selection: ProviderSelection,
+        request: AgentRunRequest,
+        context: ExecutionContext,
+        emit: Callable[[AgentEvent], None],
+    ) -> str:
+        provider, owned = await self._provider(selection)
+        tools = self._tool_factory(profile, self.bus, self.runtime, self.config.data_root)
+        runner = AgentRunner(provider, tools, DatabaseSessionPersistence(self.database))
+        final: ChatMessage | None = None
+        stream = runner.stream(request, context)
+        try:
+            async for event in stream:
+                emit(event)
+                if event.type is AgentEventType.DONE and event.message is not None:
+                    final = event.message
+            if final is None:
+                stream.result()
+            assert final is not None
+            return str(final.content or "")
+        finally:
+            await stream.aclose()
+            if owned:
+                await provider.stop()
+
+    async def _provider(self, selection: ProviderSelection) -> tuple[Provider, bool]:
+        shared = self.runtime.providers.get(selection.name)
+        if shared is not None:
+            return shared, False
+        provider = create_provider(
+            name=selection.name,
+            api_key=selection.api_key,
+            api_base=selection.api_base,
+            api_type=selection.api_type,
+        )
+        await provider.start(self.runtime.http_client)
+        return provider, True
+
+    async def _load_profile(self, agent: AgentRecord) -> AgentRuntimeProfile:
+        async with UnitOfWork(self.database) as unit:
+            records = await unit.require_store().list_agent_files(agent.id, agent.user_id)
+        files = {record.filename: record.data for record in records}
+        file_config: dict[str, Any] = {}
+        raw_config = files.get("agent.json")
+        if raw_config:
+            try:
+                parsed = json.loads(raw_config)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                file_config = parsed
+        effective_config = {**file_config, **agent.config}
+        prompt_parts: list[str] = []
+        for filename in ("SOUL.md", "IDENTITY.md", "USER.md", "MEMORY.md"):
+            raw = files.get(filename)
+            if not raw:
+                continue
+            try:
+                content = raw.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                continue
+            if content:
+                prompt_parts.append(f"## {filename}\n\n{content}")
+        configured_soul = str(effective_config.get("soul") or "").strip()
+        if configured_soul and "SOUL.md" not in files:
+            prompt_parts.insert(0, f"## SOUL.md\n\n{configured_soul}")
+        policy = str(effective_config.get("policy") or "").strip()
+        if policy == "no-tools":
+            allowed_tools: frozenset[str] | None = frozenset()
+        elif policy == "delegate-only":
+            allowed_tools = frozenset({"spawn_subagent"})
+        else:
+            configured = effective_config.get("allowedTools")
+            allowed_tools = (
+                frozenset(str(item) for item in configured)
+                if isinstance(configured, list)
+                else None
+            )
+        return AgentRuntimeProfile(
+            agent=agent.model_copy(update={"config": effective_config}),
+            system_prompt="\n\n".join(prompt_parts),
+            allowed_tools=allowed_tools,
+        )
+
+    @staticmethod
+    def _request(profile: AgentRuntimeProfile, model: str, message: str) -> AgentRunRequest:
+        config = profile.agent.config
+        return AgentRunRequest(
+            model=model,
+            message=message,
+            system_prompt=profile.system_prompt or str(config.get("soul") or ""),
+            allowed_tools=profile.allowed_tools,
+            max_rounds=int(config.get("maxToolIterations") or 8),
+        )
+
+    @staticmethod
+    def _provider_env_key(name: str) -> str:
+        normalized = re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_")
+        return os.environ.get(f"FASTCLAW_PROVIDER_{normalized}_API_KEY", "")
+
+    @staticmethod
+    def safe_error(error: BaseException) -> str:
+        if isinstance(error, (LookupError, RuntimeError, AgentRunError)):
+            return str(error).replace("\n", " ")[:240]
+        return "agent execution failed"
+
+    def _require_running(self) -> None:
+        if not self.started or self.runtime.state is not RuntimeState.RUNNING:
+            raise RuntimeError("Agent runtime manager is not running")

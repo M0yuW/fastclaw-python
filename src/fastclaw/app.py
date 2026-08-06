@@ -8,6 +8,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from fastclaw.agent.manager import AgentRuntimeConfig, AgentRuntimeManager
 from fastclaw.gateway import Gateway, GatewaySettings, create_gateway_router
 from fastclaw.models import HealthResponse, ReadinessResponse
 from fastclaw.runtime import Runtime, RuntimeState
@@ -25,25 +26,45 @@ def create_app(
     app_runtime = runtime or Runtime()
     app_settings = settings or GatewaySettings.from_env()
     app_database = database or Database(app_settings.database_url)
-    gateway = Gateway(app_settings, app_database, app_runtime)
+    agent_manager = AgentRuntimeManager(
+        app_database,
+        app_runtime,
+        AgentRuntimeConfig(
+            data_root=app_settings.data_root,
+            default_provider_name=app_settings.provider_name,
+            default_provider_api_key=app_settings.provider_api_key,
+            default_provider_api_base=app_settings.provider_api_base,
+            default_provider_api_type=app_settings.provider_api_type,
+            default_model=app_settings.default_model,
+        ),
+    )
+    gateway = Gateway(app_settings, app_database, app_runtime, agent_manager)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.runtime = app_runtime
         app.state.database = app_database
         app.state.gateway = gateway
+        app.state.agent_manager = agent_manager
         await app_database.create_schema()
         await app_runtime.start()
+        await agent_manager.start()
         try:
             yield
         finally:
-            await app_runtime.stop()
-            await app_database.close()
+            try:
+                await agent_manager.stop()
+            finally:
+                try:
+                    await app_runtime.stop()
+                finally:
+                    await app_database.close()
 
     app = FastAPI(title="FastClaw", version="0.1.0", lifespan=lifespan)
     app.state.runtime = app_runtime
     app.state.database = app_database
     app.state.gateway = gateway
+    app.state.agent_manager = agent_manager
 
     @app.exception_handler(HTTPException)
     async def http_error(request: Request, exc: HTTPException) -> JSONResponse:
@@ -88,11 +109,17 @@ def create_app(
     )
     async def readyz() -> ReadinessResponse | JSONResponse:
         providers = await app_runtime.readiness()
-        is_ready = app_runtime.state is RuntimeState.RUNNING and all(providers.values())
+        checks = await agent_manager.readiness()
+        is_ready = (
+            app_runtime.state is RuntimeState.RUNNING
+            and all(providers.values())
+            and all(checks.values())
+        )
         response = ReadinessResponse(
             status="ready" if is_ready else "not_ready",
             state=app_runtime.state,
             providers=providers,
+            checks=checks,
         )
         if is_ready:
             return response
