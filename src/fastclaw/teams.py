@@ -26,6 +26,8 @@ class TeamRole:
     name: str
     member_type: str
     description: str = ""
+    soul: str = ""
+    allowed_tools: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,10 +44,37 @@ FINANCE_MARKET_RESEARCH = TeamTemplate(
     "v1",
     "Finance market research",
     (
-        TeamRole("coordinator", "Research coordinator", "coordinator"),
-        TeamRole("china-news-analyst", "China news analyst", "specialist"),
-        TeamRole("us-news-analyst", "US news analyst", "specialist"),
-        TeamRole("stock-screener", "Stock screener", "specialist"),
+        TeamRole(
+            "coordinator",
+            "Research coordinator",
+            "coordinator",
+            soul="Coordinate market research and synthesize specialist evidence.",
+            allowed_tools=("spawn_subagent",),
+        ),
+        TeamRole(
+            "news-analyst",
+            "News analyst",
+            "specialist",
+            soul="Analyze market news and cite uncertainty.",
+        ),
+        TeamRole(
+            "news-analyst-us",
+            "US news analyst",
+            "specialist",
+            soul="Analyze US market news and cite uncertainty.",
+        ),
+        TeamRole(
+            "stock-screener",
+            "Stock screener",
+            "specialist",
+            soul="Screen domestic securities using available evidence.",
+        ),
+        TeamRole(
+            "stock-screener-us",
+            "US stock screener",
+            "specialist",
+            soul="Screen US securities using available evidence.",
+        ),
     ),
 )
 WORLD_CUP_ANALYSIS = TeamTemplate(
@@ -53,21 +82,90 @@ WORLD_CUP_ANALYSIS = TeamTemplate(
     "v1",
     "World Cup analysis",
     (
-        TeamRole("coordinator", "World Cup coordinator", "coordinator"),
-        TeamRole("match-analyst", "Match analyst", "specialist"),
-        TeamRole("team-analyst", "Team analyst", "specialist"),
-        TeamRole("player-analyst", "Player analyst", "specialist"),
-        TeamRole("odds-analyst", "Odds analyst", "specialist"),
-        TeamRole("news-analyst", "News analyst", "specialist"),
-        TeamRole("data-analyst", "Data analyst", "specialist"),
+        TeamRole(
+            "coordinator",
+            "World Cup coordinator",
+            "coordinator",
+            soul="Coordinate World Cup analysis and synthesize specialists.",
+            allowed_tools=("spawn_subagent", "worldcup_ledger"),
+        ),
+        TeamRole(
+            "data-analyst",
+            "Data analyst",
+            "specialist",
+            soul="Analyze match data without inventing live facts.",
+        ),
+        TeamRole(
+            "tactics-analyst", "Tactics analyst", "specialist", soul="Analyze tactical matchups."
+        ),
+        TeamRole(
+            "odds-analyst",
+            "Odds analyst",
+            "specialist",
+            soul="Analyze market odds and uncertainty.",
+        ),
+        TeamRole(
+            "history-analyst",
+            "History analyst",
+            "specialist",
+            soul="Analyze relevant historical evidence.",
+        ),
+        TeamRole(
+            "risk-officer",
+            "Risk officer",
+            "specialist",
+            soul="Identify uncertainty and risk controls.",
+        ),
+        TeamRole(
+            "ev-analyst", "EV analyst", "specialist", soul="Assess expected value assumptions."
+        ),
     ),
 )
 BENCHMARK_FINANCE = TeamTemplate(
-    "benchmark-finance", "v1", "Benchmark finance", FINANCE_MARKET_RESEARCH.roles, public=False
+    "benchmark-finance",
+    "v1",
+    "Benchmark finance",
+    (
+        TeamRole(
+            "coordinator",
+            "Finance Research Coordinator",
+            "coordinator",
+            allowed_tools=("spawn_subagent",),
+        ),
+        TeamRole("accounting", "Finance Accounting Analyst", "specialist"),
+        TeamRole("governance", "Finance Governance Specialist", "specialist"),
+        TeamRole("methodology", "Finance Methodology Specialist", "specialist"),
+        TeamRole("retriever", "Finance Retrieval Specialist", "specialist"),
+        TeamRole("risk", "Finance Risk Analyst", "specialist"),
+    ),
+    public=False,
+)
+BENCHMARK_RUNTIME = TeamTemplate(
+    "benchmark-runtime",
+    "v1",
+    "Benchmark runtime",
+    (
+        TeamRole(
+            "coordinator",
+            "Runtime Benchmark Coordinator",
+            "coordinator",
+            allowed_tools=("spawn_subagent",),
+        ),
+        TeamRole("investigator", "Benchmark Investigator", "specialist"),
+        TeamRole("observer", "Benchmark Observer", "specialist"),
+        TeamRole("operator", "Benchmark Operator", "specialist"),
+        TeamRole("policy", "Benchmark Policy", "specialist"),
+    ),
+    public=False,
 )
 _TEMPLATES = {
     template.key: template
-    for template in (FINANCE_MARKET_RESEARCH, WORLD_CUP_ANALYSIS, BENCHMARK_FINANCE)
+    for template in (
+        FINANCE_MARKET_RESEARCH,
+        WORLD_CUP_ANALYSIS,
+        BENCHMARK_FINANCE,
+        BENCHMARK_RUNTIME,
+    )
 }
 
 
@@ -141,10 +239,14 @@ class TeamService:
                     user_id=user_id,
                     name=role.name,
                     config={
+                        **({"model": model} if model else {}),
                         "description": role.description,
-                        "model": model,
+                        "soul": role.soul,
                         "teamRole": role.key,
                         "teamMemberType": role.member_type,
+                        **(
+                            {"allowedTools": list(role.allowed_tools)} if role.allowed_tools else {}
+                        ),
                     },
                     created_at=now,
                     updated_at=now,
@@ -162,3 +264,50 @@ class TeamService:
             team = team.model_copy(update={"status": "active", "updated_at": datetime.now(UTC)})
             await store.save_team(team)
             return team, tuple(members)
+
+    async def add_specialist(
+        self, *, team_id: str, user_id: str, revision: int, role: TeamRole, model: str = ""
+    ) -> tuple[AgentTeamRecord, AgentTeamMemberRecord]:
+        if role.member_type != "specialist" or not role.key.strip() or not role.name.strip():
+            raise TeamValidationError("a specialist requires a non-empty role key and name")
+        async with UnitOfWork(self.database) as unit:
+            store = unit.require_store()
+            team = await store.get_team(team_id)
+            if team is None or team.user_id != user_id:
+                raise LookupError("team not found")
+            if team.revision != revision:
+                raise TeamValidationError("team revision conflict")
+            if team.status != "active":
+                raise TeamValidationError("archived teams cannot add members")
+            members = await store.list_team_members(team_id)
+            if len([member for member in members if member.member_type == "specialist"]) >= 12:
+                raise TeamValidationError("a team cannot contain more than 12 specialists")
+            if any(member.role_key == role.key for member in members):
+                raise TeamValidationError("team role key already exists")
+            now = datetime.now(UTC)
+            agent = AgentRecord(
+                id=f"agt_{uuid4().hex[:20]}",
+                user_id=user_id,
+                name=role.name,
+                config={
+                    **({"model": model} if model else {}),
+                    "description": role.description,
+                    "soul": role.soul,
+                    "teamRole": role.key,
+                    "teamMemberType": "specialist",
+                },
+                created_at=now,
+                updated_at=now,
+            )
+            await store.save_agent(agent)
+            member = AgentTeamMemberRecord(
+                team_id=team_id,
+                agent_id=agent.id,
+                role_key=role.key,
+                member_type="specialist",
+                display_order=len(members),
+            )
+            await store.save_team_member(member)
+            updated = team.model_copy(update={"revision": team.revision + 1, "updated_at": now})
+            await store.save_team(updated)
+            return updated, member

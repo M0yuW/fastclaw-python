@@ -11,8 +11,11 @@ from fastclaw.tools import ToolResult
 
 
 class SpawnSubagentTool:
-    def __init__(self, bus: MessageBus) -> None:
+    def __init__(self, bus: MessageBus, target_agent_ids: tuple[str, ...] = ()) -> None:
         self._bus = bus
+        agent_id: dict[str, object] = {"type": "string"}
+        if target_agent_ids:
+            agent_id["enum"] = list(target_agent_ids)
         self.definition = ToolDefinition(
             function=ToolFunction(
                 name="spawn_subagent",
@@ -20,7 +23,7 @@ class SpawnSubagentTool:
                 parameters={
                     "type": "object",
                     "properties": {
-                        "agent_id": {"type": "string"},
+                        "agent_id": agent_id,
                         "task": {"type": "string"},
                     },
                     "required": ["agent_id", "task"],

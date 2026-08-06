@@ -40,7 +40,7 @@ async def test_sqlite_defaults_and_repository_round_trip(tmp_path: Path) -> None
     try:
         async with database.session() as session:
             assert await session.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "20260806_01"
+                "20260806_02"
             )
             assert await session.scalar(text("PRAGMA journal_mode")) == "wal"
             assert await session.scalar(text("PRAGMA foreign_keys")) == 1

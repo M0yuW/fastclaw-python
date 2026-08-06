@@ -101,34 +101,56 @@ def backfill_teams(
                 users = await store.list_users()
                 for user in users:
                     agents = await store.list_agents(user.id)
-                    candidates = (
-                        ("finance-market-research", ("china", "us", "screener")),
-                        ("world-cup-analysis", ("match", "team", "player", "odds", "news", "data")),
-                    )
-                    for key, markers in candidates:
+                    candidates = {
+                        "finance-market-research": (
+                            "coordinator",
+                            "news-analyst",
+                            "news-analyst-us",
+                            "stock-screener",
+                            "stock-screener-us",
+                        ),
+                        "world-cup-analysis": (
+                            "coordinator-wc",
+                            "data-analyst",
+                            "tactics-analyst",
+                            "odds-analyst",
+                            "history-analyst",
+                            "risk-officer",
+                            "ev-analyst",
+                        ),
+                        "benchmark-finance": (
+                            "Finance Research Coordinator",
+                            "Finance Accounting Analyst",
+                            "Finance Governance Specialist",
+                            "Finance Methodology Specialist",
+                            "Finance Retrieval Specialist",
+                            "Finance Risk Analyst",
+                        ),
+                        "benchmark-runtime": (
+                            "Runtime Benchmark Coordinator",
+                            "Benchmark Investigator",
+                            "Benchmark Observer",
+                            "Benchmark Operator",
+                            "Benchmark Policy",
+                        ),
+                    }
+                    by_name = {agent.name.casefold(): agent for agent in agents}
+                    for key, names in candidates.items():
                         template = resolve_template(key)
-                        selected = [
-                            agent
-                            for agent in agents
-                            if any(marker in agent.name.lower() for marker in markers)
-                        ]
-                        coordinator = next(
-                            (
-                                agent
-                                for agent in agents
-                                if "coordinator" in agent.name.lower()
-                                and any(marker in agent.name.lower() for marker in markers)
-                            ),
-                            None,
-                        )
-                        if coordinator is None or len(selected) < len(template.roles) - 1:
+                        selected = [by_name.get(name.casefold()) for name in names]
+                        if any(agent is None for agent in selected):
+                            manifest.append(
+                                {"userId": user.id, "template": key, "status": "conflict"}
+                            )
                             continue
+                        assigned = [agent for agent in selected if agent is not None]
+                        coordinator = assigned[0]
                         request_id = f"backfill:{key}:{user.id}"
                         existing = await store.get_team_by_request(user.id, request_id)
                         entry: dict[str, object] = {
                             "userId": user.id,
                             "template": key,
-                            "agentIds": [coordinator.id, *[agent.id for agent in selected]],
+                            "agentIds": [agent.id for agent in assigned],
                             "status": "existing" if existing else "candidate",
                         }
                         manifest.append(entry)
@@ -155,7 +177,7 @@ def backfill_teams(
                                 )
                             )
                             for order, (role, agent) in enumerate(
-                                zip(template.roles[1:], selected, strict=False), 1
+                                zip(template.roles[1:], assigned[1:], strict=True), 1
                             ):
                                 await store.save_team_member(
                                     AgentTeamMemberRecord(

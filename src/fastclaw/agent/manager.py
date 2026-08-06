@@ -134,7 +134,7 @@ def _default_tools(
         ListDirTool(workspace),
         WriteFileTool(workspace),
         WebFetchTool(runtime.web_http_client),
-        SpawnSubagentTool(bus),
+        SpawnSubagentTool(bus, tuple(profile.agent.config.get("teamSpecialistIds", ()))),
         WorldCupLedgerTool(data_root),
     ]
     if profile.skills:
@@ -205,10 +205,12 @@ class ManagedAgentStream(AsyncIterator[AgentEvent]):
                         )
                     )
             finally:
+                self._manager._untrack_root(self.context.agent_id, self.context.root_execution_id)
                 if not self._saw_done:
                     self._error = self._error or "agent stream ended without a terminal event"
                 self._events.put_nowait(self._STOP)
 
+        self._manager._track_root(self.context.agent_id, self.context.root_execution_id)
         self._task = asyncio.create_task(supervise())
 
     def __aiter__(self) -> ManagedAgentStream:
@@ -264,6 +266,7 @@ class AgentRuntimeManager:
         self.bus = InProcessMessageBus(self._queue)
         self._tool_factory = tool_factory
         self._profiles: dict[str, AgentRuntimeProfile] = {}
+        self._agent_roots: dict[str, set[str]] = {}
         self.skill_catalog = SkillCatalog(config.data_root / "skills")
         package_plugins = Path(__file__).resolve().parents[1] / "bundled_plugins"
         checkout_plugins = Path(__file__).resolve().parents[3] / "plugins"
@@ -455,6 +458,20 @@ class AgentRuntimeManager:
     async def cancel_root(self, root_execution_id: str) -> None:
         await self.bus.cancel_root(root_execution_id)
 
+    async def cancel_agent_roots(self, agent_ids: tuple[str, ...]) -> None:
+        roots = {root for agent_id in agent_ids for root in self._agent_roots.get(agent_id, set())}
+        await asyncio.gather(*(self.cancel_root(root) for root in roots))
+
+    def _track_root(self, agent_id: str, root_execution_id: str) -> None:
+        self._agent_roots.setdefault(agent_id, set()).add(root_execution_id)
+
+    def _untrack_root(self, agent_id: str, root_execution_id: str) -> None:
+        roots = self._agent_roots.get(agent_id)
+        if roots is not None:
+            roots.discard(root_execution_id)
+            if not roots:
+                self._agent_roots.pop(agent_id, None)
+
     async def readiness(self) -> dict[str, bool]:
         database_ready = False
         try:
@@ -592,6 +609,7 @@ class AgentRuntimeManager:
                 store = unit.require_store()
                 permitted = False
                 source_is_team_member = False
+                target_is_team_member = False
                 for team in await store.list_teams(context.user_id):
                     members = await store.list_team_members(team.id)
                     source = next(
@@ -601,6 +619,7 @@ class AgentRuntimeManager:
                         (member for member in members if member.agent_id == agent_id), None
                     )
                     source_is_team_member = source_is_team_member or source is not None
+                    target_is_team_member = target_is_team_member or target is not None
                     if team.status != "active":
                         continue
                     if (
@@ -612,7 +631,7 @@ class AgentRuntimeManager:
                     ):
                         permitted = True
                         break
-            if source_is_team_member and not permitted:
+            if (source_is_team_member or target_is_team_member) and not permitted:
                 raise AgentRunError("team delegation is restricted to active specialists")
         profile = self._profiles[agent_id]
         selection = await self.provider_selection(profile)
@@ -806,6 +825,12 @@ class AgentRuntimeManager:
                 f"Team: {team.name}\nStatus: {team.status}\n{roster}\n\n"
                 "Only the coordinator may delegate, and only to active specialists in this roster."
             )
+            if current.member_type == "coordinator":
+                effective_config["teamSpecialistIds"] = [
+                    member.agent_id
+                    for member in members
+                    if member.member_type == "specialist" and member.status == "active"
+                ]
             break
         system_prompt = "\n\n".join(prompt_parts).replace(
             str(self.config.legacy_data_root), str(self.config.data_root)
