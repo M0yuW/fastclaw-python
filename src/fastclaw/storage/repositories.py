@@ -11,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from fastclaw.storage.models import (
     AgentFileModel,
     AgentModel,
+    AgentTeamMemberModel,
+    AgentTeamModel,
     APIKeyAgentModel,
     APIKeyModel,
     ConfigModel,
@@ -22,6 +24,8 @@ from fastclaw.storage.models import (
 from fastclaw.storage.records import (
     AgentFileRecord,
     AgentRecord,
+    AgentTeamMemberRecord,
+    AgentTeamRecord,
     APIKeyRecord,
     ConfigRecord,
     CronJobRecord,
@@ -45,6 +49,18 @@ class AgentRepository(Protocol):
     async def get_agent(self, agent_id: str) -> AgentRecord | None: ...
     async def list_agents(self, user_id: str) -> Sequence[AgentRecord]: ...
     async def delete_agent(self, agent_id: str) -> None: ...
+
+
+class AgentTeamRepository(Protocol):
+    async def save_team(self, record: AgentTeamRecord) -> None: ...
+    async def get_team(self, team_id: str) -> AgentTeamRecord | None: ...
+    async def get_team_by_request(
+        self, user_id: str, client_request_id: str
+    ) -> AgentTeamRecord | None: ...
+    async def list_teams(self, user_id: str) -> Sequence[AgentTeamRecord]: ...
+    async def delete_team(self, team_id: str) -> None: ...
+    async def save_team_member(self, record: AgentTeamMemberRecord) -> None: ...
+    async def list_team_members(self, team_id: str) -> Sequence[AgentTeamMemberRecord]: ...
 
 
 class SessionRepository(Protocol):
@@ -212,6 +228,52 @@ class SQLAlchemyStore:
         )
         await self.session.execute(delete(AgentModel).where(AgentModel.id == agent_id))
 
+    async def save_team(self, record: AgentTeamRecord) -> None:
+        await self.session.merge(AgentTeamModel(**record.model_dump()))
+
+    async def get_team(self, team_id: str) -> AgentTeamRecord | None:
+        model = await self.session.get(AgentTeamModel, team_id)
+        return self._team_record(model) if model is not None else None
+
+    async def get_team_by_request(
+        self, user_id: str, client_request_id: str
+    ) -> AgentTeamRecord | None:
+        if not client_request_id:
+            return None
+        model = await self.session.scalar(
+            select(AgentTeamModel).where(
+                AgentTeamModel.user_id == user_id,
+                AgentTeamModel.client_request_id == client_request_id,
+            )
+        )
+        return self._team_record(model) if model is not None else None
+
+    async def list_teams(self, user_id: str) -> Sequence[AgentTeamRecord]:
+        models = (
+            await self.session.scalars(
+                select(AgentTeamModel)
+                .where(AgentTeamModel.user_id == user_id)
+                .order_by(AgentTeamModel.created_at, AgentTeamModel.id)
+            )
+        ).all()
+        return [self._team_record(model) for model in models]
+
+    async def delete_team(self, team_id: str) -> None:
+        await self.session.execute(delete(AgentTeamModel).where(AgentTeamModel.id == team_id))
+
+    async def save_team_member(self, record: AgentTeamMemberRecord) -> None:
+        await self.session.merge(AgentTeamMemberModel(**record.model_dump()))
+
+    async def list_team_members(self, team_id: str) -> Sequence[AgentTeamMemberRecord]:
+        models = (
+            await self.session.scalars(
+                select(AgentTeamMemberModel)
+                .where(AgentTeamMemberModel.team_id == team_id)
+                .order_by(AgentTeamMemberModel.display_order, AgentTeamMemberModel.agent_id)
+            )
+        ).all()
+        return [self._team_member_record(model) for model in models]
+
     async def save_session(self, record: SessionRecord) -> None:
         await self.session.merge(SessionModel(**record.model_dump()))
 
@@ -369,6 +431,33 @@ class SQLAlchemyStore:
             is_public=model.is_public,
             created_at=model.created_at,
             updated_at=model.updated_at,
+        )
+
+    @staticmethod
+    def _team_record(model: AgentTeamModel) -> AgentTeamRecord:
+        return AgentTeamRecord(
+            id=model.id,
+            user_id=model.user_id,
+            name=model.name,
+            description=model.description,
+            template_key=model.template_key,
+            template_version=model.template_version,
+            status=model.status,
+            revision=model.revision,
+            client_request_id=model.client_request_id,
+            created_at=model.created_at,
+            updated_at=model.updated_at,
+        )
+
+    @staticmethod
+    def _team_member_record(model: AgentTeamMemberModel) -> AgentTeamMemberRecord:
+        return AgentTeamMemberRecord(
+            team_id=model.team_id,
+            agent_id=model.agent_id,
+            role_key=model.role_key,
+            member_type=model.member_type,
+            status=model.status,
+            display_order=model.display_order,
         )
 
     @staticmethod

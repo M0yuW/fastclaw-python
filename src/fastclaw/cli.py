@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
+from uuid import uuid4
 
 import typer
 
@@ -15,7 +17,8 @@ from fastclaw.cutover import audit_cutover
 from fastclaw.migration import AssetImportConflictError, import_assets, import_go_database
 from fastclaw.runtime import Runtime
 from fastclaw.skills import SkillCatalog
-from fastclaw.storage import Database
+from fastclaw.storage import AgentTeamMemberRecord, AgentTeamRecord, Database
+from fastclaw.teams import TeamValidationError, resolve_template
 
 _DEFAULT_DATA_ROOT = Path.home() / ".fastclaw-python"
 
@@ -77,6 +80,102 @@ def import_runtime_assets(
         typer.echo(json.dumps(exc.report.model_dump(mode="json"), indent=2, sort_keys=True))
         raise typer.Exit(code=2) from exc
     typer.echo(json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True))
+
+
+@migrate_app.command("backfill-teams")
+def backfill_teams(
+    database_url: Annotated[str, typer.Option(help="Python database URL.")],
+    dry_run: Annotated[bool, typer.Option(help="Report candidate teams without writing.")] = False,
+) -> None:
+    """Idempotently group known imported finance and World Cup teams by their Agent names."""
+
+    async def run() -> dict[str, object]:
+        database = Database(database_url)
+        await database.create_schema()
+        manifest: list[dict[str, object]] = []
+        try:
+            from fastclaw.storage import UnitOfWork
+
+            async with UnitOfWork(database) as unit:
+                store = unit.require_store()
+                users = await store.list_users()
+                for user in users:
+                    agents = await store.list_agents(user.id)
+                    candidates = (
+                        ("finance-market-research", ("china", "us", "screener")),
+                        ("world-cup-analysis", ("match", "team", "player", "odds", "news", "data")),
+                    )
+                    for key, markers in candidates:
+                        template = resolve_template(key)
+                        selected = [
+                            agent
+                            for agent in agents
+                            if any(marker in agent.name.lower() for marker in markers)
+                        ]
+                        coordinator = next(
+                            (
+                                agent
+                                for agent in agents
+                                if "coordinator" in agent.name.lower()
+                                and any(marker in agent.name.lower() for marker in markers)
+                            ),
+                            None,
+                        )
+                        if coordinator is None or len(selected) < len(template.roles) - 1:
+                            continue
+                        request_id = f"backfill:{key}:{user.id}"
+                        existing = await store.get_team_by_request(user.id, request_id)
+                        entry: dict[str, object] = {
+                            "userId": user.id,
+                            "template": key,
+                            "agentIds": [coordinator.id, *[agent.id for agent in selected]],
+                            "status": "existing" if existing else "candidate",
+                        }
+                        manifest.append(entry)
+                        if existing is None and not dry_run:
+                            now = datetime.now(UTC)
+                            team = AgentTeamRecord(
+                                id=f"team_{uuid4().hex}",
+                                user_id=user.id,
+                                name=template.name,
+                                template_key=key,
+                                template_version=template.version,
+                                status="active",
+                                client_request_id=request_id,
+                                created_at=now,
+                                updated_at=now,
+                            )
+                            await store.save_team(team)
+                            await store.save_team_member(
+                                AgentTeamMemberRecord(
+                                    team_id=team.id,
+                                    agent_id=coordinator.id,
+                                    role_key="coordinator",
+                                    member_type="coordinator",
+                                )
+                            )
+                            for order, (role, agent) in enumerate(
+                                zip(template.roles[1:], selected, strict=False), 1
+                            ):
+                                await store.save_team_member(
+                                    AgentTeamMemberRecord(
+                                        team_id=team.id,
+                                        agent_id=agent.id,
+                                        role_key=role.key,
+                                        member_type="specialist",
+                                        display_order=order,
+                                    )
+                                )
+                            entry["status"] = "created"
+            return {"dryRun": dry_run, "manifest": manifest, "count": len(manifest)}
+        finally:
+            await database.close()
+
+    try:
+        payload = asyncio.run(run())
+    except TeamValidationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    typer.echo(json.dumps(payload, indent=2, sort_keys=True))
 
 
 @skills_app.command("list")

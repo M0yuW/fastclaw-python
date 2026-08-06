@@ -80,6 +80,42 @@ class AgentModel(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class AgentTeamModel(Base):
+    __tablename__ = "agent_teams"
+    __table_args__ = (UniqueConstraint("user_id", "client_request_id"),)
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String)
+    description: Mapped[str] = mapped_column(Text, default="")
+    template_key: Mapped[str] = mapped_column(String, default="custom")
+    template_version: Mapped[str] = mapped_column(String, default="v1")
+    status: Mapped[str] = mapped_column(String, default="provisioning", index=True)
+    revision: Mapped[int] = mapped_column(default=1)
+    client_request_id: Mapped[str] = mapped_column(String, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class AgentTeamMemberModel(Base):
+    __tablename__ = "agent_team_members"
+    __table_args__ = (
+        UniqueConstraint("team_id", "agent_id"),
+        UniqueConstraint("team_id", "role_key"),
+    )
+
+    team_id: Mapped[str] = mapped_column(
+        ForeignKey("agent_teams.id", ondelete="CASCADE"), primary_key=True
+    )
+    agent_id: Mapped[str] = mapped_column(
+        ForeignKey("agents.id", ondelete="RESTRICT"), primary_key=True
+    )
+    role_key: Mapped[str] = mapped_column(String)
+    member_type: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String, default="active", index=True)
+    display_order: Mapped[int] = mapped_column(default=0)
+
+
 class SessionModel(Base):
     __tablename__ = "sessions"
 

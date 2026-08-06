@@ -1,0 +1,164 @@
+"""Team templates and atomic persistence for coordinator-led Agent teams."""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from uuid import uuid4
+
+from fastclaw.storage import (
+    AgentRecord,
+    AgentTeamMemberRecord,
+    AgentTeamRecord,
+    Database,
+    UnitOfWork,
+)
+
+
+class TeamValidationError(ValueError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class TeamRole:
+    key: str
+    name: str
+    member_type: str
+    description: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class TeamTemplate:
+    key: str
+    version: str
+    name: str
+    roles: tuple[TeamRole, ...]
+    public: bool = True
+
+
+FINANCE_MARKET_RESEARCH = TeamTemplate(
+    "finance-market-research",
+    "v1",
+    "Finance market research",
+    (
+        TeamRole("coordinator", "Research coordinator", "coordinator"),
+        TeamRole("china-news-analyst", "China news analyst", "specialist"),
+        TeamRole("us-news-analyst", "US news analyst", "specialist"),
+        TeamRole("stock-screener", "Stock screener", "specialist"),
+    ),
+)
+WORLD_CUP_ANALYSIS = TeamTemplate(
+    "world-cup-analysis",
+    "v1",
+    "World Cup analysis",
+    (
+        TeamRole("coordinator", "World Cup coordinator", "coordinator"),
+        TeamRole("match-analyst", "Match analyst", "specialist"),
+        TeamRole("team-analyst", "Team analyst", "specialist"),
+        TeamRole("player-analyst", "Player analyst", "specialist"),
+        TeamRole("odds-analyst", "Odds analyst", "specialist"),
+        TeamRole("news-analyst", "News analyst", "specialist"),
+        TeamRole("data-analyst", "Data analyst", "specialist"),
+    ),
+)
+BENCHMARK_FINANCE = TeamTemplate(
+    "benchmark-finance", "v1", "Benchmark finance", FINANCE_MARKET_RESEARCH.roles, public=False
+)
+_TEMPLATES = {
+    template.key: template
+    for template in (FINANCE_MARKET_RESEARCH, WORLD_CUP_ANALYSIS, BENCHMARK_FINANCE)
+}
+
+
+def public_templates() -> tuple[TeamTemplate, ...]:
+    return tuple(template for template in _TEMPLATES.values() if template.public)
+
+
+def resolve_template(key: str, custom_roles: Sequence[TeamRole] = ()) -> TeamTemplate:
+    if key == "custom":
+        return TeamTemplate("custom", "v1", "Custom", tuple(custom_roles))
+    try:
+        return _TEMPLATES[key]
+    except KeyError as exc:
+        raise TeamValidationError(f"unknown team template: {key}") from exc
+
+
+def validate_roles(roles: Sequence[TeamRole]) -> None:
+    coordinators = [role for role in roles if role.member_type == "coordinator"]
+    specialists = [role for role in roles if role.member_type == "specialist"]
+    keys = [role.key for role in roles]
+    if len(coordinators) != 1:
+        raise TeamValidationError("a team must contain exactly one coordinator")
+    if not 1 <= len(specialists) <= 12:
+        raise TeamValidationError("a team must contain between 1 and 12 specialists")
+    if len(keys) != len(set(keys)) or any(not key.strip() for key in keys):
+        raise TeamValidationError("team role keys must be non-empty and unique")
+
+
+class TeamService:
+    def __init__(self, database: Database) -> None:
+        self.database = database
+
+    async def create(
+        self,
+        *,
+        user_id: str,
+        name: str,
+        description: str,
+        template_key: str,
+        client_request_id: str,
+        model: str = "",
+        custom_roles: Sequence[TeamRole] = (),
+    ) -> tuple[AgentTeamRecord, tuple[AgentTeamMemberRecord, ...]]:
+        if not name.strip() or not client_request_id.strip():
+            raise TeamValidationError("team name and clientRequestId are required")
+        template = resolve_template(template_key, custom_roles)
+        validate_roles(template.roles)
+        async with UnitOfWork(self.database) as unit:
+            store = unit.require_store()
+            existing = await store.get_team_by_request(user_id, client_request_id)
+            if existing is not None:
+                return existing, tuple(await store.list_team_members(existing.id))
+            now = datetime.now(UTC)
+            team = AgentTeamRecord(
+                id=f"team_{uuid4().hex}",
+                user_id=user_id,
+                name=name.strip(),
+                description=description,
+                template_key=template.key,
+                template_version=template.version,
+                status="provisioning",
+                client_request_id=client_request_id,
+                created_at=now,
+                updated_at=now,
+            )
+            await store.save_team(team)
+            members: list[AgentTeamMemberRecord] = []
+            for position, role in enumerate(template.roles):
+                agent = AgentRecord(
+                    id=f"agt_{uuid4().hex[:20]}",
+                    user_id=user_id,
+                    name=role.name,
+                    config={
+                        "description": role.description,
+                        "model": model,
+                        "teamRole": role.key,
+                        "teamMemberType": role.member_type,
+                    },
+                    created_at=now,
+                    updated_at=now,
+                )
+                await store.save_agent(agent)
+                member = AgentTeamMemberRecord(
+                    team_id=team.id,
+                    agent_id=agent.id,
+                    role_key=role.key,
+                    member_type=role.member_type,
+                    display_order=position,
+                )
+                await store.save_team_member(member)
+                members.append(member)
+            team = team.model_copy(update={"status": "active", "updated_at": datetime.now(UTC)})
+            await store.save_team(team)
+            return team, tuple(members)
