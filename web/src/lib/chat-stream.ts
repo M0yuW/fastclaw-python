@@ -5,6 +5,7 @@ export interface StreamToolCall<TMetadata = ToolResultMetadata> {
   name: string;
   arguments: string;
   result?: string;
+  isError?: boolean;
   metadata?: TMetadata;
 }
 
@@ -140,7 +141,12 @@ export function reduceChatStreamEvents<T extends StreamMessage>(messages: T[], e
       next = [...next.slice(0, index), {
         ...current,
         toolCalls: current.toolCalls?.map((tool) => tool.id === data.id
-          ? { ...tool, result: data.result ?? "", metadata: data.metadata }
+          ? {
+              ...tool,
+              result: data.result ?? "",
+              isError: data.isError ?? data.metadata?.isError,
+              metadata: data.metadata,
+            }
           : tool),
         _stream: nextStream,
       } as T, ...next.slice(index + 1)];

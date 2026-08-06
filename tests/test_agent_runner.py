@@ -340,6 +340,10 @@ async def test_tool_exceptions_are_visible_to_model_and_event_stream() -> None:
     second_request_tool = provider.requests[1].messages[-1]
     assert "tool 'echo' failed (reference " in str(second_request_tool.content)
     assert "fixture failure" not in str(second_request_tool.content)
+    saved_tool = next(
+        message for message in persistence.saved[-1].messages if message["role"] == "tool"
+    )
+    assert saved_tool["metadata"]["isError"] is True
 
 
 @pytest.mark.asyncio

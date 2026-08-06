@@ -256,7 +256,17 @@ async def test_root_and_nested_runs_share_queue_without_deadlock(tmp_path: Path)
         assert coordinator_requests[0].max_tokens == 8192
         assert coordinator_requests[0].temperature == 0.1
         assert [tool.function.name for tool in coordinator_requests[0].tools] == ["spawn_subagent"]
+        assert "emit several ordinary `spawn_subagent` tool calls" in str(
+            coordinator_requests[0].messages[0].content
+        )
+        assert "Do not use legacy `delegations`, `sharedContext`, or `agentId`" in str(
+            coordinator_requests[0].messages[0].content
+        )
         assert specialist_requests[0].tools == ()
+        assert all(
+            "Runtime delegation contract" not in str(message.content)
+            for message in specialist_requests[0].messages
+        )
         async with UnitOfWork(database) as unit:
             store = unit.require_store()
             root_session = await store.get_session("user-1", coordinator.id, "shared-session")

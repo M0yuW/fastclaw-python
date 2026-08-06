@@ -90,13 +90,13 @@ CI，没有 rebase、force push 或删除 Go 历史。
 
 | 命令 | 预期输出 |
 |---|---|
-| `pytest -q` | `145 passed, 1 skipped`（skip = 本机无 PostgreSQL 服务） |
+| `pytest -q` | `153 passed, 1 skipped`（skip = 本机无 PostgreSQL 服务） |
 | `(cd plugins/finance-tools && ../../.venv/bin/python -m unittest -v test_plugin.py)` | `10 passed` |
 | `ruff check .` | `All checks passed` |
-| `ruff format --check .` | `112 files already formatted` |
-| `mypy` | `Success: no issues found in 83 source files`（strict） |
+| `ruff format --check .` | `114 files already formatted` |
+| `mypy` | `Success: no issues found in 84 source files`（strict） |
 | `alembic upgrade head` && `alembic check` | 升级至 `20260805_01`，无漂移 |
-| `python scripts/verify_web_snapshot.py` | `86 unchanged + 4 declared overlays + 4 attributed additions` |
+| `python scripts/verify_web_snapshot.py` | `84 unchanged + 6 declared overlays + 4 attributed additions` |
 | `pnpm --dir web lint` / `build` | exit 0；build 产出 25 routes |
 
 注意：`alembic upgrade head` 会在工作树里生成 `fastclaw.db`，复跑后请删除，否则 `git status` 不干净。
@@ -119,9 +119,9 @@ chat/SSE、工具与取消也已通过，见 `evidence/runtime-wiring-smoke-2026
 独立 Go/Python disposable 副本上的认证双服务差分见
 `evidence/differential-authenticated-2026-08-06.json`。
 
-发行包已在本机实际构建并通过 `twine check`：分别包含 71/229 个 wheel/sdist
+发行包已在本机实际构建并通过 `twine check`：分别包含 71/232 个 wheel/sdist
 文件。`scripts/verify_distribution.py` 会阻断缺失 Alembic/plugin/cutover 运行文件、
-两个可复现 wiring smoke 脚本，
+两个可复现 wiring smoke 脚本、credentialed live smoke 执行器及其固定 fixture，
 以及把 `node_modules`、`.next`、`out` 等本地 Web 产物混入 sdist 的回归。修复前
 sdist 曾达到约 105 MiB、21,901 个文件，因此这一检查不能只依赖 `twine check`。
 
@@ -135,8 +135,8 @@ sdist 曾达到约 105 MiB、21,901 个文件，因此这一检查不能只依�
 
 本阶段代码与文档变更已实现，完成验证后即可解除对应合并阻断：
 
-- **G1 Web 快照口径**统一为 `86 unchanged + 4 declared overlays + 4 attributed additions`，并由脚本输出和机械搜索共同锁定。
-- **G2 Web overlay 哈希**已写入 `web-python-overlays.json`；`verify_web_snapshot.py` 会校验全部 4 个 overlay，参数化测试逐一证明篡改会失败。
+- **G1 Web 快照口径**统一为 `84 unchanged + 6 declared overlays + 4 attributed additions`，并由脚本输出和机械搜索共同锁定。
+- **G2 Web overlay 哈希**已写入 `web-python-overlays.json`；`verify_web_snapshot.py` 会校验全部 6 个 overlay，参数化测试逐一证明篡改会失败。
 - **G3 可信身份契约**已由回归测试锁定：`spawn_subagent` schema 只能暴露 `agent_id` 与 `task`，模型提供的 user/root/call-path 字段不影响可信上下文；plugin 的 10 个 camelCase/snake_case 受保护名称均逐一拒绝。
 - **G4 differential 状态**已关闭：真实 Go/Python 的未认证 health/status 与认证身份、Agent/chat/SSE、5 对 ToolCall/ToolResult、任务终态和取消均已执行并留证；真实 Provider 异常与业务结果属于 J2/J3。
 - **G5 切换审计**已实现：`fastclaw cutover audit` 在一次性安全副本上核对 2 用户、27 Agent、模型来源、角色文件、tool policy、Skill、Provider、ODDS、plugin、FK/ACL/Session/channel 状态，并以退出码 2 阻断不完整切换。当前真实副本只剩三项集中凭据未配置。
@@ -144,6 +144,16 @@ sdist 曾达到约 105 MiB、21,901 个文件，因此这一检查不能只依�
   Provider 跑通四个 coordinator、18 对 ToolCall/ToolResult、账本 direct-return 和
   HTTP Abort；无活动任务、跨租户 Session 或残缺 assistant 持久化。该证据不替代
   真实 Provider/业务结果 smoke。
+- **J3 live 执行器**已完成：`scripts/cutover_live_smoke.py` 锁定四个 coordinator、
+  17 个目标专家与账本 report，拒绝任何 `tool_result.isError`、重复/失配 ToolCall、
+  跨租户 Session、非终态 task 或空回复。认证只从两个环境变量读取，输出只保留
+  内容 hash/字节数，不记录 cookie、模型内容或工具结果；必须提供精确的写入确认值，
+  且硬拒绝 Go 数据目录。当前只缺轮换后的凭据来实际执行。
+- **旧 coordinator prompt 兼容**已收口：只要 profile 可用 `spawn_subagent`，运行时
+  都追加权威契约，要求多个普通 `{agent_id, task}` ToolCall，明确禁止旧 SOUL 中的
+  `delegations/sharedContext/agentId` 包装；导入文件保持原始 hash 不变。
+- **ToolResult 假绿**已关闭：失败状态写入 SSE `isError` 和 Session metadata，Web
+  历史/实时界面均显示红色失败及失败计数；live smoke 对任一结构化工具错误 fail closed。
 - **批量委派门禁**已完成：同一模型轮次的多个 `spawn_subagent` 通过显式 BatchTool
   协议进入 `MessageBus.batch()`；不同目标并行，结果按输入顺序回填。其他有副作用工具
   不会被隐式并发，batch 错误仍只向模型暴露稳定分类与安全文案。

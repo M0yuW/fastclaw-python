@@ -54,6 +54,16 @@ _STANDARD_PROVIDERS: dict[str, tuple[str, str]] = {
     "openrouter": ("https://openrouter.ai/api/v1", "openai-compatible"),
 }
 
+_DELEGATION_TOOL_PROMPT = """## Runtime delegation contract
+
+`spawn_subagent` accepts exactly two arguments: `agent_id` and `task`. Tenant,
+session, root execution, and call-path identity are injected by the Runtime and
+must not be supplied by the model. To delegate several independent tasks in
+parallel, emit several ordinary `spawn_subagent` tool calls in the same
+assistant turn. Do not use legacy `delegations`, `sharedContext`, or `agentId`
+wrapper fields.
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class AgentRuntimeConfig:
@@ -717,6 +727,8 @@ class AgentRuntimeManager:
                 allowed_tools = frozenset(coordinator_tools)
             else:
                 allowed_tools = frozenset({"read_file", "web_fetch", "list_dir", "write_file"})
+        if allowed_tools is None or "spawn_subagent" in allowed_tools:
+            prompt_parts.append(_DELEGATION_TOOL_PROMPT.strip())
         system_prompt = "\n\n".join(prompt_parts).replace(
             str(self.config.legacy_data_root), str(self.config.data_root)
         )

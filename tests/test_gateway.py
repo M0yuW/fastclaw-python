@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastclaw.agent import AgentEvent, AgentEventType
 from fastclaw.app import create_app
 from fastclaw.gateway import GatewaySettings
-from fastclaw.gateway.router import _web_event
+from fastclaw.gateway.router import _web_event, _web_history_message
 from fastclaw.identity import hash_api_key, hash_password
 from fastclaw.orchestration import TaskSnapshot
 from fastclaw.providers import FunctionCall, ToolCall
@@ -99,6 +99,7 @@ def test_sse_tool_result_preserves_call_identity_for_pairing() -> None:
             tool_call=call,
             tool_result="content",
             tool_metadata={"sandbox": True},
+            is_error=True,
         )
     )
 
@@ -106,6 +107,42 @@ def test_sse_tool_result_preserves_call_identity_for_pairing() -> None:
     assert payload["data"]["name"] == "read_file"
     assert payload["data"]["result"] == "content"
     assert payload["data"]["metadata"] == {"sandbox": True}
+    assert payload["data"]["isError"] is True
+
+    success = _web_event(
+        AgentEvent(
+            type=AgentEventType.TOOL_RESULT,
+            turn_id="turn-1",
+            message_id="message-1",
+            round=0,
+            seq=2,
+            tool_call=call.model_copy(update={"id": "call-2"}),
+            tool_result="ok",
+        )
+    )
+    assert "isError" not in success["data"]
+
+
+def test_web_history_flattens_internal_provider_tool_calls() -> None:
+    message = {
+        "role": "assistant",
+        "content": "",
+        "toolCalls": [
+            {
+                "id": "call-1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"path":"a.txt"}'},
+            }
+        ],
+        "_raw": {"provider": "fixture"},
+    }
+
+    assert _web_history_message(message) == {
+        "role": "assistant",
+        "content": "",
+        "toolCalls": [{"id": "call-1", "name": "read_file", "arguments": '{"path":"a.txt"}'}],
+        "_raw": {"provider": "fixture"},
+    }
 
 
 def test_sse_content_delta_preserves_legacy_content_alias() -> None:

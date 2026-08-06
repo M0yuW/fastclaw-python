@@ -18,8 +18,10 @@ _REQUIRED_WHEEL_SUFFIXES = {
     "fastclaw/py.typed",
 }
 _REQUIRED_SDIST_SUFFIXES = {
+    "scripts/cutover_live_smoke.py",
     "scripts/cutover_wiring_smoke.py",
     "scripts/fixture_multiagent_provider.py",
+    "tests/fixtures/cutover-live-smoke.json",
 }
 _FORBIDDEN_SDIST_PARTS = {
     ".mypy_cache",

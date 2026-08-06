@@ -607,6 +607,7 @@ export async function sendChat(agentId: string, sessionId: string, message: stri
 
 export interface ToolResultMetadata {
   sandbox?: boolean;
+  isError?: boolean;
 }
 
 export interface ChatStreamEvent {
@@ -619,6 +620,7 @@ export interface ChatStreamEvent {
     name?: string;
     arguments?: string;
     result?: string;
+    isError?: boolean;
     message?: string;
     metadata?: ToolResultMetadata;
     turnId?: string;

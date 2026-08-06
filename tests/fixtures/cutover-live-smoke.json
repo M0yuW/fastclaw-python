@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "scenarios": [
+    {
+      "name": "finance-production",
+      "principal": "production",
+      "agentId": "agt_0b741037d5175a6c0c2a",
+      "message": "CUTOVER FIXTURE finance-production. Analyze Apple (AAPL) using both company/market evidence and recent US-market news. Delegate exactly once to agt_4e85c80c71dc538a1139 and exactly once to agt_5bb1e62935afc80d77ce, then give a concise synthesis with uncertainty. Do not delegate to any other Agent.",
+      "expectedDelegations": [
+        "agt_4e85c80c71dc538a1139",
+        "agt_5bb1e62935afc80d77ce"
+      ],
+      "requiredTools": {
+        "spawn_subagent": 2
+      }
+    },
+    {
+      "name": "worldcup-production",
+      "principal": "production",
+      "agentId": "agt_0810c26790ce1c32bb11",
+      "message": "CUTOVER FIXTURE worldcup-production. Using the fixed hypothetical evidence 'Team A vs Team B; neutral venue; market 1X2 odds 2.10/3.20/3.60', request one independent assessment from each of agt_3372d8716415f15b50cc, agt_2dc40bf88b2398422edd, agt_5909ce07c02eea3c535a, agt_b3925b25aab7705a0f85, agt_7bbaaf3aced233f3a329, and agt_70b89a987f1a6f6c2383. Do not invent live facts. After all six results, call worldcup_ledger with operation=report and return that authoritative report directly.",
+      "expectedDelegations": [
+        "agt_3372d8716415f15b50cc",
+        "agt_2dc40bf88b2398422edd",
+        "agt_5909ce07c02eea3c535a",
+        "agt_b3925b25aab7705a0f85",
+        "agt_7bbaaf3aced233f3a329",
+        "agt_70b89a987f1a6f6c2383"
+      ],
+      "requiredTools": {
+        "spawn_subagent": 6,
+        "worldcup_ledger": 1
+      }
+    },
+    {
+      "name": "finance-benchmark",
+      "principal": "benchmark",
+      "agentId": "finance-coordinator",
+      "message": "CUTOVER FIXTURE finance-benchmark. Research the fixed question: what governance, accounting, methodology, retrieval/source, and risk evidence should be checked before relying on a public-company earnings trend? In one assistant turn emit one ordinary spawn_subagent call for each of finance-accounting, finance-governance, finance-methodology, finance-retriever, and finance-risk. Use only agent_id and task arguments, then synthesize all five results.",
+      "expectedDelegations": [
+        "finance-accounting",
+        "finance-governance",
+        "finance-methodology",
+        "finance-retriever",
+        "finance-risk"
+      ],
+      "requiredTools": {
+        "spawn_subagent": 5
+      }
+    },
+    {
+      "name": "runtime-benchmark",
+      "principal": "benchmark",
+      "agentId": "bench-coordinator",
+      "message": "CUTOVER FIXTURE runtime-benchmark. Evaluate a fixed hypothetical incident: a queued task is cancelled during shutdown while a sibling task completes. In one assistant turn emit one ordinary spawn_subagent call for each of bench-investigator, bench-observer, bench-operator, and bench-policy. Use only agent_id and task arguments, then synthesize all four results.",
+      "expectedDelegations": [
+        "bench-investigator",
+        "bench-observer",
+        "bench-operator",
+        "bench-policy"
+      ],
+      "requiredTools": {
+        "spawn_subagent": 4
+      }
+    }
+  ]
+}

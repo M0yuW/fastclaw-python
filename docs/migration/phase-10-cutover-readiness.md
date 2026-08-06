@@ -17,12 +17,12 @@
 
 | 项目 | 结果 |
 |---|---|
-| `pytest -q` | 142 passed, 1 skipped（PostgreSQL 本机无服务） |
+| `pytest -q` | 153 passed, 1 skipped（PostgreSQL 本机无服务） |
 | `ruff check .` | All checks passed |
-| `ruff format --check .` | 112 files already formatted |
-| `mypy` | Success: no issues found in 83 source files |
+| `ruff format --check .` | 114 files already formatted |
+| `mypy` | Success: no issues found in 84 source files |
 | `alembic upgrade head` + `alembic check` | 升级至 `20260805_01`，无漂移 |
-| `scripts/verify_web_snapshot.py` | 86 unchanged + 4 declared overlays + 4 attributed additions |
+| `scripts/verify_web_snapshot.py` | 84 unchanged + 6 declared overlays + 4 attributed additions |
 | 分支状态 | 从 `main@4f1df92` 追加提交，未 rebase，未 force push |
 
 抽查确认到位的修复：
@@ -55,17 +55,17 @@
 ```
 只在 Python:  LICENSE  SOURCE.md  e2e/runtime.spec.ts  playwright.config.ts
 只在 Go:      next-env.d.ts
-共有:         90（其中 4 个为已声明 overlay）
+共有:         90（当前其中 6 个为已声明 overlay）
 ```
 
-- 把所有文档、PR 描述、交接手册的验收口径改为脚本实际执行的三个数字：**86 个未改动 + 4 个已声明 overlay + 4 个归属新增**。
+- 把所有文档、PR 描述、交接手册的验收口径改为脚本实际执行的三个数字。最初为 **86 个未改动 + 4 个已声明 overlay + 4 个归属新增**；ToolResult 失败可见性又显式修改 chat page 与 reducer 后，当前为 **84 + 6 + 4**。
 - 口径必须与 `scripts/verify_web_snapshot.py` 的输出逐字对应，可机械核对。
 
-**验收**：全仓快照验收摘要统一为 `86 unchanged + 4 declared overlays + 4 attributed additions`；`grep` 可机械核对。
+**验收**：全仓当前快照验收摘要统一为 `84 unchanged + 6 declared overlays + 4 attributed additions`；`grep` 可机械核对。
 
 ### G2 · 给 Web overlay 钉哈希
 
-`verify_web_snapshot.py:97-103` 跳过 `modified` 集合中的文件，因此 4 个 overlay 此后无任何内容保护。其中 `src/lib/api.ts` 承载只读 actAs 传播，`src/app/agents/page.tsx` 承载管理员导航——权限相关代码可被静默改动而 CI 全绿。
+`verify_web_snapshot.py:97-103` 曾跳过 `modified` 集合中的文件，因此 overlay 此后无任何内容保护。其中 `src/lib/api.ts` 承载只读 actAs 传播，`src/app/agents/page.tsx` 承载管理员导航——权限相关代码可被静默改动而 CI 全绿。当前清单另含 chat page 与 reducer，共 6 个 overlay。
 
 已实测确认该行为：改 `src/app/page.tsx`（未声明）→ `RuntimeError: web snapshot hashes differ`；改 `src/lib/api.ts`（已声明 overlay）→ 通过。
 
@@ -73,7 +73,7 @@
 - 校验时对 overlay 文件比对声明的 SHA-256；改动 overlay 必须同步更新清单，形成显式审计动作。
 - 新增单测：篡改任一 overlay 文件而不更新清单，校验必须失败。
 
-**验收**：对 4 个 overlay 逐一注入改动，校验全部报错。
+**验收**：对当前 6 个 overlay 逐一注入改动，校验全部报错。
 
 ### G3 · 补齐可信身份的锁定契约测试
 
@@ -195,6 +195,15 @@ benchmark coordinator、Runtime benchmark coordinator。18 个 ToolCall/ToolResu
 `--acknowledge-disposable-copy`，且硬拒绝默认 Go/Python live 数据库路径；两个脚本均
 被 sdist 完整性门禁锁定。session cookie 只应使用写入副本的一次性值，不得使用或
 记录旧账号口令/API key。
+
+真实业务结果入口已固化为 `scripts/cutover_live_smoke.py` 与
+`tests/fixtures/cutover-live-smoke.json`。它覆盖生产金融、生产世界杯、finance
+benchmark 和 Runtime benchmark 四个 coordinator，锁定 17 个委派目标及账本 report；
+对 SSE/落库两侧的错误状态、ToolCall 配对、租户归属、Session 数和活动 task 均 fail
+closed。命令只接受环境中的
+`FASTCLAW_CUTOVER_PRODUCTION_SESSION` / `FASTCLAW_CUTOVER_BENCHMARK_SESSION`，
+必须传入精确的 `--acknowledge-live-cutover` 值，且报告只保留内容 SHA-256 与字节数。
+在三项轮换凭据配置且 `/readyz` 为 200 前不得执行或宣称 J3 完成。
 
 ---
 

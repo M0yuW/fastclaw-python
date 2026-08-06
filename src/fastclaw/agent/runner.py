@@ -178,12 +178,16 @@ class AgentRunner:
                             timeout_seconds=request.tool_timeout,
                         )
                         for call, result in zip(assistant.tool_calls, batch_results, strict=True):
+                            message_metadata = dict(result.metadata)
+                            if result.is_error:
+                                message_metadata["isError"] = True
                             history.append(
                                 ChatMessage(
                                     role=MessageRole.TOOL,
                                     content=result.content,
                                     tool_call_id=call.id,
                                     name=call.function.name,
+                                    metadata=message_metadata,
                                 )
                             )
                             yield event(
@@ -217,12 +221,16 @@ class AgentRunner:
                             result_metadata = result.metadata
                         if parse_error:
                             direct_return = False
+                        message_metadata = dict(result_metadata)
+                        if is_error:
+                            message_metadata["isError"] = True
                         history.append(
                             ChatMessage(
                                 role=MessageRole.TOOL,
                                 content=result_content,
                                 tool_call_id=call.id,
                                 name=call.function.name,
+                                metadata=message_metadata,
                             )
                         )
                         yield event(
