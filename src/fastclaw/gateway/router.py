@@ -40,6 +40,7 @@ from fastclaw.gateway.models import (
     SystemFileWrite,
     TeamCreate,
     TeamDelete,
+    TeamMemberCreate,
     TeamMemberUpdate,
     TeamUpdate,
 )
@@ -766,6 +767,33 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             await store.save_team(updated)
             members = await store.list_team_members(team_id)
         return {"ok": True, "team": _team_json(updated, members)}
+
+    @router.post("/api/agent-teams/{team_id}/members", status_code=status.HTTP_201_CREATED)
+    async def add_team_member(
+        team_id: str, payload: TeamMemberCreate, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        require_mutation(auth)
+        try:
+            team, member = await TeamService(gateway.database).add_specialist(
+                team_id=team_id,
+                user_id=auth.identity.effective_user_id,
+                revision=payload.revision,
+                role=TeamRole(payload.key, payload.name, "specialist", payload.description),
+                model=payload.model,
+            )
+        except LookupError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "team not found") from exc
+        except TeamValidationError as exc:
+            code = (
+                status.HTTP_409_CONFLICT
+                if "revision" in str(exc)
+                else status.HTTP_422_UNPROCESSABLE_ENTITY
+            )
+            raise HTTPException(code, str(exc)) from exc
+        agent = await gateway.agent_manager.profile(
+            member.agent_id, auth.identity.effective_user_id
+        )
+        return {"ok": True, "team": _team_json(team, (member,)), "agentId": agent.agent.id}
 
     @router.post("/api/agent-teams/{team_id}/restore")
     async def restore_team(

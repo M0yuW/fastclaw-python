@@ -264,3 +264,50 @@ class TeamService:
             team = team.model_copy(update={"status": "active", "updated_at": datetime.now(UTC)})
             await store.save_team(team)
             return team, tuple(members)
+
+    async def add_specialist(
+        self, *, team_id: str, user_id: str, revision: int, role: TeamRole, model: str = ""
+    ) -> tuple[AgentTeamRecord, AgentTeamMemberRecord]:
+        if role.member_type != "specialist" or not role.key.strip() or not role.name.strip():
+            raise TeamValidationError("a specialist requires a non-empty role key and name")
+        async with UnitOfWork(self.database) as unit:
+            store = unit.require_store()
+            team = await store.get_team(team_id)
+            if team is None or team.user_id != user_id:
+                raise LookupError("team not found")
+            if team.revision != revision:
+                raise TeamValidationError("team revision conflict")
+            if team.status != "active":
+                raise TeamValidationError("archived teams cannot add members")
+            members = await store.list_team_members(team_id)
+            if len([member for member in members if member.member_type == "specialist"]) >= 12:
+                raise TeamValidationError("a team cannot contain more than 12 specialists")
+            if any(member.role_key == role.key for member in members):
+                raise TeamValidationError("team role key already exists")
+            now = datetime.now(UTC)
+            agent = AgentRecord(
+                id=f"agt_{uuid4().hex[:20]}",
+                user_id=user_id,
+                name=role.name,
+                config={
+                    **({"model": model} if model else {}),
+                    "description": role.description,
+                    "soul": role.soul,
+                    "teamRole": role.key,
+                    "teamMemberType": "specialist",
+                },
+                created_at=now,
+                updated_at=now,
+            )
+            await store.save_agent(agent)
+            member = AgentTeamMemberRecord(
+                team_id=team_id,
+                agent_id=agent.id,
+                role_key=role.key,
+                member_type="specialist",
+                display_order=len(members),
+            )
+            await store.save_team_member(member)
+            updated = team.model_copy(update={"revision": team.revision + 1, "updated_at": now})
+            await store.save_team(updated)
+            return updated, member

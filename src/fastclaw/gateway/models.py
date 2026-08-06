@@ -147,6 +147,14 @@ class TeamMemberUpdate(WireModel):
     revision: int
 
 
+class TeamMemberCreate(WireModel):
+    key: str
+    name: str
+    description: str = ""
+    model: str = ""
+    revision: int
+
+
 class AdminUserCreate(WireModel):
     username: str
     email: str
