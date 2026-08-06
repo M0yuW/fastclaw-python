@@ -756,6 +756,54 @@ export async function getAgents(signal?: AbortSignal): Promise<AgentDetail[]> {
   return Array.isArray(data) ? (data as AgentDetail[]) : [];
 }
 
+export interface TeamMemberInfo {
+  agentId: string;
+  roleKey: string;
+  memberType: "coordinator" | "specialist";
+  status: string;
+  displayOrder: number;
+}
+
+export interface TeamInfo {
+  id: string;
+  name: string;
+  description: string;
+  templateKey: string;
+  templateVersion: string;
+  status: "provisioning" | "active" | "archived";
+  revision: number;
+  members: TeamMemberInfo[];
+}
+
+export interface TeamTemplate {
+  key: string;
+  version: string;
+  name: string;
+  roles: Array<{ key: string; name: string; memberType: "coordinator" | "specialist" }>;
+}
+
+export async function getTeams(): Promise<TeamInfo[]> {
+  const res = await apiFetch("/api/agent-teams");
+  if (!res.ok) throw new Error(`getTeams failed: ${res.status}`);
+  return ((await res.json()).teams || []) as TeamInfo[];
+}
+
+export async function getTeamTemplates(): Promise<TeamTemplate[]> {
+  const res = await apiFetch("/api/agent-team-templates");
+  if (!res.ok) throw new Error(`getTeamTemplates failed: ${res.status}`);
+  return ((await res.json()).templates || []) as TeamTemplate[];
+}
+
+export async function previewTeam(payload: Record<string, unknown>) {
+  const res = await apiFetch("/api/agent-teams/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  return res.json();
+}
+
+export async function createTeam(payload: Record<string, unknown>) {
+  const res = await apiFetch("/api/agent-teams", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  return res.json();
+}
+
 // Single-agent detail. Falls back through the same permission rules as
 // the rest of /api/agents/{id} — owner or super_admin can fetch. Used
 // by the chat header to resolve a name when the agent isn't in the
