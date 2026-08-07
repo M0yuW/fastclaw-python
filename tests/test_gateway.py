@@ -104,6 +104,16 @@ async def test_team_api_is_idempotent_and_enforces_lifecycle(tmp_path: Path) -> 
         assert checks["skills"]["required"] == ["findata-toolkit-cn", "findata-toolkit-us"]
         assert checks["skills"]["prepared"] is False
         assert "finance-tools.screen_stocks" in checks["tools"]["required"]
+        blocked = await client.post(
+            "/api/agent-teams",
+            json={
+                "name": "Markets",
+                "templateKey": "finance-market-research",
+                "clientRequestId": "blocked-team-request",
+            },
+        )
+        assert blocked.status_code == 422
+        assert "prerequisites" in blocked.json()["error"]
         creation = {
             "name": "Custom research",
             "templateKey": "custom",

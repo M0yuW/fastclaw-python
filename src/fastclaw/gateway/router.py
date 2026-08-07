@@ -632,11 +632,23 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             validate_roles(template.roles)
         except TeamValidationError as exc:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+        preview_model = payload.model
+        if not preview_model:
+            async with UnitOfWork(gateway.database) as unit:
+                agents = await unit.require_store().list_agents(auth.identity.effective_user_id)
+            preview_model = next(
+                (
+                    str(agent.config.get("model") or "")
+                    for agent in agents
+                    if agent.config.get("model")
+                ),
+                "",
+            )
         preview_agent = AgentRecord(
             id="preview-agent",
             user_id=auth.identity.effective_user_id,
             name=template.roles[0].name,
-            config={**({"model": payload.model} if payload.model else {})},
+            config={**({"model": preview_model} if preview_model else {})},
         )
         profile = AgentRuntimeProfile(
             agent=preview_agent,
@@ -716,6 +728,22 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         payload: TeamCreate, auth: AuthContext = auth_dependency
     ) -> dict[str, Any]:
         require_mutation(auth)
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            existing = await store.get_team_by_request(
+                auth.identity.effective_user_id, payload.client_request_id
+            )
+            if existing is not None:
+                return {
+                    "ok": True,
+                    "team": _team_json(existing, await store.list_team_members(existing.id)),
+                }
+        preflight = await preview_team(payload, auth)
+        if not preflight["ok"]:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "team prerequisites are not ready; resolve the preview checks before creating",
+            )
         custom_roles = (
             TeamRole("coordinator", "Coordinator", "coordinator"),
             *(
