@@ -652,22 +652,61 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             }
         except RuntimeError as exc:
             provider_check = {"ok": False, "error": str(exc)}
+        required_skills = sorted({skill for role in template.roles for skill in role.skills})
+        skill_checks: dict[str, dict[str, Any]] = {}
+        for skill_name in required_skills:
+            try:
+                skill = gateway.agent_manager.skill_catalog.require(skill_name)
+            except SkillError as exc:
+                skill_checks[skill_name] = {
+                    "installed": False,
+                    "prepared": False,
+                    "error": str(exc),
+                }
+                continue
+            skill_checks[skill_name] = {
+                "installed": True,
+                "prepared": gateway.agent_manager.skill_catalog.is_prepared(skill),
+            }
         required_tools = sorted({tool for role in template.roles for tool in role.allowed_tools})
+        available_tools = {
+            "exec",
+            "list_dir",
+            "read_file",
+            "spawn_subagent",
+            "web_fetch",
+            "worldcup_ledger",
+            "write_file",
+            *(
+                tool.definition.function.name
+                for tool in gateway.agent_manager.plugin_manager.tools()
+            ),
+        }
+        missing_tools = sorted(set(required_tools) - available_tools)
         environment = {
             "ODDS_API_KEY": bool(os.environ.get("ODDS_API_KEY"))
             if template.key == "world-cup-analysis"
             else True
         }
+        skills_prepared = all(check["prepared"] for check in skill_checks.values())
         return {
-            "ok": bool(provider_check["ok"]) and all(environment.values()),
+            "ok": bool(provider_check["ok"]) and skills_prepared and not missing_tools,
             "writesDatabase": False,
             "templateKey": template.key,
             "roles": [role.key for role in template.roles],
             "checks": {
                 "provider": provider_check,
                 "model": bool(provider_check["ok"] and provider_check.get("model")),
-                "skills": {"required": [], "prepared": True},
-                "tools": {"required": required_tools, "available": True},
+                "skills": {
+                    "required": required_skills,
+                    "prepared": skills_prepared,
+                    "details": skill_checks,
+                },
+                "tools": {
+                    "required": required_tools,
+                    "available": not missing_tools,
+                    "missing": missing_tools,
+                },
                 "environment": environment,
             },
         }

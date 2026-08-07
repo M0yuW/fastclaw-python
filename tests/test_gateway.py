@@ -91,6 +91,19 @@ async def test_team_api_is_idempotent_and_enforces_lifecycle(tmp_path: Path) -> 
     async with gateway_client(tmp_path / "teams.db") as (client, database, _):
         await onboard(client)
         await login(client)
+        preview = await client.post(
+            "/api/agent-teams/preview",
+            json={
+                "name": "Markets",
+                "templateKey": "finance-market-research",
+                "clientRequestId": "preview-request",
+            },
+        )
+        assert preview.status_code == 200
+        checks = preview.json()["checks"]
+        assert checks["skills"]["required"] == ["findata-toolkit-cn", "findata-toolkit-us"]
+        assert checks["skills"]["prepared"] is False
+        assert "finance-tools.screen_stocks" in checks["tools"]["required"]
         creation = {
             "name": "Custom research",
             "templateKey": "custom",
