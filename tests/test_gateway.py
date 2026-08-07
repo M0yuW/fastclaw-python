@@ -113,7 +113,31 @@ async def test_team_api_is_idempotent_and_enforces_lifecycle(tmp_path: Path) -> 
             json={"key": "review", "name": "Review specialist", "revision": team["revision"]},
         )
         assert added.status_code == 201
+        assert len(added.json()["team"]["members"]) == 3
         team = (await client.get(f"/api/agent-teams/{team['id']}")).json()["team"]
+        coordinator = next(
+            member for member in team["members"] if member["memberType"] == "coordinator"
+        )
+        coordinator_update = await client.patch(
+            f"/api/agent-teams/{team['id']}/members/{coordinator['agentId']}",
+            json={
+                "agentId": coordinator["agentId"],
+                "status": "archived",
+                "revision": team["revision"],
+            },
+        )
+        assert coordinator_update.status_code == 422
+        research = next(member for member in team["members"] if member["roleKey"] == "research")
+        member_update = await client.patch(
+            f"/api/agent-teams/{team['id']}/members/{research['agentId']}",
+            json={
+                "agentId": research["agentId"],
+                "status": "archived",
+                "revision": team["revision"],
+            },
+        )
+        assert member_update.status_code == 200
+        team = member_update.json()["team"]
         archived = await client.post(
             f"/api/agent-teams/{team['id']}/archive", json={"revision": team["revision"]}
         )

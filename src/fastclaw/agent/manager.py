@@ -129,12 +129,18 @@ def _default_tools(
     plugins: PluginManager,
 ) -> ToolRegistry:
     workspace = data_root / "workspaces" / profile.agent.id
+    configured_targets = profile.agent.config.get("teamSpecialistIds")
+    team_targets = (
+        tuple(str(agent_id) for agent_id in configured_targets)
+        if isinstance(configured_targets, list)
+        else None
+    )
     tools: list[Any] = [
         ReadFileTool(workspace),
         ListDirTool(workspace),
         WriteFileTool(workspace),
         WebFetchTool(runtime.web_http_client),
-        SpawnSubagentTool(bus, tuple(profile.agent.config.get("teamSpecialistIds", ()))),
+        SpawnSubagentTool(bus, team_targets),
         WorldCupLedgerTool(data_root),
     ]
     if profile.skills:
@@ -594,10 +600,14 @@ class AgentRuntimeManager:
     async def _agent_accepts_tasks(self, agent_id: str, user_id: str) -> bool:
         async with UnitOfWork(self.database) as unit:
             store = unit.require_store()
+            agent = await store.get_agent(agent_id)
+            if agent is None or agent.user_id != user_id:
+                return False
             for team in await store.list_teams(user_id):
                 members = await store.list_team_members(team.id)
-                if any(member.agent_id == agent_id for member in members):
-                    return team.status == "active"
+                member = next((member for member in members if member.agent_id == agent_id), None)
+                if member is not None:
+                    return team.status == "active" and member.status == "active"
         return True
 
     async def _delegated_chat(self, agent_id: str, task: str, context: ExecutionContext) -> str:
