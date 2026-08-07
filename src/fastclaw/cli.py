@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal
+from uuid import uuid4
 
 import typer
 
@@ -15,9 +17,44 @@ from fastclaw.cutover import audit_cutover
 from fastclaw.migration import AssetImportConflictError, import_assets, import_go_database
 from fastclaw.runtime import Runtime
 from fastclaw.skills import SkillCatalog
-from fastclaw.storage import Database
+from fastclaw.storage import AgentRecord, AgentTeamMemberRecord, AgentTeamRecord, Database
+from fastclaw.teams import TeamValidationError, resolve_template
 
 _DEFAULT_DATA_ROOT = Path.home() / ".fastclaw-python"
+
+_BACKFILL_TEAM_MEMBERS: dict[str, tuple[str, ...]] = {
+    "finance-market-research": (
+        "coordinator",
+        "news-analyst",
+        "news-analyst-us",
+        "stock-screener",
+        "stock-screener-us",
+    ),
+    "world-cup-analysis": (
+        "coordinator-wc",
+        "data-analyst",
+        "tactics-analyst",
+        "odds-analyst",
+        "history-analyst",
+        "risk-officer",
+        "ev-analyst",
+    ),
+    "benchmark-finance": (
+        "Finance Research Coordinator",
+        "Finance Accounting Analyst",
+        "Finance Governance Specialist",
+        "Finance Methodology Specialist",
+        "Finance Retrieval Specialist",
+        "Finance Risk Analyst",
+    ),
+    "benchmark-runtime": (
+        "Runtime Benchmark Coordinator",
+        "Benchmark Investigator",
+        "Benchmark Observer",
+        "Benchmark Operator",
+        "Benchmark Policy",
+    ),
+}
 
 app = typer.Typer(help="FastClaw Python runtime tools.")
 migrate_app = typer.Typer(help="One-way data migration commands.")
@@ -77,6 +114,173 @@ def import_runtime_assets(
         typer.echo(json.dumps(exc.report.model_dump(mode="json"), indent=2, sort_keys=True))
         raise typer.Exit(code=2) from exc
     typer.echo(json.dumps(report.model_dump(mode="json"), indent=2, sort_keys=True))
+
+
+@migrate_app.command("backfill-teams")
+def backfill_teams(
+    database_url: Annotated[str, typer.Option(help="Python database URL.")],
+    dry_run: Annotated[bool, typer.Option(help="Report candidate teams without writing.")] = False,
+    manifest_path: Annotated[
+        Path | None,
+        typer.Option(help="Optional path for the JSON audit manifest."),
+    ] = None,
+) -> None:
+    """Idempotently group the four known imported Coordinator teams."""
+
+    async def run() -> dict[str, object]:
+        database = Database(database_url)
+        if not dry_run:
+            await database.create_schema()
+        manifest: list[dict[str, object]] = []
+        try:
+            from fastclaw.storage import UnitOfWork
+
+            async with UnitOfWork(database) as unit:
+                store = unit.require_store()
+                users = await store.list_users()
+                for user in users:
+                    agents = await store.list_agents(user.id)
+                    by_name: dict[str, list[AgentRecord]] = {}
+                    for agent in agents:
+                        by_name.setdefault(agent.name.casefold(), []).append(agent)
+                    memberships: dict[str, str] = {}
+                    for team in await store.list_teams(user.id):
+                        for member in await store.list_team_members(team.id):
+                            memberships[member.agent_id] = team.id
+                    for key, names in _BACKFILL_TEAM_MEMBERS.items():
+                        template = resolve_template(key)
+                        matched = [by_name.get(name.casefold(), []) for name in names]
+                        if all(not matches for matches in matched):
+                            manifest.append(
+                                {
+                                    "userId": user.id,
+                                    "template": key,
+                                    "status": "skipped",
+                                    "reason": "no_matching_agents",
+                                }
+                            )
+                            continue
+                        missing = [
+                            name
+                            for name, matches in zip(names, matched, strict=True)
+                            if not matches
+                        ]
+                        ambiguous = [
+                            name
+                            for name, matches in zip(names, matched, strict=True)
+                            if len(matches) > 1
+                        ]
+                        if missing or ambiguous:
+                            manifest.append(
+                                {
+                                    "userId": user.id,
+                                    "template": key,
+                                    "status": "conflict",
+                                    "reason": "partial_or_ambiguous_match",
+                                    "missingNames": missing,
+                                    "ambiguousNames": ambiguous,
+                                }
+                            )
+                            continue
+                        assigned = [matches[0] for matches in matched]
+                        request_id = f"backfill:{key}:{user.id}"
+                        existing = await store.get_team_by_request(user.id, request_id)
+                        expected_ids = {agent.id for agent in assigned}
+                        if existing is not None:
+                            existing_members = await store.list_team_members(existing.id)
+                            existing_ids = {member.agent_id for member in existing_members}
+                            if existing.template_key == key and existing_ids == expected_ids:
+                                manifest.append(
+                                    {
+                                        "userId": user.id,
+                                        "template": key,
+                                        "teamId": existing.id,
+                                        "agentIds": [agent.id for agent in assigned],
+                                        "status": "existing",
+                                    }
+                                )
+                            else:
+                                manifest.append(
+                                    {
+                                        "userId": user.id,
+                                        "template": key,
+                                        "teamId": existing.id,
+                                        "status": "conflict",
+                                        "reason": "existing_team_mismatch",
+                                    }
+                                )
+                            continue
+                        occupied = {
+                            agent.id: memberships[agent.id]
+                            for agent in assigned
+                            if agent.id in memberships
+                        }
+                        if occupied:
+                            manifest.append(
+                                {
+                                    "userId": user.id,
+                                    "template": key,
+                                    "status": "conflict",
+                                    "reason": "agent_already_in_team",
+                                    "memberships": occupied,
+                                }
+                            )
+                            continue
+                        entry: dict[str, object] = {
+                            "userId": user.id,
+                            "template": key,
+                            "agentIds": [agent.id for agent in assigned],
+                            "status": "candidate",
+                        }
+                        manifest.append(entry)
+                        if not dry_run:
+                            now = datetime.now(UTC)
+                            team = AgentTeamRecord(
+                                id=f"team_{uuid4().hex}",
+                                user_id=user.id,
+                                name=template.name,
+                                template_key=key,
+                                template_version=template.version,
+                                status="active",
+                                client_request_id=request_id,
+                                created_at=now,
+                                updated_at=now,
+                            )
+                            await store.save_team(team)
+                            await store.save_team_member(
+                                AgentTeamMemberRecord(
+                                    team_id=team.id,
+                                    agent_id=assigned[0].id,
+                                    role_key="coordinator",
+                                    member_type="coordinator",
+                                )
+                            )
+                            for order, (role, agent) in enumerate(
+                                zip(template.roles[1:], assigned[1:], strict=True), 1
+                            ):
+                                await store.save_team_member(
+                                    AgentTeamMemberRecord(
+                                        team_id=team.id,
+                                        agent_id=agent.id,
+                                        role_key=role.key,
+                                        member_type="specialist",
+                                        display_order=order,
+                                    )
+                                )
+                            entry["status"] = "created"
+            return {"dryRun": dry_run, "manifest": manifest, "count": len(manifest)}
+        finally:
+            await database.close()
+
+    try:
+        payload = asyncio.run(run())
+    except TeamValidationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    rendered = json.dumps(payload, indent=2, sort_keys=True)
+    if manifest_path is not None:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(rendered + "\n", encoding="utf-8")
+    typer.echo(rendered)
 
 
 @skills_app.command("list")

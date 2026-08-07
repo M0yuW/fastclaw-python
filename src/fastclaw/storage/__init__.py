@@ -4,6 +4,8 @@ from fastclaw.storage.database import Database
 from fastclaw.storage.records import (
     AgentFileRecord,
     AgentRecord,
+    AgentTeamMemberRecord,
+    AgentTeamRecord,
     APIKeyRecord,
     ConfigRecord,
     CronJobRecord,
@@ -13,6 +15,7 @@ from fastclaw.storage.records import (
 )
 from fastclaw.storage.repositories import (
     AgentRepository,
+    AgentTeamRepository,
     APIKeyRepository,
     ConfigRepository,
     SessionRepository,
@@ -27,6 +30,9 @@ __all__ = [
     "AgentFileRecord",
     "AgentRecord",
     "AgentRepository",
+    "AgentTeamMemberRecord",
+    "AgentTeamRecord",
+    "AgentTeamRepository",
     "ConfigRecord",
     "ConfigRepository",
     "CronJobRecord",
