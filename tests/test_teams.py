@@ -55,6 +55,18 @@ async def test_team_creation_is_atomic_and_idempotent(tmp_path: Path) -> None:
             assert len(await store.list_team_members(first.id)) == 5
             created = [await store.get_agent(member.agent_id) for member in members]
             assert all(agent is not None and "model" not in agent.config for agent in created)
+            created_by_role = {
+                member.role_key: agent
+                for member, agent in zip(members, created, strict=True)
+                if agent is not None
+            }
+            china_news = created_by_role["news-analyst"]
+            assert china_news.config["skills"] == {"alwaysLoad": ["findata-toolkit-cn"]}
+            assert china_news.config["allowedTools"] == [
+                "exec",
+                "web_fetch",
+                "finance-tools.market_events",
+            ]
     finally:
         await database.close()
 

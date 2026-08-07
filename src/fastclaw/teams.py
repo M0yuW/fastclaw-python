@@ -29,6 +29,7 @@ class TeamRole:
     member_type: str
     description: str = ""
     soul: str = ""
+    skills: tuple[str, ...] = ()
     allowed_tools: tuple[str, ...] = ()
 
 
@@ -50,32 +51,53 @@ FINANCE_MARKET_RESEARCH = TeamTemplate(
             "coordinator",
             "Research coordinator",
             "coordinator",
-            soul="Coordinate market research and synthesize specialist evidence.",
+            soul=(
+                "Coordinate market research. Delegate evidence collection, reconcile "
+                "conflicting sources, and clearly separate facts from assumptions."
+            ),
             allowed_tools=("spawn_subagent",),
         ),
         TeamRole(
             "news-analyst",
             "News analyst",
             "specialist",
-            soul="Analyze market news and cite uncertainty.",
+            soul="Analyze mainland China market news with dated source evidence and uncertainty.",
+            skills=("findata-toolkit-cn",),
+            allowed_tools=("exec", "web_fetch", "finance-tools.market_events"),
         ),
         TeamRole(
             "news-analyst-us",
             "US news analyst",
             "specialist",
-            soul="Analyze US market news and cite uncertainty.",
+            soul="Analyze US market news with dated source evidence and uncertainty.",
+            skills=("findata-toolkit-us",),
+            allowed_tools=("exec", "web_fetch", "finance-tools.market_events"),
         ),
         TeamRole(
             "stock-screener",
             "Stock screener",
             "specialist",
-            soul="Screen domestic securities using available evidence.",
+            soul="Screen mainland China securities from current, cited market and financial data.",
+            skills=("findata-toolkit-cn",),
+            allowed_tools=(
+                "exec",
+                "web_fetch",
+                "finance-tools.stock_snapshot",
+                "finance-tools.screen_stocks",
+            ),
         ),
         TeamRole(
             "stock-screener-us",
             "US stock screener",
             "specialist",
-            soul="Screen US securities using available evidence.",
+            soul="Screen US securities from current, cited market and financial data.",
+            skills=("findata-toolkit-us",),
+            allowed_tools=(
+                "exec",
+                "web_fetch",
+                "finance-tools.stock_snapshot",
+                "finance-tools.screen_stocks",
+            ),
         ),
     ),
 )
@@ -88,38 +110,67 @@ WORLD_CUP_ANALYSIS = TeamTemplate(
             "coordinator",
             "World Cup coordinator",
             "coordinator",
-            soul="Coordinate World Cup analysis and synthesize specialists.",
+            soul=(
+                "Coordinate World Cup analysis. Delegate factual research, keep predictions "
+                "conditional, and synthesize specialist evidence without inventing live facts."
+            ),
             allowed_tools=("spawn_subagent", "worldcup_ledger"),
         ),
         TeamRole(
             "data-analyst",
             "Data analyst",
             "specialist",
-            soul="Analyze match data without inventing live facts.",
+            soul=(
+                "Analyze match data and state the date, source, and limits of every factual claim."
+            ),
+            skills=("match-data-toolkit",),
+            allowed_tools=("exec", "web_fetch"),
         ),
         TeamRole(
-            "tactics-analyst", "Tactics analyst", "specialist", soul="Analyze tactical matchups."
+            "tactics-analyst",
+            "Tactics analyst",
+            "specialist",
+            soul="Analyze tactical matchups from observed team style and current availability.",
+            skills=("match-data-toolkit",),
+            allowed_tools=("exec", "web_fetch"),
         ),
         TeamRole(
             "odds-analyst",
             "Odds analyst",
             "specialist",
-            soul="Analyze market odds and uncertainty.",
+            soul=(
+                "Analyze odds, implied probabilities, and uncertainty without presenting "
+                "betting advice."
+            ),
+            skills=("match-data-toolkit",),
+            allowed_tools=("exec", "web_fetch"),
         ),
         TeamRole(
             "history-analyst",
             "History analyst",
             "specialist",
-            soul="Analyze relevant historical evidence.",
+            soul=(
+                "Analyze relevant historical evidence and distinguish it from current-team "
+                "evidence."
+            ),
+            skills=("match-data-toolkit",),
+            allowed_tools=("exec", "web_fetch"),
         ),
         TeamRole(
             "risk-officer",
             "Risk officer",
             "specialist",
-            soul="Identify uncertainty and risk controls.",
+            soul="Identify uncertainty, missing information, and risk controls in the analysis.",
+            skills=("match-data-toolkit",),
+            allowed_tools=("exec", "web_fetch"),
         ),
         TeamRole(
-            "ev-analyst", "EV analyst", "specialist", soul="Assess expected value assumptions."
+            "ev-analyst",
+            "EV analyst",
+            "specialist",
+            soul="Assess expected-value assumptions and sensitivity; never claim certainty.",
+            skills=("match-data-toolkit",),
+            allowed_tools=("exec", "web_fetch"),
         ),
     ),
 )
@@ -274,6 +325,7 @@ class TeamService:
                         **({"model": model} if model else {}),
                         "description": role.description,
                         "soul": role.soul,
+                        **({"skills": {"alwaysLoad": list(role.skills)}} if role.skills else {}),
                         "teamRole": role.key,
                         "teamMemberType": role.member_type,
                         **(
