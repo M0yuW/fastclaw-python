@@ -86,7 +86,7 @@ export default function TeamsPage() {
         return false;
       }
       if (!providerSaved && !(await saveProviderProfile())) return false;
-      const result = await previewTeam({ name: name || "Preview", templateKey, clientRequestId: requestId || crypto.randomUUID(), model, specialists: customRoles() });
+      const result = await previewTeam({ name: name || "Preview", templateKey, clientRequestId: requestId || crypto.randomUUID(), model, providerName: providerName.trim(), specialists: customRoles() });
       const checks = result.checks;
       const skillText = checks?.skills?.required?.length
         ? `Skills: ${checks.skills.prepared ? "ready" : "not prepared"} (${checks.skills.required.join(", ")})`
@@ -99,7 +99,13 @@ export default function TeamsPage() {
         : `Provider: ${checks?.provider?.error || "not configured"}`;
       setPreview([providerText, skillText, toolText, `Roles: ${(result.roles || []).join(", ")}`]);
       setPreviewReady(result.ok);
-      if (!result.ok) setError(result.detail || "Preview found prerequisites that need attention");
+      if (!result.ok) {
+        setError(
+          !checks?.provider?.ok && providerName.trim()
+            ? `Provider ${providerName.trim()} is unavailable. Confirm FASTCLAW_PROVIDER_${providerName.trim().toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_API_KEY is set on the Gateway, then restart it.`
+            : result.detail || "Preview found prerequisites that need attention",
+        );
+      }
       return result.ok;
     } catch (cause) {
       setPreviewReady(false);
@@ -113,7 +119,7 @@ export default function TeamsPage() {
     if (!name.trim()) return;
     if (!previewReady && !(await runPreview())) return;
     setSaving(true); setError("");
-    const result = await createTeam({ name: name.trim(), description, templateKey, clientRequestId: requestId, model, specialists: customRoles() });
+    const result = await createTeam({ name: name.trim(), description, templateKey, clientRequestId: requestId, model, providerName: providerName.trim(), specialists: customRoles() });
     setSaving(false);
     if (!result.ok) return setError(result.detail || result.error || "Team creation failed");
     setOpen(false); setName(""); setDescription(""); setSpecialists(""); setRequestId(""); setPreview([]); setPreviewReady(false); load();
@@ -128,9 +134,12 @@ export default function TeamsPage() {
     {!teams.length && !error && <Card><CardContent className="p-8 text-center text-muted-foreground">No teams yet. Create a template-based team to start.</CardContent></Card>}
     {error && <p className="text-sm text-destructive">{error}</p>}
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent>
-        <DialogHeader><DialogTitle>Create team</DialogTitle></DialogHeader>
-        <div className="space-y-4">
+      <DialogContent className="flex max-h-[calc(100dvh-2rem)] max-w-2xl flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl">
+        <DialogHeader className="shrink-0 border-b px-6 py-5 pr-12">
+          <DialogTitle>Create team</DialogTitle>
+          <p className="text-sm text-muted-foreground">1. Choose a team template. 2. Select its runtime. 3. Preview or create.</p>
+        </DialogHeader>
+        <div className="min-h-0 flex-1 space-y-5 overflow-y-auto px-6 py-5">
           <div><Label htmlFor="team-name">Name</Label><Input id="team-name" value={name} onChange={(event) => setName(event.target.value)} /></div>
           <div><Label htmlFor="team-description">Description</Label><Textarea id="team-description" value={description} onChange={(event) => setDescription(event.target.value)} /></div>
           <div>
@@ -142,21 +151,25 @@ export default function TeamsPage() {
             <p className="mt-2 text-xs text-muted-foreground">{selected?.roles.map((role) => role.name).join(" · ")}</p>
           </div>
           {templateKey === "custom" && <div><Label htmlFor="team-specialists">Specialists</Label><Textarea id="team-specialists" placeholder="One specialist name per line" value={specialists} onChange={(event) => { setSpecialists(event.target.value); invalidatePreview(); }} /></div>}
-          <div className="space-y-2 rounded-md border p-3">
-            <div><p className="text-sm font-medium">Model and provider</p><p className="text-xs text-muted-foreground">Configure the runtime used by every member of this team.</p></div>
-            <div><Label htmlFor="team-model">Model</Label><Input id="team-model" placeholder="provider/model" value={model} onChange={(event) => { setModel(event.target.value); invalidatePreview(); }} /></div>
+          <div className="space-y-3 rounded-md border p-4">
+            <div><p className="text-sm font-medium">Step 2 — Model and provider</p><p className="text-xs text-muted-foreground">These values are applied to every coordinator and specialist created in this team.</p></div>
+            <div>
+              <Label htmlFor="team-model">Model ID</Label>
+              <Input id="team-model" placeholder="deepseek-v4-flash" value={model} onChange={(event) => { setModel(event.target.value); invalidatePreview(); }} />
+              <p className="mt-1 text-xs text-muted-foreground">Enter the provider’s exact model ID. Do not add a provider prefix here.</p>
+            </div>
             <div className="grid grid-cols-2 gap-3">
-              <div><Label htmlFor="team-provider-name">Provider name</Label><Input id="team-provider-name" placeholder="openrouter" value={providerName} onChange={(event) => { setProviderName(event.target.value); setProviderSaved(false); invalidatePreview(); }} /></div>
+              <div><Label htmlFor="team-provider-name">Provider name</Label><Input id="team-provider-name" placeholder="deepseek" value={providerName} onChange={(event) => { setProviderName(event.target.value); setProviderSaved(false); invalidatePreview(); }} /></div>
               <div><Label htmlFor="team-provider-base">API base URL</Label><Input id="team-provider-base" placeholder="https://api.example.com/v1" value={providerApiBase} onChange={(event) => { setProviderApiBase(event.target.value); setProviderSaved(false); invalidatePreview(); }} /></div>
             </div>
             <div><Label htmlFor="team-provider-type">API type</Label><select id="team-provider-type" className="mt-1 w-full rounded-md border bg-background p-2" value={providerApiType} onChange={(event) => { setProviderApiType(event.target.value); setProviderSaved(false); invalidatePreview(); }}><option value="openai-compatible">OpenAI-compatible</option><option value="anthropic-messages">Anthropic Messages</option></select></div>
-            <p className="text-xs text-muted-foreground">Provider credentials stay on the Gateway. Set <code>FASTCLAW_PROVIDER_&lt;NAME&gt;_API_KEY</code> in its environment; they are never entered in this browser.</p>
+            <div className="rounded bg-muted/60 p-3 text-xs text-muted-foreground"><p>Step 3 — Credentials stay on the Gateway.</p><p className="mt-1">For provider <code>{providerName || "&lt;name&gt;"}</code>, set <code>FASTCLAW_PROVIDER_{(providerName || "&lt;NAME&gt;").toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_API_KEY</code> in the Gateway environment, then restart Gateway. The browser never receives this key.</p></div>
           </div>
           {preview.length > 0 && <div className="space-y-1 text-sm"><p className="font-medium">Preview</p>{preview.map((item) => <p key={item} className="text-muted-foreground">{item}</p>)}</div>}
           {error && <p className="text-sm text-destructive">{error}</p>}
         </div>
-        <DialogFooter>
-          <p className="mr-auto text-xs text-muted-foreground">Provider changes are saved to your user scope before the prerequisite check.</p>
+        <DialogFooter className="mx-0 mb-0 shrink-0 rounded-none px-6 py-4">
+          <p className="mr-auto text-xs text-muted-foreground">Preview saves the Provider profile and checks its credential. Create repeats this check automatically.</p>
           <Button variant="outline" onClick={() => void runPreview()} disabled={previewing || saving || savingProvider}>Preview</Button>
           <Button onClick={() => void submit()} disabled={saving || previewing || savingProvider || !name.trim()}>{saving ? "Creating…" : previewing ? "Checking…" : "Create"}</Button>
         </DialogFooter>

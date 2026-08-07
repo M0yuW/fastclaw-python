@@ -260,6 +260,7 @@ class TeamService:
         template_key: str,
         client_request_id: str,
         model: str = "",
+        provider_name: str = "",
         custom_roles: Sequence[TeamRole] = (),
     ) -> tuple[AgentTeamRecord, tuple[AgentTeamMemberRecord, ...]]:
         if not name.strip() or not client_request_id.strip():
@@ -274,6 +275,7 @@ class TeamService:
                 template=template,
                 client_request_id=client_request_id,
                 model=model,
+                provider_name=provider_name,
             )
         except IntegrityError:
             # The unique (user_id, client_request_id) constraint resolves a
@@ -295,6 +297,7 @@ class TeamService:
         template: TeamTemplate,
         client_request_id: str,
         model: str,
+        provider_name: str,
     ) -> tuple[AgentTeamRecord, tuple[AgentTeamMemberRecord, ...]]:
         async with UnitOfWork(self.database) as unit:
             store = unit.require_store()
@@ -323,6 +326,7 @@ class TeamService:
                     name=role.name,
                     config={
                         **({"model": model} if model else {}),
+                        **({"provider": provider_name} if provider_name else {}),
                         "description": role.description,
                         "soul": role.soul,
                         **({"skills": {"alwaysLoad": list(role.skills)}} if role.skills else {}),

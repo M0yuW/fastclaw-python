@@ -513,7 +513,7 @@ class AgentRuntimeManager:
     ) -> ProviderSelection:
         agent = profile.agent
         model = requested_model or str(agent.config.get("model") or self.config.default_model)
-        provider_name = (
+        provider_name = str(agent.config.get("provider") or "").strip() or (
             model.split("/", 1)[0] if "/" in model else self.config.default_provider_name
         )
         if provider_name in self.runtime.providers and model:
