@@ -943,29 +943,8 @@ export async function deleteAgentSkill(agentId: string, name: string) {
   return res.json();
 }
 
-// Search results use skills.sh's shape; clawhub has a different shape but the
-// admin UI only wires skills.sh (primary registry). Callers that want clawhub
-// go through installSkill with source="clawhub".
-export interface SkillSearchResult {
-  id: string;       // "<owner>/<repo>/<skillId>"
-  skillId: string;  // folder name — also the slug passed to installSkill
-  name: string;
-  source: string;   // "<owner>/<repo>"
-  installs: number;
-}
-
-export async function searchSkills(query: string, signal?: AbortSignal): Promise<SkillSearchResult[]> {
-  if (!query.trim()) return [];
-  const res = await apiFetch(`/api/skills/search?source=skillssh&q=${encodeURIComponent(query)}`, { signal });
-  if (!res.ok) return [];
-  const data = await res.json();
-  return (data.results || []) as SkillSearchResult[];
-}
-
 export interface InstallSkillRequest {
   name: string;
-  source?: "skillssh" | "clawhub" | "github" | "auto";
-  repo?: string;
   agent?: string;  // omit for global install (admin only)
 }
 
