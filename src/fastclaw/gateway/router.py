@@ -648,7 +648,10 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             id="preview-agent",
             user_id=auth.identity.effective_user_id,
             name=template.roles[0].name,
-            config={**({"model": preview_model} if preview_model else {})},
+            config={
+                **({"model": preview_model} if preview_model else {}),
+                **({"provider": payload.provider_name} if payload.provider_name else {}),
+            },
         )
         profile = AgentRuntimeProfile(
             agent=preview_agent,
@@ -759,6 +762,7 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                 template_key=payload.template_key,
                 client_request_id=payload.client_request_id,
                 model=payload.model,
+                provider_name=payload.provider_name,
                 custom_roles=custom_roles if payload.template_key == "custom" else (),
             )
         except TeamValidationError as exc:
