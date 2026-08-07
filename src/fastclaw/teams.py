@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from sqlalchemy.exc import IntegrityError
+
 from fastclaw.storage import (
     AgentRecord,
     AgentTeamMemberRecord,
@@ -213,6 +215,36 @@ class TeamService:
             raise TeamValidationError("team name and clientRequestId are required")
         template = resolve_template(template_key, custom_roles)
         validate_roles(template.roles)
+        try:
+            return await self._create_once(
+                user_id=user_id,
+                name=name,
+                description=description,
+                template=template,
+                client_request_id=client_request_id,
+                model=model,
+            )
+        except IntegrityError:
+            # The unique (user_id, client_request_id) constraint resolves a
+            # concurrent retry to the first committed team rather than leaking
+            # a database conflict to the caller.
+            async with UnitOfWork(self.database) as unit:
+                store = unit.require_store()
+                existing = await store.get_team_by_request(user_id, client_request_id)
+                if existing is not None:
+                    return existing, tuple(await store.list_team_members(existing.id))
+            raise
+
+    async def _create_once(
+        self,
+        *,
+        user_id: str,
+        name: str,
+        description: str,
+        template: TeamTemplate,
+        client_request_id: str,
+        model: str,
+    ) -> tuple[AgentTeamRecord, tuple[AgentTeamMemberRecord, ...]]:
         async with UnitOfWork(self.database) as unit:
             store = unit.require_store()
             existing = await store.get_team_by_request(user_id, client_request_id)
