@@ -13,6 +13,8 @@ from fastclaw.agent.manager import (
     AgentRuntimeConfig,
     AgentRuntimeManager,
 )
+from fastclaw.agent.models import AgentRunError
+from fastclaw.execution import ExecutionContext
 from fastclaw.providers import (
     ChatRequest,
     ChatResponse,
@@ -25,6 +27,8 @@ from fastclaw.runtime import Runtime
 from fastclaw.storage import (
     AgentFileRecord,
     AgentRecord,
+    AgentTeamMemberRecord,
+    AgentTeamRecord,
     ConfigRecord,
     Database,
     UnitOfWork,
@@ -274,6 +278,111 @@ async def test_root_and_nested_runs_share_queue_without_deadlock(tmp_path: Path)
         assert root_session is not None
         assert child_session is not None
         assert root_session.agent_id != child_session.agent_id
+    finally:
+        await close_manager(manager, runtime, database)
+
+
+async def test_team_coordinator_has_a_roster_enum_and_rejects_non_team_delegation(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    coordinator = AgentRecord(
+        id="coordinator",
+        user_id="user-1",
+        name="Coordinator",
+        config={"model": "fixture/coordinator", "policy": "delegate-only"},
+        created_at=now,
+        updated_at=now,
+    )
+    specialist = AgentRecord(
+        id="specialist",
+        user_id="user-1",
+        name="Specialist",
+        config={"model": "fixture/specialist", "policy": "no-tools"},
+        created_at=now,
+        updated_at=now,
+    )
+    outsider = AgentRecord(
+        id="outsider",
+        user_id="user-1",
+        name="Outsider",
+        config={"model": "fixture/specialist", "policy": "no-tools"},
+        created_at=now,
+        updated_at=now,
+    )
+    provider = CoordinatingProvider(specialist.id)
+    manager, runtime, database = await build_manager(
+        tmp_path / "team-manager.db", provider, (coordinator, specialist, outsider)
+    )
+    try:
+        async with UnitOfWork(database) as unit:
+            store = unit.require_store()
+            await store.save_team(
+                AgentTeamRecord(
+                    id="team-1",
+                    user_id="user-1",
+                    name="Team",
+                    status="active",
+                    client_request_id="team-request",
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            await store.save_team_member(
+                AgentTeamMemberRecord(
+                    team_id="team-1",
+                    agent_id=coordinator.id,
+                    role_key="coordinator",
+                    member_type="coordinator",
+                )
+            )
+            await store.save_team_member(
+                AgentTeamMemberRecord(
+                    team_id="team-1",
+                    agent_id=specialist.id,
+                    role_key="research",
+                    member_type="specialist",
+                    display_order=1,
+                )
+            )
+        await manager.reload_profile(coordinator)
+        await manager.reload_profile(specialist)
+
+        result = await manager.chat(
+            user_id="user-1",
+            agent_id=coordinator.id,
+            session_id="team-session",
+            message="coordinate",
+        )
+
+        assert result.content == "coordinator: specialist answer"
+        first_request = next(
+            request for request in provider.requests if request.model == "fixture/coordinator"
+        )
+        properties = first_request.tools[0].function.parameters["properties"]
+        assert isinstance(properties, dict)
+        agent_id_schema = properties["agent_id"]
+        assert isinstance(agent_id_schema, dict)
+        assert agent_id_schema == {
+            "type": "string",
+            "enum": [specialist.id],
+        }
+        profile = await manager.profile(coordinator.id, "user-1")
+        assert specialist.id in profile.system_prompt
+        assert "research" in profile.system_prompt
+
+        with pytest.raises(AgentRunError, match="team delegation"):
+            await manager._delegated_chat(
+                specialist.id,
+                "bypass",
+                ExecutionContext(
+                    user_id="user-1",
+                    agent_id=specialist.id,
+                    session_id="team-session",
+                    root_execution_id="team-root",
+                    call_path=(outsider.id, specialist.id),
+                ),
+            )
     finally:
         await close_manager(manager, runtime, database)
 
