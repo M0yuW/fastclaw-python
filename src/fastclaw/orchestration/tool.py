@@ -11,8 +11,12 @@ from fastclaw.tools import ToolResult
 
 
 class SpawnSubagentTool:
-    def __init__(self, bus: MessageBus) -> None:
+    def __init__(self, bus: MessageBus, target_agent_ids: tuple[str, ...] | None = None) -> None:
         self._bus = bus
+        self._target_agent_ids = target_agent_ids
+        agent_id: dict[str, object] = {"type": "string"}
+        if target_agent_ids is not None:
+            agent_id["enum"] = list(target_agent_ids)
         self.definition = ToolDefinition(
             function=ToolFunction(
                 name="spawn_subagent",
@@ -20,7 +24,7 @@ class SpawnSubagentTool:
                 parameters={
                     "type": "object",
                     "properties": {
-                        "agent_id": {"type": "string"},
+                        "agent_id": agent_id,
                         "task": {"type": "string"},
                     },
                     "required": ["agent_id", "task"],
@@ -29,10 +33,16 @@ class SpawnSubagentTool:
         )
 
     async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
+        agent_id = arguments.get("agent_id")
+        task = arguments.get("task")
+        if not isinstance(agent_id, str) or not agent_id or not isinstance(task, str):
+            return ToolResult(content="invalid delegation arguments", is_error=True)
+        if self._target_agent_ids is not None and agent_id not in self._target_agent_ids:
+            return ToolResult(content="delegation target is not allowed", is_error=True)
         result = await self._bus.request(
             context,
-            target_agent_id=str(arguments["agent_id"]),
-            task=str(arguments["task"]),
+            target_agent_id=agent_id,
+            task=task,
         )
         return ToolResult(
             content=result.value,
@@ -53,6 +63,12 @@ class SpawnSubagentTool:
             if not isinstance(agent_id, str) or not agent_id or not isinstance(task, str):
                 results[index] = ToolResult(
                     content="invalid delegation arguments",
+                    is_error=True,
+                )
+                continue
+            if self._target_agent_ids is not None and agent_id not in self._target_agent_ids:
+                results[index] = ToolResult(
+                    content="delegation target is not allowed",
                     is_error=True,
                 )
                 continue

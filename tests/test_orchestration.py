@@ -43,6 +43,34 @@ def test_spawn_subagent_schema_exposes_only_delegation_arguments() -> None:
 
 
 @pytest.mark.asyncio
+async def test_spawn_subagent_restricts_runtime_targets_and_schema() -> None:
+    bus = InProcessMessageBus()
+
+    async def handler(task: str, child: ExecutionContext) -> str:
+        del child
+        return task
+
+    bus.register(user_id="user-1", agent_id="allowed", handler=handler)
+    bus.register(user_id="user-1", agent_id="blocked", handler=handler)
+    tool = SpawnSubagentTool(bus, ("allowed",))
+    try:
+        properties = tool.definition.function.parameters["properties"]
+        assert isinstance(properties, dict)
+        agent_id = properties["agent_id"]
+        assert isinstance(agent_id, dict)
+        assert agent_id["enum"] == ["allowed"]
+
+        rejected = await tool.execute({"agent_id": "blocked", "task": "do not run"}, context())
+        assert rejected.is_error
+        assert rejected.content == "delegation target is not allowed"
+
+        accepted = await tool.execute({"agent_id": "allowed", "task": "run"}, context())
+        assert accepted.content == "run"
+    finally:
+        await bus.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_spawn_subagent_ignores_model_supplied_identity() -> None:
     bus = InProcessMessageBus()
     received: list[ExecutionContext] = []
