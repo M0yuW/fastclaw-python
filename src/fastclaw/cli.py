@@ -129,7 +129,8 @@ def backfill_teams(
 
     async def run() -> dict[str, object]:
         database = Database(database_url)
-        await database.create_schema()
+        if not dry_run:
+            await database.create_schema()
         manifest: list[dict[str, object]] = []
         try:
             from fastclaw.storage import UnitOfWork
