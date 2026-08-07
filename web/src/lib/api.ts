@@ -782,6 +782,21 @@ export interface TeamTemplate {
   roles: Array<{ key: string; name: string; memberType: "coordinator" | "specialist" }>;
 }
 
+export interface TeamPreview {
+  ok: boolean;
+  writesDatabase: boolean;
+  templateKey: string;
+  roles: string[];
+  checks?: {
+    provider?: { ok?: boolean; name?: string; model?: string; error?: string };
+    model?: boolean;
+    skills?: { required?: string[]; prepared?: boolean; details?: Record<string, { installed: boolean; prepared: boolean; error?: string }> };
+    tools?: { required?: string[]; available?: boolean; missing?: string[] };
+    environment?: Record<string, boolean>;
+  };
+  detail?: string;
+}
+
 export async function getTeams(): Promise<TeamInfo[]> {
   const res = await apiFetch("/api/agent-teams");
   if (!res.ok) throw new Error(`getTeams failed: ${res.status}`);
@@ -794,9 +809,9 @@ export async function getTeamTemplates(): Promise<TeamTemplate[]> {
   return ((await res.json()).templates || []) as TeamTemplate[];
 }
 
-export async function previewTeam(payload: Record<string, unknown>) {
+export async function previewTeam(payload: Record<string, unknown>): Promise<TeamPreview> {
   const res = await apiFetch("/api/agent-teams/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-  return res.json();
+  return res.json() as Promise<TeamPreview>;
 }
 
 export async function createTeam(payload: Record<string, unknown>) {

@@ -23,7 +23,7 @@
     },
     "src/lib/api.ts": {
       "reason": "Read-only actAs, chat compatibility, and Teams API lifecycle requests",
-      "sha256": "4024a2f5e07882bbd72f24a6015a095c73c9bb7f29dcdcd423a7e6214fce55c8"
+      "sha256": "c8370b3b5e0154fe60b33cb9f0080e98725b09c98a2d558ffe7f303f426b1003"
     },
     "src/lib/chat-stream.ts": {
       "reason": "Preserve tool error state in the streaming reducer",
