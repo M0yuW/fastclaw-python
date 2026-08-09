@@ -109,6 +109,19 @@ def test_custom_team_requires_one_coordinator_and_specialist() -> None:
         validate_roles((TeamRole("worker", "Worker", "specialist"),))
 
 
+def test_custom_team_rejects_unsupported_member_types() -> None:
+    from fastclaw.teams import validate_roles
+
+    with pytest.raises(TeamValidationError, match="unsupported team member type: observer"):
+        validate_roles(
+            (
+                TeamRole("coordinator", "Coordinator", "coordinator"),
+                TeamRole("worker", "Worker", "specialist"),
+                TeamRole("observer", "Observer", "observer"),
+            )
+        )
+
+
 def test_benchmark_finance_template_contains_all_persisted_specialists() -> None:
     template = resolve_template("benchmark-finance")
 
