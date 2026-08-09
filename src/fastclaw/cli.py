@@ -46,6 +46,8 @@ _BACKFILL_TEAM_MEMBERS: dict[str, tuple[str, ...]] = {
         "Finance Methodology Specialist",
         "Finance Retrieval Specialist",
         "Finance Risk Analyst",
+        "Finance Source Specialist",
+        "Finance Trend Analyst",
     ),
     "benchmark-runtime": (
         "Runtime Benchmark Coordinator",
@@ -189,17 +191,42 @@ def backfill_teams(
                         if existing is not None:
                             existing_members = await store.list_team_members(existing.id)
                             existing_ids = {member.agent_id for member in existing_members}
-                            if existing.template_key == key and existing_ids == expected_ids:
-                                manifest.append(
-                                    {
-                                        "userId": user.id,
-                                        "template": key,
-                                        "teamId": existing.id,
-                                        "agentIds": [agent.id for agent in assigned],
-                                        "status": "existing",
-                                    }
+                            expected_members = {
+                                agent.id: (role, order)
+                                for order, (role, agent) in enumerate(
+                                    zip(template.roles, assigned, strict=True)
                                 )
-                            else:
+                            }
+                            existing_by_agent = {
+                                member.agent_id: member for member in existing_members
+                            }
+                            unexpected_ids = sorted(existing_ids - expected_ids)
+                            role_mismatches = [
+                                member.agent_id
+                                for member in existing_members
+                                if member.agent_id in expected_members
+                                and (
+                                    member.role_key != expected_members[member.agent_id][0].key
+                                    or member.member_type
+                                    != expected_members[member.agent_id][0].member_type
+                                    or member.status != "active"
+                                )
+                            ]
+                            missing_agent_ids = [
+                                agent.id for agent in assigned if agent.id not in existing_by_agent
+                            ]
+                            occupied = {
+                                agent_id: team_id
+                                for agent_id, team_id in memberships.items()
+                                if agent_id in missing_agent_ids and team_id != existing.id
+                            }
+                            if (
+                                existing.template_key != key
+                                or existing.status != "active"
+                                or unexpected_ids
+                                or role_mismatches
+                                or occupied
+                            ):
                                 manifest.append(
                                     {
                                         "userId": user.id,
@@ -207,6 +234,56 @@ def backfill_teams(
                                         "teamId": existing.id,
                                         "status": "conflict",
                                         "reason": "existing_team_mismatch",
+                                        "unexpectedAgentIds": unexpected_ids,
+                                        "roleMismatches": role_mismatches,
+                                        "occupiedAgentIds": occupied,
+                                    }
+                                )
+                                continue
+                            if missing_agent_ids:
+                                entry: dict[str, object] = {
+                                    "userId": user.id,
+                                    "template": key,
+                                    "teamId": existing.id,
+                                    "agentIds": [agent.id for agent in assigned],
+                                    "missingAgentIds": missing_agent_ids,
+                                    "status": "existing",
+                                }
+                                manifest.append(entry)
+                                if not dry_run:
+                                    now = datetime.now(UTC)
+                                    for order, (role, agent) in enumerate(
+                                        zip(template.roles, assigned, strict=True)
+                                    ):
+                                        if agent.id in existing_by_agent:
+                                            continue
+                                        await store.save_team_member(
+                                            AgentTeamMemberRecord(
+                                                team_id=existing.id,
+                                                agent_id=agent.id,
+                                                role_key=role.key,
+                                                member_type=role.member_type,
+                                                display_order=order,
+                                            )
+                                        )
+                                    await store.save_team(
+                                        existing.model_copy(
+                                            update={
+                                                "revision": existing.revision + 1,
+                                                "updated_at": now,
+                                            }
+                                        )
+                                    )
+                                    entry["status"] = "updated"
+                                    entry["addedAgentIds"] = missing_agent_ids
+                            else:
+                                manifest.append(
+                                    {
+                                        "userId": user.id,
+                                        "template": key,
+                                        "teamId": existing.id,
+                                        "agentIds": [agent.id for agent in assigned],
+                                        "status": "existing",
                                     }
                                 )
                             continue
@@ -226,13 +303,13 @@ def backfill_teams(
                                 }
                             )
                             continue
-                        entry: dict[str, object] = {
+                        candidate_entry: dict[str, object] = {
                             "userId": user.id,
                             "template": key,
                             "agentIds": [agent.id for agent in assigned],
                             "status": "candidate",
                         }
-                        manifest.append(entry)
+                        manifest.append(candidate_entry)
                         if not dry_run:
                             now = datetime.now(UTC)
                             team = AgentTeamRecord(
@@ -267,7 +344,7 @@ def backfill_teams(
                                         display_order=order,
                                     )
                                 )
-                            entry["status"] = "created"
+                            candidate_entry["status"] = "created"
             return {"dryRun": dry_run, "manifest": manifest, "count": len(manifest)}
         finally:
             await database.close()

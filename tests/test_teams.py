@@ -18,7 +18,7 @@ from fastclaw.storage import (
     UnitOfWork,
     UserRecord,
 )
-from fastclaw.teams import TeamRole, TeamService, TeamValidationError
+from fastclaw.teams import TeamRole, TeamService, TeamValidationError, resolve_template
 
 
 @pytest.mark.anyio
@@ -107,6 +107,147 @@ def test_custom_team_requires_one_coordinator_and_specialist() -> None:
         from fastclaw.teams import validate_roles
 
         validate_roles((TeamRole("worker", "Worker", "specialist"),))
+
+
+def test_benchmark_finance_template_contains_all_persisted_specialists() -> None:
+    template = resolve_template("benchmark-finance")
+
+    assert [role.name for role in template.roles] == [
+        "Finance Research Coordinator",
+        "Finance Accounting Analyst",
+        "Finance Governance Specialist",
+        "Finance Methodology Specialist",
+        "Finance Retrieval Specialist",
+        "Finance Risk Analyst",
+        "Finance Source Specialist",
+        "Finance Trend Analyst",
+    ]
+
+
+def test_benchmark_backfill_repairs_existing_team_without_creating_agents(
+    tmp_path: Path,
+) -> None:
+    database_url = f"sqlite+aiosqlite:///{tmp_path / 'benchmark-backfill.db'}"
+    names = _BACKFILL_TEAM_MEMBERS["benchmark-finance"]
+    template = resolve_template("benchmark-finance")
+
+    async def inspect() -> tuple[int, int, tuple[str, ...], tuple[str, ...]]:
+        database = Database(database_url)
+        try:
+            async with UnitOfWork(database) as unit:
+                store = unit.require_store()
+                agents = await store.list_agents("user-1")
+                teams = await store.list_teams("user-1")
+                members = await store.list_team_members("team-benchmark")
+                team = teams[0]
+            return (
+                len(agents),
+                team.revision,
+                tuple(member.agent_id for member in members),
+                tuple(member.role_key for member in members),
+            )
+        finally:
+            await database.close()
+
+    async def seed() -> None:
+        database = Database(database_url)
+        await database.create_schema()
+        try:
+            async with UnitOfWork(database) as unit:
+                store = unit.require_store()
+                await store.save_user(
+                    UserRecord(
+                        id="user-1",
+                        username="benchmark",
+                        email="benchmark@example.test",
+                        password_hash="x",
+                    )
+                )
+                for index, name in enumerate(names):
+                    await store.save_agent(
+                        AgentRecord(id=f"agent-{index}", user_id="user-1", name=name)
+                    )
+                await store.save_team(
+                    AgentTeamRecord(
+                        id="team-benchmark",
+                        user_id="user-1",
+                        name="Benchmark finance",
+                        template_key="benchmark-finance",
+                        template_version="v1",
+                        status="active",
+                        revision=4,
+                        client_request_id="backfill:benchmark-finance:user-1",
+                    )
+                )
+                for order, (role, _name) in enumerate(
+                    zip(template.roles[:6], names[:6], strict=True)
+                ):
+                    await store.save_team_member(
+                        AgentTeamMemberRecord(
+                            team_id="team-benchmark",
+                            agent_id=f"agent-{order}",
+                            role_key=role.key,
+                            member_type=role.member_type,
+                            display_order=order,
+                        )
+                    )
+        finally:
+            await database.close()
+
+    def decode_report(output: str) -> dict[str, Any]:
+        return cast(dict[str, Any], json.loads(output[output.index("{") :]))
+
+    asyncio.run(seed())
+    runner = CliRunner()
+    dry_run = runner.invoke(
+        app,
+        ["migrate", "backfill-teams", "--database-url", database_url, "--dry-run"],
+    )
+    assert dry_run.exit_code == 0, dry_run.output
+    dry_entry = next(
+        entry
+        for entry in decode_report(dry_run.output)["manifest"]
+        if entry["template"] == "benchmark-finance"
+    )
+    assert dry_entry["status"] == "existing"
+    assert dry_entry["missingAgentIds"] == ["agent-6", "agent-7"]
+    assert asyncio.run(inspect()) == (
+        8,
+        4,
+        tuple(f"agent-{index}" for index in range(6)),
+        tuple(role.key for role in template.roles[:6]),
+    )
+
+    repaired = runner.invoke(app, ["migrate", "backfill-teams", "--database-url", database_url])
+    assert repaired.exit_code == 0, repaired.output
+    repaired_entry = next(
+        entry
+        for entry in decode_report(repaired.output)["manifest"]
+        if entry["template"] == "benchmark-finance"
+    )
+    assert repaired_entry["status"] == "updated"
+    assert repaired_entry["addedAgentIds"] == ["agent-6", "agent-7"]
+    assert asyncio.run(inspect()) == (
+        8,
+        5,
+        tuple(f"agent-{index}" for index in range(8)),
+        tuple(role.key for role in template.roles),
+    )
+
+    repeated = runner.invoke(app, ["migrate", "backfill-teams", "--database-url", database_url])
+    assert repeated.exit_code == 0, repeated.output
+    repeated_entry = next(
+        entry
+        for entry in decode_report(repeated.output)["manifest"]
+        if entry["template"] == "benchmark-finance"
+    )
+    assert repeated_entry["status"] == "existing"
+    assert asyncio.run(inspect()) == (
+        8,
+        5,
+        tuple(f"agent-{index}" for index in range(8)),
+        tuple(role.key for role in template.roles),
+    )
 
 
 @pytest.mark.anyio

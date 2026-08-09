@@ -190,6 +190,8 @@ BENCHMARK_FINANCE = TeamTemplate(
         TeamRole("methodology", "Finance Methodology Specialist", "specialist"),
         TeamRole("retriever", "Finance Retrieval Specialist", "specialist"),
         TeamRole("risk", "Finance Risk Analyst", "specialist"),
+        TeamRole("source", "Finance Source Specialist", "specialist"),
+        TeamRole("trend", "Finance Trend Analyst", "specialist"),
     ),
     public=False,
 )
