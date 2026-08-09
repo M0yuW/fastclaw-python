@@ -55,6 +55,29 @@ class AgentRecord(Record):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class AgentTeamRecord(Record):
+    id: str
+    user_id: str
+    name: str
+    description: str = ""
+    template_key: str = "custom"
+    template_version: str = "v1"
+    status: str = "provisioning"
+    revision: int = 1
+    client_request_id: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
+class AgentTeamMemberRecord(Record):
+    team_id: str
+    agent_id: str
+    role_key: str
+    member_type: str
+    status: str = "active"
+    display_order: int = 0
+
+
 class SessionRecord(Record):
     user_id: str
     agent_id: str

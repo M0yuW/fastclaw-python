@@ -637,7 +637,13 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
     async def delete_agent(agent_id: str, auth: AuthContext = auth_dependency) -> dict[str, Any]:
         await require_mutable_agent(auth, agent_id)
         async with UnitOfWork(gateway.database) as unit:
-            await unit.require_store().delete_agent(agent_id)
+            store = unit.require_store()
+            if await store.get_team_member_by_agent(agent_id) is not None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "agents that belong to a team cannot be deleted directly",
+                )
+            await store.delete_agent(agent_id)
         gateway.agent_manager.remove_profile(agent_id)
         return {"ok": True, "assetsRetained": True}
 
