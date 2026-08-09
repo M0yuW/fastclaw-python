@@ -246,9 +246,7 @@ def validate_roles(roles: Sequence[TeamRole]) -> None:
         }
     )
     if unsupported_types:
-        raise TeamValidationError(
-            f"unsupported team member type: {', '.join(unsupported_types)}"
-        )
+        raise TeamValidationError(f"unsupported team member type: {', '.join(unsupported_types)}")
     coordinators = [role for role in roles if role.member_type == "coordinator"]
     specialists = [role for role in roles if role.member_type == "specialist"]
     keys = [role.key for role in roles]
