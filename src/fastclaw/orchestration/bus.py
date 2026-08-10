@@ -119,6 +119,7 @@ class InProcessMessageBus:
     async def request(
         self, context: ExecutionContext, target_agent_id: str, task: str
     ) -> TaskResult:
+        started_at = asyncio.get_running_loop().time()
         if self._closing:
             raise MessageBusError("message bus is shutting down")
         registration = self._handlers.get(target_agent_id)
@@ -166,8 +167,27 @@ class InProcessMessageBus:
                 handler=run,
             )
             try:
-                return await ticket.result()
+                result = await ticket.result()
+                logger.info(
+                    "delegation completed "
+                    "(correlation=%s root=%s source=%s target=%s duration_ms=%d)",
+                    result.correlation_id,
+                    context.root_execution_id,
+                    context.agent_id,
+                    target_agent_id,
+                    int((asyncio.get_running_loop().time() - started_at) * 1000),
+                )
+                return result
             except asyncio.CancelledError:
+                logger.warning(
+                    "delegation cancelled "
+                    "(correlation=%s root=%s source=%s target=%s duration_ms=%d)",
+                    correlation_id,
+                    context.root_execution_id,
+                    context.agent_id,
+                    target_agent_id,
+                    int((asyncio.get_running_loop().time() - started_at) * 1000),
+                )
                 await ticket.release(cancel=True)
                 raise
         finally:

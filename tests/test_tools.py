@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from collections.abc import Sequence
@@ -18,14 +19,33 @@ from fastclaw.network import (
 )
 from fastclaw.tools import (
     ExecTool,
+    FootballDataTool,
     FootballLedgerTool,
     ListDirTool,
     ReadFileTool,
     ToolRegistry,
+    ToolResult,
     WebFetchTool,
     WorldCupLedgerTool,
     WriteFileTool,
 )
+
+
+class FixtureFetcher:
+    def __init__(self, responses: dict[str, object]) -> None:
+        self.responses = responses
+        self.urls: list[str] = []
+
+    async def execute(
+        self, arguments: dict[str, object], execution: ExecutionContext
+    ) -> ToolResult:
+        del execution
+        url = str(arguments["url"])
+        self.urls.append(url)
+        for marker, payload in self.responses.items():
+            if marker in url:
+                return ToolResult(content=json.dumps(payload))
+        return ToolResult(content="fixture URL not found", is_error=True)
 
 
 def context() -> ExecutionContext:
@@ -35,6 +55,97 @@ def context() -> ExecutionContext:
         session_id="session-1",
         root_execution_id="run-1",
     )
+
+
+@pytest.mark.asyncio
+async def test_football_data_resolves_non_world_cup_competition_and_schedule() -> None:
+    fetcher = FixtureFetcher(
+        {
+            "search_all_leagues.php": {
+                "countries": [
+                    {
+                        "idLeague": "4429",
+                        "strLeague": "FIFA World Cup",
+                        "strLeagueAlternate": "",
+                        "strCountry": "Worldwide",
+                    },
+                    {
+                        "idLeague": "4613",
+                        "strLeague": "Swedish Allsvenskan",
+                        "strLeagueAlternate": "Allsvenskan",
+                        "strCountry": "Sweden",
+                    },
+                ]
+            },
+            "eventsday.php": {"events": [{"strEvent": "IK Sirius vs IF Brommapojkarna"}]},
+        }
+    )
+    tool = FootballDataTool(fetcher)
+
+    resolved = await tool.execute(
+        {
+            "action": "competition_search",
+            "competition": "Allsvenskan",
+            "country": "Sweden",
+        },
+        context(),
+    )
+    scheduled = await tool.execute(
+        {"action": "schedule", "league_id": "4613", "date": "2026-08-10"},
+        context(),
+    )
+
+    assert json.loads(resolved.content)["competitions"] == [
+        {
+            "league_id": "4613",
+            "competition": "Swedish Allsvenskan",
+            "alternate": "Allsvenskan",
+            "country": "Sweden",
+        }
+    ]
+    assert json.loads(scheduled.content)["rows"][0]["match"] == ("IK Sirius vs IF Brommapojkarna")
+    assert "l=4613" in fetcher.urls[-1]
+    assert "c=Sweden" in fetcher.urls[0]
+
+
+@pytest.mark.asyncio
+async def test_football_data_sporttery_match_is_not_world_cup_filtered() -> None:
+    fetcher = FixtureFetcher(
+        {
+            "getMatchCalculatorV1": {
+                "value": {
+                    "matchInfoList": [
+                        {
+                            "subMatchList": [
+                                {
+                                    "matchId": "swe-1",
+                                    "leagueAllName": "瑞典超级联赛",
+                                    "homeTeamAllName": "天狼星",
+                                    "homeTeamAbbEnName": "IK Sirius",
+                                    "awayTeamAllName": "布洛马波卡纳",
+                                    "awayTeamAbbEnName": "IF Brommapojkarna",
+                                    "had": {"h": "2.10", "d": "3.20", "a": "3.05"},
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    result = await FootballDataTool(fetcher).execute(
+        {
+            "action": "sporttery_match",
+            "team_a": "Sirius",
+            "team_b": "Brommapojkarna",
+        },
+        context(),
+    )
+
+    payload = json.loads(result.content)
+    assert payload["competition"] == "瑞典超级联赛"
+    assert payload["match_id"] == "swe-1"
 
 
 @pytest.mark.asyncio

@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastclaw.agent import AgentEvent, AgentEventType
 from fastclaw.app import create_app
 from fastclaw.gateway import GatewaySettings
-from fastclaw.gateway.router import _web_event, _web_history_message
+from fastclaw.gateway.router import _clean_session_preview, _web_event, _web_history_message
 from fastclaw.identity import hash_api_key, hash_password
 from fastclaw.orchestration import TaskSnapshot
 from fastclaw.providers import FunctionCall, ToolCall
@@ -28,6 +28,10 @@ from fastclaw.storage import (
     UserRecord,
 )
 from fastclaw.teams import TeamService
+
+
+def test_session_preview_strips_markdown_title_prefixes() -> None:
+    assert _clean_session_preview("---\n\n## ⚠️ Important **result**") == "⚠️ Important result"
 
 
 @asynccontextmanager
@@ -113,6 +117,7 @@ async def test_team_api_is_idempotent_and_enforces_lifecycle(tmp_path: Path) -> 
             "details": {},
         }
         assert football_preview.json()["checks"]["tools"]["required"] == [
+            "football_data",
             "football_ledger",
             "spawn_subagent",
             "web_fetch",

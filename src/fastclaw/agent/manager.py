@@ -40,6 +40,7 @@ from fastclaw.runtime import Runtime, RuntimeState
 from fastclaw.skills import Skill, SkillCatalog, SkillError
 from fastclaw.storage import AgentRecord, ConfigRecord, Database, UnitOfWork
 from fastclaw.tools import (
+    FootballDataTool,
     FootballLedgerTool,
     ListDirTool,
     ReadFileTool,
@@ -136,11 +137,13 @@ def _default_tools(
         if isinstance(configured_targets, list)
         else None
     )
+    web_fetch = WebFetchTool(runtime.web_http_client)
     tools: list[Any] = [
         ReadFileTool(workspace),
         ListDirTool(workspace),
         WriteFileTool(workspace),
-        WebFetchTool(runtime.web_http_client),
+        web_fetch,
+        FootballDataTool(web_fetch),
         SpawnSubagentTool(bus, team_targets),
         FootballLedgerTool(data_root),
         WorldCupLedgerTool(data_root),
@@ -917,6 +920,9 @@ class AgentRuntimeManager:
             thinking_budget_tokens=(
                 int(config["thinkingBudgetTokens"]) if config.get("thinkingBudgetTokens") else None
             ),
+            delegation_timeout=float(config.get("delegationTimeoutSeconds") or 120),
+            max_failed_tool_rounds=int(config.get("maxFailedToolRounds") or 0),
+            scope_guard=str(config.get("scopeGuard") or ""),
         )
 
     @staticmethod

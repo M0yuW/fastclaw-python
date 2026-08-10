@@ -31,6 +31,9 @@ class TeamRole:
     soul: str = ""
     skills: tuple[str, ...] = ()
     allowed_tools: tuple[str, ...] = ()
+    delegation_timeout_seconds: int | None = None
+    max_failed_tool_rounds: int | None = None
+    scope_guard: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,12 +190,18 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "Coordinate evidence-based analysis for any named football competition. "
                 "Before delegation, resolve the competition, season or edition, stage, match, "
                 "kickoff time, timezone, venue, and leg or aggregate context. Ask the user when "
-                "scope is ambiguous. Delegate independently, reject evidence from the wrong "
+                "scope is ambiguous. If competition plus date/season are missing, ask a concise "
+                "clarifying question and do not call tools or predict yet. Delegate independently, "
+                "reject evidence from the wrong "
                 "competition or season, keep predictions conditional, and never invent live "
-                "facts. Record predictions with football_ledger only after reconciling all "
-                "specialist results."
+                "facts. If every required tool fails, stop and report that no evidence-backed "
+                "prediction is available; never substitute model memory. Record predictions with "
+                "football_ledger only after reconciling all specialist results."
             ),
             allowed_tools=("spawn_subagent", "football_ledger"),
+            delegation_timeout_seconds=120,
+            max_failed_tool_rounds=1,
+            scope_guard="football",
         ),
         TeamRole(
             "data-analyst",
@@ -204,7 +213,7 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "sources, never mix competitions or seasons, and mark unavailable data unknown. "
                 "Return as_of, competition, season, match, lean, confidence, evidence, and URLs."
             ),
-            allowed_tools=("web_fetch",),
+            allowed_tools=("football_data", "web_fetch"),
         ),
         TeamRole(
             "tactics-analyst",
@@ -215,7 +224,7 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "competition format. Separate confirmed lineup or injury facts from tactical "
                 "inference, cite dated sources, and account for two-leg or extra-time rules."
             ),
-            allowed_tools=("web_fetch",),
+            allowed_tools=("football_data", "web_fetch"),
         ),
         TeamRole(
             "odds-analyst",
@@ -226,7 +235,7 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "competition. State bookmaker or market source, remove vig when possible, expose "
                 "missing coverage, and provide price calibration rather than betting advice."
             ),
-            allowed_tools=("web_fetch",),
+            allowed_tools=("football_data", "web_fetch"),
         ),
         TeamRole(
             "history-analyst",
@@ -237,7 +246,7 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "managers, formats, or venues as current evidence. Cite dates and sources and make "
                 "the limits of historical transfer explicit."
             ),
-            allowed_tools=("web_fetch",),
+            allowed_tools=("football_data", "web_fetch"),
         ),
         TeamRole(
             "risk-officer",
@@ -248,7 +257,7 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "injuries, suspensions, fatigue, weather, travel, rotation, format rules, and data "
                 "gaps. Never turn an unverified absence or rumor into a confirmed fact."
             ),
-            allowed_tools=("web_fetch",),
+            allowed_tools=("football_data", "web_fetch"),
         ),
         TeamRole(
             "ev-analyst",
@@ -259,7 +268,7 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "show assumptions and sensitivity, and report whether price already reflects the "
                 "evidence. Do not change the evidence confidence and do not give stake advice."
             ),
-            allowed_tools=("web_fetch",),
+            allowed_tools=("football_data", "web_fetch"),
         ),
     ),
 )
@@ -361,6 +370,7 @@ class TeamService:
         template_key: str,
         client_request_id: str,
         model: str = "",
+        specialist_model: str = "",
         provider_name: str = "",
         custom_roles: Sequence[TeamRole] = (),
     ) -> tuple[AgentTeamRecord, tuple[AgentTeamMemberRecord, ...]]:
@@ -376,6 +386,7 @@ class TeamService:
                 template=template,
                 client_request_id=client_request_id,
                 model=model,
+                specialist_model=specialist_model,
                 provider_name=provider_name,
             )
         except IntegrityError:
@@ -398,6 +409,7 @@ class TeamService:
         template: TeamTemplate,
         client_request_id: str,
         model: str,
+        specialist_model: str,
         provider_name: str,
     ) -> tuple[AgentTeamRecord, tuple[AgentTeamMemberRecord, ...]]:
         async with UnitOfWork(self.database) as unit:
@@ -421,12 +433,17 @@ class TeamService:
             await store.save_team(team)
             members: list[AgentTeamMemberRecord] = []
             for position, role in enumerate(template.roles):
+                role_model = (
+                    specialist_model
+                    if role.member_type == "specialist" and specialist_model
+                    else model
+                )
                 agent = AgentRecord(
                     id=f"agt_{uuid4().hex[:20]}",
                     user_id=user_id,
                     name=role.name,
                     config={
-                        **({"model": model} if model else {}),
+                        **({"model": role_model} if role_model else {}),
                         **({"provider": provider_name} if provider_name else {}),
                         "description": role.description,
                         "soul": role.soul,
@@ -436,6 +453,17 @@ class TeamService:
                         **(
                             {"allowedTools": list(role.allowed_tools)} if role.allowed_tools else {}
                         ),
+                        **(
+                            {"delegationTimeoutSeconds": role.delegation_timeout_seconds}
+                            if role.delegation_timeout_seconds is not None
+                            else {}
+                        ),
+                        **(
+                            {"maxFailedToolRounds": role.max_failed_tool_rounds}
+                            if role.max_failed_tool_rounds is not None
+                            else {}
+                        ),
+                        **({"scopeGuard": role.scope_guard} if role.scope_guard else {}),
                     },
                     created_at=now,
                     updated_at=now,

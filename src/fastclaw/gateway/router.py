@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import tempfile
 import time
@@ -270,6 +271,17 @@ def _web_history_message(message: dict[str, Any]) -> dict[str, Any]:
         )
     payload["toolCalls"] = flattened
     return payload
+
+
+def _clean_session_preview(value: str, limit: int = 160) -> str:
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    candidate = next(
+        (line for line in lines if not re.fullmatch(r"[-_*#~`>\s]+", line)),
+        "",
+    )
+    candidate = re.sub(r"^[#>*_~`\-\s]+", "", candidate)
+    candidate = re.sub(r"[*_~`]+", "", candidate)
+    return re.sub(r"\s+", " ", candidate).strip()[:limit]
 
 
 def create_gateway_router(gateway: Gateway) -> APIRouter:
@@ -686,6 +698,7 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         required_tools = sorted({tool for role in template.roles for tool in role.allowed_tools})
         available_tools = {
             "exec",
+            "football_data",
             "football_ledger",
             "list_dir",
             "read_file",
@@ -763,6 +776,7 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                 template_key=payload.template_key,
                 client_request_id=payload.client_request_id,
                 model=payload.model,
+                specialist_model=payload.specialist_model,
                 provider_name=payload.provider_name,
                 custom_roles=custom_roles if payload.template_key == "custom" else (),
             )
@@ -1634,7 +1648,7 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                     "title": item.title,
                     "preview": next(
                         (
-                            str(message.get("content") or "")[:160]
+                            _clean_session_preview(str(message.get("content") or ""))
                             for message in reversed(item.messages)
                             if message.get("role") == "assistant"
                         ),

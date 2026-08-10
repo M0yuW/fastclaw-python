@@ -109,7 +109,7 @@ class ChatMessage(ProviderModel):
     name: str | None = None
     thinking: str | None = None
     thinking_signature: str | None = None
-    timestamp: datetime = Field(default_factory=lambda: datetime.fromtimestamp(0, UTC))
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
     origin: str = ""
     provider: str = ""

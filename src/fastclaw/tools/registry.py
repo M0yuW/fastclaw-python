@@ -53,7 +53,19 @@ class ToolRegistry:
             with anyio.fail_after(timeout_seconds):
                 return await tool.execute(arguments, context)
         except TimeoutError:
-            return ToolResult(content=f"tool {name!r} timed out", is_error=True)
+            logger.warning(
+                "tool %s timed out after %.1fs (root=%s agent=%s call_path=%s)",
+                name,
+                timeout_seconds,
+                context.root_execution_id,
+                context.agent_id,
+                " -> ".join(context.call_path),
+            )
+            return ToolResult(
+                content=f"tool {name!r} timed out",
+                is_error=True,
+                metadata={"errorCode": "timeout", "timeoutSeconds": timeout_seconds},
+            )
         except Exception:
             return self._unexpected_failure(name)
 
@@ -89,8 +101,22 @@ class ToolRegistry:
                 raise RuntimeError("batch tools cannot return direct responses")
             return results
         except TimeoutError:
+            logger.warning(
+                "batch tool %s timed out after %.1fs (root=%s agent=%s call_path=%s calls=%d)",
+                name,
+                timeout_seconds,
+                context.root_execution_id,
+                context.agent_id,
+                " -> ".join(context.call_path),
+                len(arguments),
+            )
             return tuple(
-                ToolResult(content=f"tool {name!r} timed out", is_error=True) for _ in arguments
+                ToolResult(
+                    content=f"tool {name!r} timed out",
+                    is_error=True,
+                    metadata={"errorCode": "timeout", "timeoutSeconds": timeout_seconds},
+                )
+                for _ in arguments
             )
         except Exception:
             failure = self._unexpected_failure(name)
