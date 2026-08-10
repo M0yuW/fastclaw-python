@@ -61,6 +61,7 @@ class AgentTeamRepository(Protocol):
     async def delete_team(self, team_id: str) -> None: ...
     async def save_team_member(self, record: AgentTeamMemberRecord) -> None: ...
     async def delete_team_member(self, team_id: str, agent_id: str) -> None: ...
+    async def get_team_member_by_agent(self, agent_id: str) -> AgentTeamMemberRecord | None: ...
     async def list_team_members(self, team_id: str) -> Sequence[AgentTeamMemberRecord]: ...
 
 
@@ -271,6 +272,12 @@ class SQLAlchemyStore:
                 AgentTeamMemberModel.team_id == team_id, AgentTeamMemberModel.agent_id == agent_id
             )
         )
+
+    async def get_team_member_by_agent(self, agent_id: str) -> AgentTeamMemberRecord | None:
+        model = await self.session.scalar(
+            select(AgentTeamMemberModel).where(AgentTeamMemberModel.agent_id == agent_id)
+        )
+        return self._team_member_record(model) if model is not None else None
 
     async def list_team_members(self, team_id: str) -> Sequence[AgentTeamMemberRecord]:
         models = (

@@ -190,6 +190,8 @@ BENCHMARK_FINANCE = TeamTemplate(
         TeamRole("methodology", "Finance Methodology Specialist", "specialist"),
         TeamRole("retriever", "Finance Retrieval Specialist", "specialist"),
         TeamRole("risk", "Finance Risk Analyst", "specialist"),
+        TeamRole("source", "Finance Source Specialist", "specialist"),
+        TeamRole("trend", "Finance Trend Analyst", "specialist"),
     ),
     public=False,
 )
@@ -236,6 +238,15 @@ def resolve_template(key: str, custom_roles: Sequence[TeamRole] = ()) -> TeamTem
 
 
 def validate_roles(roles: Sequence[TeamRole]) -> None:
+    unsupported_types = sorted(
+        {
+            role.member_type
+            for role in roles
+            if role.member_type not in {"coordinator", "specialist"}
+        }
+    )
+    if unsupported_types:
+        raise TeamValidationError(f"unsupported team member type: {', '.join(unsupported_types)}")
     coordinators = [role for role in roles if role.member_type == "coordinator"]
     specialists = [role for role in roles if role.member_type == "specialist"]
     keys = [role.key for role in roles]
