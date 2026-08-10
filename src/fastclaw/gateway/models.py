@@ -127,6 +127,7 @@ class TeamCreate(WireModel):
     template_key: str = "custom"
     client_request_id: str
     model: str = ""
+    provider_name: str = ""
     specialists: list[TeamRoleInput] = Field(default_factory=list)
 
 

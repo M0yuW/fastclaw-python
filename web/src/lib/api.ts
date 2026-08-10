@@ -756,6 +756,91 @@ export async function getAgents(signal?: AbortSignal): Promise<AgentDetail[]> {
   return Array.isArray(data) ? (data as AgentDetail[]) : [];
 }
 
+export interface TeamMemberInfo {
+  agentId: string;
+  roleKey: string;
+  memberType: "coordinator" | "specialist";
+  status: string;
+  displayOrder: number;
+}
+
+export interface TeamInfo {
+  id: string;
+  name: string;
+  description: string;
+  templateKey: string;
+  templateVersion: string;
+  status: "provisioning" | "active" | "archived";
+  revision: number;
+  members: TeamMemberInfo[];
+}
+
+export interface TeamTemplate {
+  key: string;
+  version: string;
+  name: string;
+  roles: Array<{ key: string; name: string; memberType: "coordinator" | "specialist" }>;
+}
+
+export interface TeamPreview {
+  ok: boolean;
+  writesDatabase: boolean;
+  templateKey: string;
+  roles: string[];
+  checks?: {
+    provider?: { ok?: boolean; name?: string; model?: string; error?: string };
+    model?: boolean;
+    skills?: { required?: string[]; prepared?: boolean; details?: Record<string, { installed: boolean; prepared: boolean; error?: string }> };
+    tools?: { required?: string[]; available?: boolean; missing?: string[] };
+    environment?: Record<string, boolean>;
+  };
+  detail?: string;
+}
+
+export async function getTeams(): Promise<TeamInfo[]> {
+  const res = await apiFetch("/api/agent-teams");
+  if (!res.ok) throw new Error(`getTeams failed: ${res.status}`);
+  return ((await res.json()).teams || []) as TeamInfo[];
+}
+
+export async function getTeamTemplates(): Promise<TeamTemplate[]> {
+  const res = await apiFetch("/api/agent-team-templates");
+  if (!res.ok) throw new Error(`getTeamTemplates failed: ${res.status}`);
+  return ((await res.json()).templates || []) as TeamTemplate[];
+}
+
+export async function previewTeam(payload: Record<string, unknown>): Promise<TeamPreview> {
+  const res = await apiFetch("/api/agent-teams/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  return res.json() as Promise<TeamPreview>;
+}
+
+export async function createTeam(payload: Record<string, unknown>) {
+  const res = await apiFetch("/api/agent-teams", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  return res.json();
+}
+
+export async function archiveTeam(id: string, revision: number) {
+  const res = await apiFetch(`/api/agent-teams/${encodeURIComponent(id)}/archive`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ revision }),
+  });
+  return res.json();
+}
+
+export async function restoreTeam(id: string, revision: number) {
+  const res = await apiFetch(`/api/agent-teams/${encodeURIComponent(id)}/restore`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ revision }),
+  });
+  return res.json();
+}
+
+export async function deleteTeam(id: string, revision: number) {
+  const res = await apiFetch(`/api/agent-teams/${encodeURIComponent(id)}`, {
+    method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ teamId: id, revision }),
+  });
+  return res.json();
+}
+
 // Single-agent detail. Falls back through the same permission rules as
 // the rest of /api/agents/{id} — owner or super_admin can fetch. Used
 // by the chat header to resolve a name when the agent isn't in the
@@ -858,29 +943,8 @@ export async function deleteAgentSkill(agentId: string, name: string) {
   return res.json();
 }
 
-// Search results use skills.sh's shape; clawhub has a different shape but the
-// admin UI only wires skills.sh (primary registry). Callers that want clawhub
-// go through installSkill with source="clawhub".
-export interface SkillSearchResult {
-  id: string;       // "<owner>/<repo>/<skillId>"
-  skillId: string;  // folder name — also the slug passed to installSkill
-  name: string;
-  source: string;   // "<owner>/<repo>"
-  installs: number;
-}
-
-export async function searchSkills(query: string, signal?: AbortSignal): Promise<SkillSearchResult[]> {
-  if (!query.trim()) return [];
-  const res = await apiFetch(`/api/skills/search?source=skillssh&q=${encodeURIComponent(query)}`, { signal });
-  if (!res.ok) return [];
-  const data = await res.json();
-  return (data.results || []) as SkillSearchResult[];
-}
-
 export interface InstallSkillRequest {
   name: string;
-  source?: "skillssh" | "clawhub" | "github" | "auto";
-  repo?: string;
   agent?: string;  // omit for global install (admin only)
 }
 

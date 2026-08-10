@@ -37,6 +37,8 @@ async def test_team_creation_is_atomic_and_idempotent(tmp_path: Path) -> None:
             description="",
             template_key="finance-market-research",
             client_request_id="request-1",
+            model="deepseek-v4-flash",
+            provider_name="deepseek",
         )
         second, retried_members = await service.create(
             user_id="usr_1",
@@ -54,7 +56,12 @@ async def test_team_creation_is_atomic_and_idempotent(tmp_path: Path) -> None:
             assert len(await store.list_agents("usr_1")) == 5
             assert len(await store.list_team_members(first.id)) == 5
             created = [await store.get_agent(member.agent_id) for member in members]
-            assert all(agent is not None and "model" not in agent.config for agent in created)
+            assert all(
+                agent is not None
+                and agent.config["model"] == "deepseek-v4-flash"
+                and agent.config["provider"] == "deepseek"
+                for agent in created
+            )
             created_by_role = {
                 member.role_key: agent
                 for member, agent in zip(members, created, strict=True)

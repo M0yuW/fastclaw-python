@@ -22,6 +22,7 @@ import {
   SettingsIcon,
   SparklesIcon,
   UsersIcon,
+  UsersRoundIcon,
   Wand2Icon,
 } from "lucide-react";
 import {
@@ -50,11 +51,13 @@ function extractAgentId(pathname: string): string | null {
 const USER_NAV: NavItem[] = [
   { title: "Overview", url: "/overview/", icon: LayoutDashboardIcon },
   { title: "Agents", url: "/agents/", icon: BotIcon },
+  { title: "Teams", url: "/teams/", icon: UsersRoundIcon },
 ];
 
 const ADMIN_NAV: NavItem[] = [
   { title: "Overview", url: "/overview/", icon: LayoutDashboardIcon },
   { title: "Agents", url: "/agents/", icon: BotIcon },
+  { title: "Teams", url: "/teams/", icon: UsersRoundIcon },
   { title: "Models", url: "/models/", icon: BrainIcon },
   { title: "Skills", url: "/skills/", icon: SparklesIcon },
   { title: "Users", url: "/admin/users/", icon: UsersIcon },

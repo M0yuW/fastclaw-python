@@ -26,20 +26,17 @@ import {
   Sparkles,
   Trash2,
   Download,
-  Search,
   Loader2,
   Check,
-  ExternalLink,
   Settings,
 } from "lucide-react";
 import {
   getAgentSkills,
+  getSkills,
   deleteAgentSkill,
   installSkill,
-  searchSkills,
   getConfig,
   type SkillInfo,
-  type SkillSearchResult,
 } from "@/lib/api";
 import { ConfigureSkillDialog, type SkillEntryView } from "@/components/configure-skill-dialog";
 import { useAgentIdFromURL } from "@/hooks/use-agent-id";
@@ -138,8 +135,8 @@ export default function AgentSkillsPage() {
               No agent-scoped skills yet
             </p>
             <p className="text-xs text-muted-foreground/60 mb-4 max-w-sm text-center">
-              Install a skill below. It lands in the agent-specific skills
-              directory and only this agent sees it.
+              Enable a skill from the local catalog. It is available only to
+              this agent.
             </p>
             <Button variant="outline" size="sm" onClick={() => setInstallOpen(true)}>
               <Download className="h-4 w-4 mr-2" />
@@ -267,60 +264,43 @@ function InstallSkillDialog({
   installedNames: Set<string>;
 }) {
   const [query, setQuery] = useState("");
-  const [results, setResults] = useState<SkillSearchResult[]>([]);
-  const [searching, setSearching] = useState(false);
+  const [catalog, setCatalog] = useState<SkillInfo[]>([]);
+  const [loadingCatalog, setLoadingCatalog] = useState(false);
   const [installingId, setInstallingId] = useState<string | null>(null);
   const [installError, setInstallError] = useState<string | null>(null);
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const searchAbortRef = useRef<AbortController | null>(null);
 
-  const cancelSearch = () => {
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    searchAbortRef.current?.abort();
-    searchAbortRef.current = null;
-  };
-
-  const handleQueryChange = (value: string) => {
-    setQuery(value);
-    cancelSearch();
-    if (!value.trim()) {
-      setResults([]);
-      setSearching(false);
-      return;
-    }
+  useEffect(() => {
+    if (!open) return;
     const controller = new AbortController();
-    searchAbortRef.current = controller;
-    setSearching(true);
-    debounceRef.current = setTimeout(() => {
-      searchSkills(value, controller.signal)
-        .then((nextResults) => {
-          if (!controller.signal.aborted) setResults(nextResults);
-        })
-        .catch(() => {
-          if (!controller.signal.aborted) setResults([]);
-        })
-        .finally(() => {
-          if (!controller.signal.aborted) setSearching(false);
-          if (searchAbortRef.current === controller) searchAbortRef.current = null;
-        });
-    }, 300);
-  };
+    setLoadingCatalog(true);
+    getSkills(controller.signal)
+      .then((skills) => {
+        if (!controller.signal.aborted) setCatalog(skills);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setCatalog([]);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoadingCatalog(false);
+      });
+    return () => controller.abort();
+  }, [open]);
 
-  const handleOpenChange = (nextOpen: boolean) => {
-    if (!nextOpen) cancelSearch();
-    onOpenChange(nextOpen);
-  };
+  const visible = useMemo(() => {
+    const normalized = query.trim().toLowerCase();
+    return catalog
+      .filter((skill) => {
+        return !normalized || `${skill.name} ${skill.description}`.toLowerCase().includes(normalized);
+      })
+      .slice(0, 20);
+  }, [catalog, query]);
 
-  const visible = useMemo(() => results.slice(0, 20), [results]);
-
-  const handleInstall = async (r: SkillSearchResult) => {
+  const handleInstall = async (skill: SkillInfo) => {
     setInstallError(null);
-    setInstallingId(r.id);
+    setInstallingId(skill.name);
     try {
-      // agent: agentId → backend installs into ~/.fastclaw/agents/<id>/skills
       const resp = await installSkill({
-        source: "skillssh",
-        name: r.skillId,
+        name: skill.name,
         agent: agentId,
       });
       if (!resp.ok) {
@@ -336,64 +316,51 @@ function InstallSkillDialog({
   };
 
   return (
-    <Dialog open={open} onOpenChange={handleOpenChange}>
+    <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-w-2xl">
         <DialogHeader>
           <DialogTitle>Install Skill for {agentName}</DialogTitle>
           <DialogDescription>
-            Search skills.sh and install into{" "}
-            <code className="font-mono text-xs">
-              ~/.fastclaw/agents/{agentId}/skills/
-            </code>
-            . Only this agent will see the new skill.
+            Choose a skill from the local catalog. Only this agent will be
+            able to use it.
           </DialogDescription>
         </DialogHeader>
 
         <div className="relative">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground/70" />
           <Input
             autoFocus
-            placeholder="pdf, translation, web scraping…"
+            placeholder="Filter local skills…"
             value={query}
-            onChange={(event) => handleQueryChange(event.target.value)}
-            className="pl-9"
+            onChange={(event) => setQuery(event.target.value)}
           />
         </div>
 
         <div className="min-h-[240px] max-h-[420px] overflow-y-auto -mx-1 px-1">
-          {!query.trim() ? (
-            <div className="flex flex-col items-center justify-center py-12 text-center">
-              <Sparkles className="h-8 w-8 text-muted-foreground/40 mb-3" />
-              <p className="text-sm text-muted-foreground">
-                Start typing to search skills.sh
-              </p>
-            </div>
-          ) : searching ? (
+          {loadingCatalog ? (
             <div className="space-y-2 py-2">
               {[1, 2, 3].map((i) => (
                 <Skeleton key={i} className="h-14" />
               ))}
             </div>
           ) : visible.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-10 text-center">
-              <p className="text-sm text-muted-foreground mb-1">
-                No skills found for{" "}
-                <strong className="text-foreground">{query}</strong>
+            <div className="flex flex-col items-center justify-center py-12 text-center">
+              <Sparkles className="h-8 w-8 text-muted-foreground/40 mb-3" />
+              <p className="text-sm text-muted-foreground">
+                {query.trim() ? `No local skills found for ${query}` : "No local skills are available"}
               </p>
             </div>
           ) : (
             <>
               <p className="text-[10px] uppercase tracking-wider text-muted-foreground/70 mb-1.5 px-1">
-                Results from skills.sh
+                Local skill catalog
               </p>
               <div className="space-y-1.5 py-1">
-                {visible.map((r) => {
-                  const already = installedNames.has(r.skillId);
-                  const busy = installingId === r.id;
-                  const detailUrl = `https://skills.sh/${r.id}`;
+                {visible.map((skill) => {
+                  const already = installedNames.has(skill.name);
+                  const busy = installingId === skill.name;
                   return (
                     <div
-                      key={r.id}
+                      key={skill.name}
                       className="flex items-center gap-3 rounded-md border border-border bg-card p-3 hover:bg-muted/40 transition-colors"
                     >
                       <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 shrink-0">
@@ -401,27 +368,18 @@ function InstallSkillDialog({
                       </div>
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2">
-                          <p className="text-sm font-medium truncate">{r.skillId}</p>
-                          <span className="text-[10px] text-muted-foreground">
-                            {r.installs.toLocaleString()} installs
-                          </span>
+                          <p className="text-sm font-medium truncate">{skill.name}</p>
+                          <Badge variant="outline" className="text-[10px]">local</Badge>
                         </div>
-                        <a
-                          href={detailUrl}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground font-mono truncate"
-                          title={`View on skills.sh: ${r.id}`}
-                        >
-                          {r.source}
-                          <ExternalLink className="h-3 w-3 shrink-0" />
-                        </a>
+                        <p className="text-xs text-muted-foreground line-clamp-2">
+                          {skill.description || "No description"}
+                        </p>
                       </div>
                       <Button
                         size="sm"
                         variant={already ? "outline" : "default"}
                         disabled={already || busy}
-                        onClick={() => handleInstall(r)}
+                        onClick={() => handleInstall(skill)}
                       >
                         {already ? (
                           <>
