@@ -27,6 +27,7 @@ from fastclaw.storage import (
     UnitOfWork,
     UserRecord,
 )
+from fastclaw.teams import TeamService
 
 
 @asynccontextmanager
@@ -332,6 +333,33 @@ async def test_onboard_cookie_auth_status_agents_and_masked_provider(tmp_path: P
         denied = await client.get("/api/me")
         assert logged_out.status_code == 200
         assert denied.status_code == 401
+
+
+async def test_team_member_agent_cannot_be_deleted_directly(tmp_path: Path) -> None:
+    async with gateway_client(tmp_path / "team-member-delete.db") as (client, database, _app):
+        created = await onboard(client)
+        await login(client)
+        _team, members = await TeamService(database).create(
+            user_id=created["userId"],
+            name="Markets",
+            description="",
+            template_key="finance-market-research",
+            client_request_id="team-member-delete",
+        )
+
+        rejected = await client.delete(f"/api/agents/{members[0].agent_id}")
+        deleted = await client.delete(f"/api/agents/{created['agentId']}")
+
+        assert rejected.status_code == 409
+        assert rejected.json() == {
+            "ok": False,
+            "error": "agents that belong to a team cannot be deleted directly",
+        }
+        assert deleted.status_code == 200
+        async with UnitOfWork(database) as unit:
+            store = unit.require_store()
+            assert await store.get_agent(members[0].agent_id) is not None
+            assert await store.get_agent(created["agentId"]) is None
 
 
 async def test_bearer_api_key_enforces_agent_acl(tmp_path: Path, monkeypatch: Any) -> None:
