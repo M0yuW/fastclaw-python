@@ -92,6 +92,31 @@ async def test_team_api_is_idempotent_and_enforces_lifecycle(tmp_path: Path) -> 
     async with gateway_client(tmp_path / "teams.db") as (client, database, _):
         await onboard(client)
         await login(client)
+        templates = (await client.get("/api/agent-team-templates")).json()["templates"]
+        general_football = next(
+            item for item in templates if item["key"] == "football-competition-analysis"
+        )
+        assert len(general_football["roles"]) == 7
+        football_preview = await client.post(
+            "/api/agent-teams/preview",
+            json={
+                "name": "League analysis",
+                "templateKey": "football-competition-analysis",
+                "clientRequestId": "football-preview-request",
+            },
+        )
+        assert football_preview.status_code == 200
+        assert football_preview.json()["ok"] is True
+        assert football_preview.json()["checks"]["skills"] == {
+            "required": [],
+            "prepared": True,
+            "details": {},
+        }
+        assert football_preview.json()["checks"]["tools"]["required"] == [
+            "football_ledger",
+            "spawn_subagent",
+            "web_fetch",
+        ]
         preview = await client.post(
             "/api/agent-teams/preview",
             json={
@@ -179,6 +204,33 @@ async def test_team_api_is_idempotent_and_enforces_lifecycle(tmp_path: Path) -> 
                 await store.get_agent(member["agentId"]) for member in team["members"]
             ]
             assert all(agent is None for agent in deleted_agents)
+
+
+async def test_general_football_team_can_be_created_from_public_template(tmp_path: Path) -> None:
+    async with gateway_client(tmp_path / "football-team.db") as (client, _database, app):
+        await onboard(client)
+        await login(client)
+
+        response = await client.post(
+            "/api/agent-teams",
+            json={
+                "name": "General football analysis",
+                "description": "Competition-scoped fixture analysis",
+                "templateKey": "football-competition-analysis",
+                "clientRequestId": "general-football-create",
+            },
+        )
+
+        assert response.status_code == 201
+        team = response.json()["team"]
+        assert team["templateKey"] == "football-competition-analysis"
+        assert len(team["members"]) == 7
+        coordinator = next(
+            member for member in team["members"] if member["memberType"] == "coordinator"
+        )
+        profile = app.state.gateway.agent_manager.profiles[coordinator["agentId"]]
+        assert profile.allowed_tools == frozenset({"spawn_subagent", "football_ledger"})
+        assert "competition, season or edition" in profile.system_prompt
 
 
 def test_sse_tool_result_preserves_call_identity_for_pairing() -> None:

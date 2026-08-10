@@ -18,6 +18,7 @@ from fastclaw.network import (
 )
 from fastclaw.tools import (
     ExecTool,
+    FootballLedgerTool,
     ListDirTool,
     ReadFileTool,
     ToolRegistry,
@@ -98,6 +99,59 @@ async def test_worldcup_ledger_is_atomic_unique_and_reports_directly(tmp_path: P
     assert report.direct_return is True
     assert "France vs Sweden" in report.content
     assert "2-1" in report.content
+
+
+async def test_football_ledger_scopes_entries_by_competition(tmp_path: Path) -> None:
+    tool = FootballLedgerTool(tmp_path)
+    premier_league = {
+        "competition": "Premier League",
+        "season": "2026/27",
+        "date": "2026-08-15",
+        "match": "Team A vs Team B",
+        "our_pred": "Team A",
+        "our_confidence": "mid",
+        "actual_result": None,
+    }
+    fa_cup = {**premier_league, "competition": "FA Cup", "season": "2026/27"}
+
+    await tool.execute({"operation": "append", "entry": premier_league}, context())
+    await tool.execute({"operation": "append", "entry": fa_cup}, context())
+    with pytest.raises(ValueError, match="already contains"):
+        await tool.execute(
+            {
+                "operation": "append",
+                "entry": {
+                    **premier_league,
+                    "competition": " premier  league ",
+                    "match": "team a VS team b",
+                },
+            },
+            context(),
+        )
+
+    await tool.execute(
+        {
+            "operation": "settle",
+            "competition": "Premier League",
+            "date": "2026-08-15",
+            "match": "Team A vs Team B",
+            "actual_result": "draw",
+            "actual_score": "1-1",
+        },
+        context(),
+    )
+    premier_report = await tool.execute(
+        {"operation": "report", "competition": "Premier League"}, context()
+    )
+    pending_report = await tool.execute({"operation": "report", "pending_only": True}, context())
+
+    assert premier_report.direct_return is True
+    assert "Premier League" in premier_report.content
+    assert "FA Cup" not in premier_report.content
+    assert "1-1" in premier_report.content
+    assert "FA Cup" in pending_report.content
+    assert "Premier League" not in pending_report.content
+    assert (tmp_path / "workspaces" / "agent-1" / "football" / "ledger.json").is_file()
 
 
 @pytest.mark.asyncio

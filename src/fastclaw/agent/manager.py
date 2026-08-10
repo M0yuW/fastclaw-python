@@ -40,6 +40,7 @@ from fastclaw.runtime import Runtime, RuntimeState
 from fastclaw.skills import Skill, SkillCatalog, SkillError
 from fastclaw.storage import AgentRecord, ConfigRecord, Database, UnitOfWork
 from fastclaw.tools import (
+    FootballLedgerTool,
     ListDirTool,
     ReadFileTool,
     SkillScriptTool,
@@ -141,6 +142,7 @@ def _default_tools(
         WriteFileTool(workspace),
         WebFetchTool(runtime.web_http_client),
         SpawnSubagentTool(bus, team_targets),
+        FootballLedgerTool(data_root),
         WorldCupLedgerTool(data_root),
     ]
     if profile.skills:

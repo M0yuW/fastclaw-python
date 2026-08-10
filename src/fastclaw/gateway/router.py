@@ -686,6 +686,7 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         required_tools = sorted({tool for role in template.roles for tool in role.allowed_tools})
         available_tools = {
             "exec",
+            "football_ledger",
             "list_dir",
             "read_file",
             "spawn_subagent",

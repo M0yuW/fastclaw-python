@@ -18,7 +18,13 @@ from fastclaw.storage import (
     UnitOfWork,
     UserRecord,
 )
-from fastclaw.teams import TeamRole, TeamService, TeamValidationError, resolve_template
+from fastclaw.teams import (
+    TeamRole,
+    TeamService,
+    TeamValidationError,
+    public_templates,
+    resolve_template,
+)
 
 
 @pytest.mark.anyio
@@ -109,6 +115,42 @@ async def test_team_creation_concurrent_retries_share_one_team(tmp_path: Path) -
         await database.close()
 
 
+@pytest.mark.anyio
+async def test_general_football_team_creation_persists_role_prompts(tmp_path: Path) -> None:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'football-team.db'}")
+    await database.create_schema()
+    try:
+        async with UnitOfWork(database) as unit:
+            await unit.require_store().save_user(
+                UserRecord(id="usr_1", username="one", email="one@example.test", password_hash="x")
+            )
+        team, members = await TeamService(database).create(
+            user_id="usr_1",
+            name="European competition review",
+            description="Competition-scoped football analysis",
+            template_key="football-competition-analysis",
+            client_request_id="football-team-request",
+            model="deepseek-v4-flash",
+            provider_name="deepseek",
+        )
+
+        assert team.status == "active"
+        assert len(members) == 7
+        async with UnitOfWork(database) as unit:
+            store = unit.require_store()
+            agents = {member.role_key: await store.get_agent(member.agent_id) for member in members}
+        coordinator = agents["coordinator"]
+        data_analyst = agents["data-analyst"]
+        assert coordinator is not None
+        assert coordinator.config["allowedTools"] == ["spawn_subagent", "football_ledger"]
+        assert "season or edition" in coordinator.config["soul"]
+        assert data_analyst is not None
+        assert data_analyst.config["allowedTools"] == ["web_fetch"]
+        assert "skills" not in data_analyst.config
+    finally:
+        await database.close()
+
+
 def test_custom_team_requires_one_coordinator_and_specialist() -> None:
     with pytest.raises(TeamValidationError, match="exactly one coordinator"):
         from fastclaw.teams import validate_roles
@@ -142,6 +184,20 @@ def test_benchmark_finance_template_contains_all_persisted_specialists() -> None
         "Finance Source Specialist",
         "Finance Trend Analyst",
     ]
+
+
+def test_general_football_template_is_public_and_competition_scoped() -> None:
+    template = resolve_template("football-competition-analysis")
+
+    assert template in public_templates()
+    assert len(template.roles) == 7
+    assert template.roles[0].allowed_tools == ("spawn_subagent", "football_ledger")
+    assert all(role.allowed_tools == ("web_fetch",) for role in template.roles[1:])
+    assert all(not role.skills for role in template.roles)
+    combined_prompt = "\n".join(role.soul for role in template.roles)
+    assert "competition" in combined_prompt.lower()
+    assert "World Cup" not in combined_prompt
+    assert "世界杯" not in combined_prompt
 
 
 def test_benchmark_backfill_repairs_existing_team_without_creating_agents(

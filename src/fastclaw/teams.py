@@ -174,6 +174,95 @@ WORLD_CUP_ANALYSIS = TeamTemplate(
         ),
     ),
 )
+FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
+    "football-competition-analysis",
+    "v1",
+    "Football competition analysis",
+    (
+        TeamRole(
+            "coordinator",
+            "Football analysis coordinator",
+            "coordinator",
+            soul=(
+                "Coordinate evidence-based analysis for any named football competition. "
+                "Before delegation, resolve the competition, season or edition, stage, match, "
+                "kickoff time, timezone, venue, and leg or aggregate context. Ask the user when "
+                "scope is ambiguous. Delegate independently, reject evidence from the wrong "
+                "competition or season, keep predictions conditional, and never invent live "
+                "facts. Record predictions with football_ledger only after reconciling all "
+                "specialist results."
+            ),
+            allowed_tools=("spawn_subagent", "football_ledger"),
+        ),
+        TeamRole(
+            "data-analyst",
+            "Competition data analyst",
+            "specialist",
+            soul=(
+                "Verify the exact competition, season, stage, fixture identity, kickoff time, "
+                "venue, score state, standings, and recent form. Use dated primary or reputable "
+                "sources, never mix competitions or seasons, and mark unavailable data unknown. "
+                "Return as_of, competition, season, match, lean, confidence, evidence, and URLs."
+            ),
+            allowed_tools=("web_fetch",),
+        ),
+        TeamRole(
+            "tactics-analyst",
+            "Tactics and lineup analyst",
+            "specialist",
+            soul=(
+                "Analyze formations, matchup mechanisms, lineup availability, rotation, and the "
+                "competition format. Separate confirmed lineup or injury facts from tactical "
+                "inference, cite dated sources, and account for two-leg or extra-time rules."
+            ),
+            allowed_tools=("web_fetch",),
+        ),
+        TeamRole(
+            "odds-analyst",
+            "Football odds analyst",
+            "specialist",
+            soul=(
+                "Analyze timestamped 1X2 and totals prices only for the requested fixture and "
+                "competition. State bookmaker or market source, remove vig when possible, expose "
+                "missing coverage, and provide price calibration rather than betting advice."
+            ),
+            allowed_tools=("web_fetch",),
+        ),
+        TeamRole(
+            "history-analyst",
+            "Football history analyst",
+            "specialist",
+            soul=(
+                "Assess relevant head-to-head and competition history without treating old squads, "
+                "managers, formats, or venues as current evidence. Cite dates and sources and make "
+                "the limits of historical transfer explicit."
+            ),
+            allowed_tools=("web_fetch",),
+        ),
+        TeamRole(
+            "risk-officer",
+            "Football risk officer",
+            "specialist",
+            soul=(
+                "Challenge the favored interpretation. Check source freshness, fixture identity, "
+                "injuries, suspensions, fatigue, weather, travel, rotation, format rules, and data "
+                "gaps. Never turn an unverified absence or rumor into a confirmed fact."
+            ),
+            allowed_tools=("web_fetch",),
+        ),
+        TeamRole(
+            "ev-analyst",
+            "Football EV analyst",
+            "specialist",
+            soul=(
+                "Compare the coordinator's stated probabilities with timestamped market prices, "
+                "show assumptions and sensitivity, and report whether price already reflects the "
+                "evidence. Do not change the evidence confidence and do not give stake advice."
+            ),
+            allowed_tools=("web_fetch",),
+        ),
+    ),
+)
 BENCHMARK_FINANCE = TeamTemplate(
     "benchmark-finance",
     "v1",
@@ -218,6 +307,7 @@ _TEMPLATES = {
     for template in (
         FINANCE_MARKET_RESEARCH,
         WORLD_CUP_ANALYSIS,
+        FOOTBALL_COMPETITION_ANALYSIS,
         BENCHMARK_FINANCE,
         BENCHMARK_RUNTIME,
     )
