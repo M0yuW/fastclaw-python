@@ -129,12 +129,18 @@ def _default_tools(
     plugins: PluginManager,
 ) -> ToolRegistry:
     workspace = data_root / "workspaces" / profile.agent.id
+    configured_targets = profile.agent.config.get("teamSpecialistIds")
+    team_targets = (
+        tuple(str(agent_id) for agent_id in configured_targets)
+        if isinstance(configured_targets, list)
+        else None
+    )
     tools: list[Any] = [
         ReadFileTool(workspace),
         ListDirTool(workspace),
         WriteFileTool(workspace),
         WebFetchTool(runtime.web_http_client),
-        SpawnSubagentTool(bus),
+        SpawnSubagentTool(bus, team_targets),
         WorldCupLedgerTool(data_root),
     ]
     if profile.skills:
@@ -205,10 +211,12 @@ class ManagedAgentStream(AsyncIterator[AgentEvent]):
                         )
                     )
             finally:
+                self._manager._untrack_root(self.context.agent_id, self.context.root_execution_id)
                 if not self._saw_done:
                     self._error = self._error or "agent stream ended without a terminal event"
                 self._events.put_nowait(self._STOP)
 
+        self._manager._track_root(self.context.agent_id, self.context.root_execution_id)
         self._task = asyncio.create_task(supervise())
 
     def __aiter__(self) -> ManagedAgentStream:
@@ -264,6 +272,7 @@ class AgentRuntimeManager:
         self.bus = InProcessMessageBus(self._queue)
         self._tool_factory = tool_factory
         self._profiles: dict[str, AgentRuntimeProfile] = {}
+        self._agent_roots: dict[str, set[str]] = {}
         self.skill_catalog = SkillCatalog(config.data_root / "skills")
         package_plugins = Path(__file__).resolve().parents[1] / "bundled_plugins"
         checkout_plugins = Path(__file__).resolve().parents[3] / "plugins"
@@ -400,6 +409,8 @@ class AgentRuntimeManager:
     ) -> ManagedAgentStream:
         self._require_running()
         profile = await self.profile(agent_id, user_id)
+        if not await self._agent_accepts_tasks(agent_id, user_id):
+            raise AgentRunError("agent team is archived")
         selection = await self.provider_selection(profile, requested_model)
         context = ExecutionContext(
             user_id=user_id,
@@ -452,6 +463,20 @@ class AgentRuntimeManager:
 
     async def cancel_root(self, root_execution_id: str) -> None:
         await self.bus.cancel_root(root_execution_id)
+
+    async def cancel_agent_roots(self, agent_ids: tuple[str, ...]) -> None:
+        roots = {root for agent_id in agent_ids for root in self._agent_roots.get(agent_id, set())}
+        await asyncio.gather(*(self.cancel_root(root) for root in roots))
+
+    def _track_root(self, agent_id: str, root_execution_id: str) -> None:
+        self._agent_roots.setdefault(agent_id, set()).add(root_execution_id)
+
+    def _untrack_root(self, agent_id: str, root_execution_id: str) -> None:
+        roots = self._agent_roots.get(agent_id)
+        if roots is not None:
+            roots.discard(root_execution_id)
+            if not roots:
+                self._agent_roots.pop(agent_id, None)
 
     async def readiness(self) -> dict[str, bool]:
         database_ready = False
@@ -572,7 +597,52 @@ class AgentRuntimeManager:
             configs.update({item.name: item for item in layer if item.enabled})
         return configs
 
+    async def _agent_accepts_tasks(self, agent_id: str, user_id: str) -> bool:
+        async with UnitOfWork(self.database) as unit:
+            store = unit.require_store()
+            agent = await store.get_agent(agent_id)
+            if agent is None or agent.user_id != user_id:
+                return False
+            for team in await store.list_teams(user_id):
+                members = await store.list_team_members(team.id)
+                member = next((member for member in members if member.agent_id == agent_id), None)
+                if member is not None:
+                    return team.status == "active" and member.status == "active"
+        return True
+
     async def _delegated_chat(self, agent_id: str, task: str, context: ExecutionContext) -> str:
+        if not await self._agent_accepts_tasks(agent_id, context.user_id):
+            raise AgentRunError("agent team is archived")
+        if len(context.call_path) > 1:
+            source_id = context.call_path[-2]
+            async with UnitOfWork(self.database) as unit:
+                store = unit.require_store()
+                permitted = False
+                source_is_team_member = False
+                target_is_team_member = False
+                for team in await store.list_teams(context.user_id):
+                    members = await store.list_team_members(team.id)
+                    source = next(
+                        (member for member in members if member.agent_id == source_id), None
+                    )
+                    target = next(
+                        (member for member in members if member.agent_id == agent_id), None
+                    )
+                    source_is_team_member = source_is_team_member or source is not None
+                    target_is_team_member = target_is_team_member or target is not None
+                    if team.status != "active":
+                        continue
+                    if (
+                        source
+                        and target
+                        and source.member_type == "coordinator"
+                        and target.member_type == "specialist"
+                        and target.status == "active"
+                    ):
+                        permitted = True
+                        break
+            if (source_is_team_member or target_is_team_member) and not permitted:
+                raise AgentRunError("team delegation is restricted to active specialists")
         profile = self._profiles[agent_id]
         selection = await self.provider_selection(profile)
         request = self._request(profile, selection.model, task)
@@ -630,11 +700,18 @@ class AgentRuntimeManager:
         async with UnitOfWork(self.database) as unit:
             store = unit.require_store()
             records = await store.list_agent_files(agent.id, agent.user_id)
+            teams = await store.list_teams(agent.user_id)
+            team_members = [(team, await store.list_team_members(team.id)) for team in teams]
             default_layers = [
                 await store.list_configs(kind="setting", user_id="", agent_id=""),
                 await store.list_configs(kind="setting", user_id=agent.user_id, agent_id=""),
                 await store.list_configs(kind="setting", user_id=agent.user_id, agent_id=agent.id),
             ]
+            roster_agents = {
+                member.agent_id: await store.get_agent(member.agent_id)
+                for _, members in team_members
+                for member in members
+            }
         files: dict[str, bytes] = {}
         asset_root = self.config.data_root / "agents" / agent.id
         for filename in (
@@ -743,6 +820,28 @@ class AgentRuntimeManager:
                 allowed_tools = frozenset({"read_file", "web_fetch", "list_dir", "write_file"})
         if allowed_tools is None or "spawn_subagent" in allowed_tools:
             prompt_parts.append(_DELEGATION_TOOL_PROMPT.strip())
+        for team, members in team_members:
+            current = next((member for member in members if member.agent_id == agent.id), None)
+            if current is None:
+                continue
+            roster = "\n".join(
+                f"- {member.role_key}: "
+                f"{(roster_agents[member.agent_id] or agent).name} ({member.agent_id})"
+                for member in members
+                if member.status == "active"
+            )
+            prompt_parts.append(
+                "## Team roster\n\n"
+                f"Team: {team.name}\nStatus: {team.status}\n{roster}\n\n"
+                "Only the coordinator may delegate, and only to active specialists in this roster."
+            )
+            if current.member_type == "coordinator":
+                effective_config["teamSpecialistIds"] = [
+                    member.agent_id
+                    for member in members
+                    if member.member_type == "specialist" and member.status == "active"
+                ]
+            break
         system_prompt = "\n\n".join(prompt_parts).replace(
             str(self.config.legacy_data_root), str(self.config.data_root)
         )

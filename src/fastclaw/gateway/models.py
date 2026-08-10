@@ -115,6 +115,46 @@ class AgentUpdate(WireModel):
     policy: Literal["no-tools", "delegate-only", "custom"] | None = None
 
 
+class TeamRoleInput(WireModel):
+    key: str
+    name: str
+    description: str = ""
+
+
+class TeamCreate(WireModel):
+    name: str
+    description: str = ""
+    template_key: str = "custom"
+    client_request_id: str
+    model: str = ""
+    specialists: list[TeamRoleInput] = Field(default_factory=list)
+
+
+class TeamUpdate(WireModel):
+    name: str | None = None
+    description: str | None = None
+    revision: int
+
+
+class TeamDelete(WireModel):
+    team_id: str
+    revision: int
+
+
+class TeamMemberUpdate(WireModel):
+    agent_id: str
+    status: Literal["active", "archived"] = "active"
+    revision: int
+
+
+class TeamMemberCreate(WireModel):
+    key: str
+    name: str
+    description: str = ""
+    model: str = ""
+    revision: int
+
+
 class AdminUserCreate(WireModel):
     username: str
     email: str

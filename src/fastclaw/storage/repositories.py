@@ -60,6 +60,7 @@ class AgentTeamRepository(Protocol):
     async def list_teams(self, user_id: str) -> Sequence[AgentTeamRecord]: ...
     async def delete_team(self, team_id: str) -> None: ...
     async def save_team_member(self, record: AgentTeamMemberRecord) -> None: ...
+    async def delete_team_member(self, team_id: str, agent_id: str) -> None: ...
     async def get_team_member_by_agent(self, agent_id: str) -> AgentTeamMemberRecord | None: ...
     async def list_team_members(self, team_id: str) -> Sequence[AgentTeamMemberRecord]: ...
 
@@ -264,6 +265,13 @@ class SQLAlchemyStore:
 
     async def save_team_member(self, record: AgentTeamMemberRecord) -> None:
         await self.session.merge(AgentTeamMemberModel(**record.model_dump()))
+
+    async def delete_team_member(self, team_id: str, agent_id: str) -> None:
+        await self.session.execute(
+            delete(AgentTeamMemberModel).where(
+                AgentTeamMemberModel.team_id == team_id, AgentTeamMemberModel.agent_id == agent_id
+            )
+        )
 
     async def get_team_member_by_agent(self, agent_id: str) -> AgentTeamMemberRecord | None:
         model = await self.session.scalar(

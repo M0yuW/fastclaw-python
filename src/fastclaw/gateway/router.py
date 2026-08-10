@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from fastclaw.agent import AgentEvent, AgentEventType
-from fastclaw.agent.manager import AgentRuntimeManager
+from fastclaw.agent.manager import AgentRuntimeManager, AgentRuntimeProfile
 from fastclaw.gateway.models import (
     AdminUserCreate,
     AdminUserUpdate,
@@ -38,6 +38,11 @@ from fastclaw.gateway.models import (
     SessionUpdate,
     StoredProviderTest,
     SystemFileWrite,
+    TeamCreate,
+    TeamDelete,
+    TeamMemberCreate,
+    TeamMemberUpdate,
+    TeamUpdate,
 )
 from fastclaw.gateway.service import (
     SESSION_COOKIE,
@@ -59,6 +64,7 @@ from fastclaw.storage import (
     UnitOfWork,
     UserRecord,
 )
+from fastclaw.teams import TeamRole, TeamService, TeamValidationError, public_templates
 
 _SYSTEM_FILES = frozenset(
     {
@@ -104,6 +110,28 @@ def _agent_json(agent: AgentRecord) -> dict[str, Any]:
         "userId": agent.user_id,
         "isPublic": agent.is_public,
         "avatarUrl": f"/api/agents/{agent.id}/files/avatar.png",
+    }
+
+
+def _team_json(team: Any, members: Any = ()) -> dict[str, Any]:
+    return {
+        "id": team.id,
+        "name": team.name,
+        "description": team.description,
+        "templateKey": team.template_key,
+        "templateVersion": team.template_version,
+        "status": team.status,
+        "revision": team.revision,
+        "members": [
+            {
+                "agentId": member.agent_id,
+                "roleKey": member.role_key,
+                "memberType": member.member_type,
+                "status": member.status,
+                "displayOrder": member.display_order,
+            }
+            for member in members
+        ],
     }
 
 
@@ -564,6 +592,394 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         visible = [agent for agent in agents if auth.identity.can_access_agent(agent.id)]
         resolved = [(await service.agent_runtime_profile(agent)).agent for agent in visible]
         return {"agents": [_agent_json(agent) for agent in resolved]}
+
+    @router.get("/api/agent-team-templates")
+    async def list_team_templates(auth: AuthContext = auth_dependency) -> dict[str, Any]:
+        del auth
+        return {
+            "templates": [
+                {
+                    "key": template.key,
+                    "version": template.version,
+                    "name": template.name,
+                    "roles": [
+                        {"key": role.key, "name": role.name, "memberType": role.member_type}
+                        for role in template.roles
+                    ],
+                }
+                for template in public_templates()
+            ]
+        }
+
+    @router.post("/api/agent-teams/preview")
+    async def preview_team(
+        payload: TeamCreate, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        require_mutation(auth)
+        roles = (
+            TeamRole("coordinator", "Coordinator", "coordinator"),
+            *(
+                TeamRole(item.key, item.name, "specialist", item.description)
+                for item in payload.specialists
+            ),
+        )
+        try:
+            from fastclaw.teams import resolve_template, validate_roles
+
+            template = resolve_template(
+                payload.template_key, roles if payload.template_key == "custom" else ()
+            )
+            validate_roles(template.roles)
+        except TeamValidationError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+        preview_model = payload.model
+        if not preview_model:
+            async with UnitOfWork(gateway.database) as unit:
+                agents = await unit.require_store().list_agents(auth.identity.effective_user_id)
+            preview_model = next(
+                (
+                    str(agent.config.get("model") or "")
+                    for agent in agents
+                    if agent.config.get("model")
+                ),
+                "",
+            )
+        preview_agent = AgentRecord(
+            id="preview-agent",
+            user_id=auth.identity.effective_user_id,
+            name=template.roles[0].name,
+            config={**({"model": preview_model} if preview_model else {})},
+        )
+        profile = AgentRuntimeProfile(
+            agent=preview_agent,
+            system_prompt="",
+            allowed_tools=frozenset(template.roles[0].allowed_tools),
+        )
+        try:
+            selection = await gateway.agent_manager.provider_selection(profile)
+            provider_check: dict[str, Any] = {
+                "ok": True,
+                "name": selection.name,
+                "model": selection.model,
+            }
+        except RuntimeError as exc:
+            provider_check = {"ok": False, "error": str(exc)}
+        required_skills = sorted({skill for role in template.roles for skill in role.skills})
+        skill_checks: dict[str, dict[str, Any]] = {}
+        for skill_name in required_skills:
+            try:
+                skill = gateway.agent_manager.skill_catalog.require(skill_name)
+            except SkillError as exc:
+                skill_checks[skill_name] = {
+                    "installed": False,
+                    "prepared": False,
+                    "error": str(exc),
+                }
+                continue
+            skill_checks[skill_name] = {
+                "installed": True,
+                "prepared": gateway.agent_manager.skill_catalog.is_prepared(skill),
+            }
+        required_tools = sorted({tool for role in template.roles for tool in role.allowed_tools})
+        available_tools = {
+            "exec",
+            "list_dir",
+            "read_file",
+            "spawn_subagent",
+            "web_fetch",
+            "worldcup_ledger",
+            "write_file",
+            *(
+                tool.definition.function.name
+                for tool in gateway.agent_manager.plugin_manager.tools()
+            ),
+        }
+        missing_tools = sorted(set(required_tools) - available_tools)
+        environment = {
+            "ODDS_API_KEY": bool(os.environ.get("ODDS_API_KEY"))
+            if template.key == "world-cup-analysis"
+            else True
+        }
+        skills_prepared = all(check["prepared"] for check in skill_checks.values())
+        return {
+            "ok": bool(provider_check["ok"]) and skills_prepared and not missing_tools,
+            "writesDatabase": False,
+            "templateKey": template.key,
+            "roles": [role.key for role in template.roles],
+            "checks": {
+                "provider": provider_check,
+                "model": bool(provider_check["ok"] and provider_check.get("model")),
+                "skills": {
+                    "required": required_skills,
+                    "prepared": skills_prepared,
+                    "details": skill_checks,
+                },
+                "tools": {
+                    "required": required_tools,
+                    "available": not missing_tools,
+                    "missing": missing_tools,
+                },
+                "environment": environment,
+            },
+        }
+
+    @router.post("/api/agent-teams", status_code=status.HTTP_201_CREATED)
+    async def create_team(
+        payload: TeamCreate, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        require_mutation(auth)
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            existing = await store.get_team_by_request(
+                auth.identity.effective_user_id, payload.client_request_id
+            )
+            if existing is not None:
+                return {
+                    "ok": True,
+                    "team": _team_json(existing, await store.list_team_members(existing.id)),
+                }
+        preflight = await preview_team(payload, auth)
+        if not preflight["ok"]:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "team prerequisites are not ready; resolve the preview checks before creating",
+            )
+        custom_roles = (
+            TeamRole("coordinator", "Coordinator", "coordinator"),
+            *(
+                TeamRole(item.key, item.name, "specialist", item.description)
+                for item in payload.specialists
+            ),
+        )
+        try:
+            team, members = await TeamService(gateway.database).create(
+                user_id=auth.identity.effective_user_id,
+                name=payload.name,
+                description=payload.description,
+                template_key=payload.template_key,
+                client_request_id=payload.client_request_id,
+                model=payload.model,
+                custom_roles=custom_roles if payload.template_key == "custom" else (),
+            )
+        except TeamValidationError as exc:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+        await gateway.agent_manager.reload_profiles()
+        return {"ok": True, "team": _team_json(team, members)}
+
+    @router.get("/api/agent-teams")
+    async def list_teams(auth: AuthContext = auth_dependency) -> dict[str, Any]:
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            teams = await store.list_teams(auth.identity.effective_user_id)
+            results = [_team_json(team, await store.list_team_members(team.id)) for team in teams]
+        return {"teams": results}
+
+    @router.get("/api/agent-teams/{team_id}")
+    async def get_team(team_id: str, auth: AuthContext = auth_dependency) -> dict[str, Any]:
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            team = await store.get_team(team_id)
+            if team is None or team.user_id != auth.identity.effective_user_id:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "team not found")
+            return {"team": _team_json(team, await store.list_team_members(team.id))}
+
+    @router.patch("/api/agent-teams/{team_id}")
+    async def update_team(
+        team_id: str, payload: TeamUpdate, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        require_mutation(auth)
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            team = await store.get_team(team_id)
+            if team is None or team.user_id != auth.identity.effective_user_id:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "team not found")
+            if team.revision != payload.revision:
+                raise HTTPException(status.HTTP_409_CONFLICT, "team revision conflict")
+            updated = team.model_copy(
+                update={
+                    "name": payload.name.strip() if payload.name is not None else team.name,
+                    "description": payload.description
+                    if payload.description is not None
+                    else team.description,
+                    "revision": team.revision + 1,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            await store.save_team(updated)
+            members = await store.list_team_members(team_id)
+        return {"ok": True, "team": _team_json(updated, members)}
+
+    @router.post("/api/agent-teams/{team_id}/archive")
+    async def archive_team(
+        team_id: str, payload: TeamUpdate, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        require_mutation(auth)
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            team = await store.get_team(team_id)
+            if team is None or team.user_id != auth.identity.effective_user_id:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "team not found")
+            if team.revision != payload.revision:
+                raise HTTPException(status.HTTP_409_CONFLICT, "team revision conflict")
+            updated = team.model_copy(
+                update={
+                    "status": "archived",
+                    "revision": team.revision + 1,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            await store.save_team(updated)
+            members = await store.list_team_members(team_id)
+        await gateway.agent_manager.cancel_agent_roots(tuple(member.agent_id for member in members))
+        for member in members:
+            gateway.agent_manager.remove_profile(member.agent_id)
+        return {"ok": True, "team": _team_json(updated, members)}
+
+    @router.patch("/api/agent-teams/{team_id}/members/{agent_id}")
+    async def update_team_member(
+        team_id: str, agent_id: str, payload: TeamMemberUpdate, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        require_mutation(auth)
+        if payload.agent_id != agent_id:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "member ID confirmation required")
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            team = await store.get_team(team_id)
+            if team is None or team.user_id != auth.identity.effective_user_id:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "team not found")
+            if team.revision != payload.revision:
+                raise HTTPException(status.HTTP_409_CONFLICT, "team revision conflict")
+            member = next(
+                (
+                    item
+                    for item in await store.list_team_members(team_id)
+                    if item.agent_id == agent_id
+                ),
+                None,
+            )
+            if member is None:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "team member not found")
+            if member.member_type == "coordinator" and payload.status != "active":
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "the team coordinator cannot be archived independently",
+                )
+            active_specialists = [
+                item
+                for item in await store.list_team_members(team_id)
+                if item.member_type == "specialist" and item.status == "active"
+            ]
+            if (
+                member.member_type == "specialist"
+                and member.status == "active"
+                and payload.status != "active"
+                and len(active_specialists) <= 1
+            ):
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    "a team must retain at least one active specialist",
+                )
+            await store.save_team_member(member.model_copy(update={"status": payload.status}))
+            updated = team.model_copy(
+                update={"revision": team.revision + 1, "updated_at": datetime.now(UTC)}
+            )
+            await store.save_team(updated)
+            members = await store.list_team_members(team_id)
+            agents = [await store.get_agent(item.agent_id) for item in members]
+        if payload.status == "archived":
+            await gateway.agent_manager.cancel_agent_roots((agent_id,))
+            gateway.agent_manager.remove_profile(agent_id)
+        for agent in agents:
+            if agent is not None and not (payload.status == "archived" and agent.id == agent_id):
+                await gateway.agent_manager.reload_profile(agent)
+        return {"ok": True, "team": _team_json(updated, members)}
+
+    @router.post("/api/agent-teams/{team_id}/members", status_code=status.HTTP_201_CREATED)
+    async def add_team_member(
+        team_id: str, payload: TeamMemberCreate, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        require_mutation(auth)
+        try:
+            team, member = await TeamService(gateway.database).add_specialist(
+                team_id=team_id,
+                user_id=auth.identity.effective_user_id,
+                revision=payload.revision,
+                role=TeamRole(payload.key, payload.name, "specialist", payload.description),
+                model=payload.model,
+            )
+        except LookupError as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "team not found") from exc
+        except TeamValidationError as exc:
+            code = (
+                status.HTTP_409_CONFLICT
+                if "revision" in str(exc)
+                else status.HTTP_422_UNPROCESSABLE_ENTITY
+            )
+            raise HTTPException(code, str(exc)) from exc
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            members = await store.list_team_members(team_id)
+            agents = [await store.get_agent(item.agent_id) for item in members]
+        for agent in agents:
+            if agent is not None:
+                await gateway.agent_manager.reload_profile(agent)
+        return {"ok": True, "team": _team_json(team, members), "agentId": member.agent_id}
+
+    @router.post("/api/agent-teams/{team_id}/restore")
+    async def restore_team(
+        team_id: str, payload: TeamUpdate, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        require_mutation(auth)
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            team = await store.get_team(team_id)
+            if team is None or team.user_id != auth.identity.effective_user_id:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "team not found")
+            if team.revision != payload.revision:
+                raise HTTPException(status.HTTP_409_CONFLICT, "team revision conflict")
+            updated = team.model_copy(
+                update={
+                    "status": "active",
+                    "revision": team.revision + 1,
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            await store.save_team(updated)
+            members = await store.list_team_members(team_id)
+            agents = [(member, await store.get_agent(member.agent_id)) for member in members]
+        for member, agent in agents:
+            if member.status == "active" and agent is not None:
+                await gateway.agent_manager.reload_profile(agent)
+        return {"ok": True, "team": _team_json(updated, members)}
+
+    @router.delete("/api/agent-teams/{team_id}")
+    async def delete_team(
+        team_id: str, payload: TeamDelete, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        require_mutation(auth)
+        if payload.team_id != team_id:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "explicit team ID confirmation required"
+            )
+        async with UnitOfWork(gateway.database) as unit:
+            store = unit.require_store()
+            team = await store.get_team(team_id)
+            if team is None or team.user_id != auth.identity.effective_user_id:
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "team not found")
+            if team.revision != payload.revision:
+                raise HTTPException(status.HTTP_409_CONFLICT, "team revision conflict")
+            if team.status != "archived":
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT, "archive the team before permanent deletion"
+                )
+            members = await store.list_team_members(team_id)
+            await store.delete_team(team_id)
+            for member in members:
+                await store.delete_agent(member.agent_id)
+        await gateway.agent_manager.cancel_agent_roots(tuple(member.agent_id for member in members))
+        for member in members:
+            gateway.agent_manager.remove_profile(member.agent_id)
+        return {"ok": True, "deleted": team_id}
 
     @router.post("/api/agents", status_code=status.HTTP_201_CREATED)
     async def create_agent(
