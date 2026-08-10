@@ -18,6 +18,7 @@ from fastclaw.network import (
     pinned_network_target,
 )
 from fastclaw.tools import (
+    FOOTBALL_COMPETITIONS,
     ExecTool,
     FootballDataTool,
     FootballLedgerTool,
@@ -28,6 +29,7 @@ from fastclaw.tools import (
     WebFetchTool,
     WorldCupLedgerTool,
     WriteFileTool,
+    resolve_football_competition,
 )
 
 
@@ -55,6 +57,39 @@ def context() -> ExecutionContext:
         session_id="session-1",
         root_execution_id="run-1",
     )
+
+
+def test_football_competition_catalog_resolves_reviewed_aliases() -> None:
+    sweden = resolve_football_competition("瑞典超", country="瑞典")
+    champions_league = resolve_football_competition("UCL", country="Europe")
+
+    assert sweden is not None and sweden.espn_slug == "swe.1"
+    assert champions_league is not None
+    assert champions_league.espn_slug == "uefa.champions"
+    assert len({item.espn_slug for item in FOOTBALL_COMPETITIONS}) == len(FOOTBALL_COMPETITIONS)
+    assert resolve_football_competition("瑞典超", country="挪威") is None
+
+
+@pytest.mark.asyncio
+async def test_football_data_exposes_only_trusted_provider_mapping() -> None:
+    fetcher = FixtureFetcher({})
+    tool = FootballDataTool(fetcher)
+
+    resolved = await tool.execute(
+        {"action": "competition_resolve", "competition": "瑞典超级联赛"}, context()
+    )
+    rejected = await tool.execute(
+        {"action": "competition_resolve", "competition": "swe.2"}, context()
+    )
+
+    assert json.loads(resolved.content)["mapping"] == {
+        "key": "swedish-allsvenskan",
+        "competition": "Swedish Allsvenskan",
+        "country": "Sweden",
+        "espn_slug": "swe.1",
+    }
+    assert rejected.is_error
+    assert fetcher.urls == []
 
 
 @pytest.mark.asyncio

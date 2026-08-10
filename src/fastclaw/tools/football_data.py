@@ -10,6 +10,10 @@ from urllib.parse import urlencode
 from fastclaw.execution import ExecutionContext
 from fastclaw.providers import ToolDefinition, ToolFunction
 from fastclaw.tools.base import ToolResult
+from fastclaw.tools.football_competitions import (
+    FOOTBALL_COMPETITIONS,
+    resolve_football_competition,
+)
 
 _SPORTS_DB = "https://www.thesportsdb.com/api/v1/json/123"
 _SPORTTERY = (
@@ -32,8 +36,9 @@ class FootballDataTool:
                 description=(
                     "Resolve a football competition and fetch dated fixtures, results, "
                     "standings, team form, head-to-head, or public Sporttery match prices. "
-                    "Call competition_search with competition and country first when league_id "
-                    "is unknown."
+                    "Call competition_resolve before using an ESPN competition. Call "
+                    "competition_search with competition and country when a TheSportsDB "
+                    "league_id is unknown."
                 ),
                 parameters={
                     "type": "object",
@@ -41,6 +46,7 @@ class FootballDataTool:
                         "action": {
                             "type": "string",
                             "enum": [
+                                "competition_resolve",
                                 "competition_search",
                                 "schedule",
                                 "results",
@@ -68,6 +74,8 @@ class FootballDataTool:
 
     async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
         action = str(arguments.get("action") or "")
+        if action == "competition_resolve":
+            return self._competition_resolve(arguments)
         if action == "competition_search":
             return await self._competition_search(arguments, context)
         if action in {"schedule", "results", "standings"}:
@@ -79,6 +87,26 @@ class FootballDataTool:
         if action == "sporttery_match":
             return await self._sporttery_match(arguments, context)
         return self._error("unsupported football_data action")
+
+    def _competition_resolve(self, arguments: dict[str, Any]) -> ToolResult:
+        query = str(arguments.get("competition") or "").strip()
+        if not query:
+            return self._error("competition_resolve requires competition")
+        country = str(arguments.get("country") or "").strip()
+        competition = resolve_football_competition(query, country=country)
+        if competition is None:
+            return self._error(
+                "competition is not in the trusted runtime catalog; ask for a supported "
+                "competition or add a reviewed mapping"
+            )
+        return self._success(
+            {
+                "source": "fastclaw:football_competitions",
+                "mapping": competition.public_mapping(),
+                "provider_identifiers_are_trusted": True,
+                "catalog_size": len(FOOTBALL_COMPETITIONS),
+            }
+        )
 
     async def _competition_search(
         self, arguments: dict[str, Any], context: ExecutionContext

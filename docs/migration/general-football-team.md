@@ -66,6 +66,7 @@ Coordinator 在委派前必须确定：
 TheSportsDB 免费 v1 的联赛列表有条数限制，因此未提供 country 时结果会明确标记可能截断。
 当前支持：
 
+- Runtime 受信赛事映射（常用欧洲赛事、世界杯、MLS，含中英文别名和 ESPN slug）；
 - competition search；
 - 指定 league/date 的 schedule；
 - 指定 league/season 的 results 与 standings；
@@ -92,3 +93,23 @@ TheSportsDB 免费 v1 的联赛列表有条数限制，因此未提供 country �
 The Odds API 和 ESPN 参数化完成并有固定 HTTP fixture、competition mismatch、歧义联赛、
 空数据和 quota 测试后，再决定是否发布独立 Skill 并开放受限 `exec`。内建 `football_data`
 不接受 API key 参数，也不会访问旧 Go workspace。
+
+ESPN slug 不由模型直接构造。模型只提供赛事名称和可选国家，Runtime 通过
+`football_data(action=competition_resolve)` 解析受审赛事目录；未知名称和直接提交的未知
+slug 均 fail closed。新增赛事时必须先验证 ESPN scoreboard 响应，再以代码评审更新映射表。
+
+| Runtime key | 用户别名示例 | ESPN slug |
+|---|---|---|
+| `fifa-world-cup` | 世界杯、World Cup | `fifa.world` |
+| `uefa-champions-league` | 欧冠、UCL | `uefa.champions` |
+| `uefa-europa-league` | 欧联、UEL | `uefa.europa` |
+| `english-premier-league` | 英超、EPL | `eng.1` |
+| `spanish-laliga` | 西甲、La Liga | `esp.1` |
+| `german-bundesliga` | 德甲、Bundesliga | `ger.1` |
+| `italian-serie-a` | 意甲、Serie A | `ita.1` |
+| `french-ligue-1` | 法甲、Ligue 1 | `fra.1` |
+| `dutch-eredivisie` | 荷甲、Eredivisie | `ned.1` |
+| `portuguese-primeira-liga` | 葡超、Primeira Liga | `por.1` |
+| `swedish-allsvenskan` | 瑞典超、Allsvenskan | `swe.1` |
+| `norwegian-eliteserien` | 挪超、Eliteserien | `nor.1` |
+| `major-league-soccer` | 美职联、MLS | `usa.1` |

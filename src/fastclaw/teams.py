@@ -210,7 +210,9 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
             soul=(
                 "Verify the exact competition, season, stage, fixture identity, kickoff time, "
                 "venue, score state, standings, and recent form. Use dated primary or reputable "
-                "sources, never mix competitions or seasons, and mark unavailable data unknown. "
+                "sources. Resolve the named competition through football_data before using a "
+                "provider identifier; never construct an ESPN slug yourself. Never mix "
+                "competitions or seasons, and mark unavailable data unknown. "
                 "Return as_of, competition, season, match, lean, confidence, evidence, and URLs."
             ),
             allowed_tools=("football_data", "web_fetch"),
