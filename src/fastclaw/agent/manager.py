@@ -25,6 +25,7 @@ from sqlalchemy import text
 from fastclaw.agent.models import AgentEvent, AgentEventType, AgentRunError, AgentRunRequest
 from fastclaw.agent.persistence import DatabaseSessionPersistence
 from fastclaw.agent.runner import AgentRunner
+from fastclaw.credentials import CredentialCipher
 from fastclaw.execution import ExecutionContext
 from fastclaw.orchestration import (
     AsyncTaskQueue,
@@ -76,6 +77,7 @@ class AgentRuntimeConfig:
     default_provider_api_base: str = ""
     default_provider_api_type: str = "openai-compatible"
     default_model: str = ""
+    master_key: str = ""
     max_concurrent: int = 8
     max_pending: int = 256
     enable_plugins: bool = True
@@ -270,6 +272,7 @@ class AgentRuntimeManager:
         self.database = database
         self.runtime = runtime
         self.config = config
+        self.credential_cipher = CredentialCipher(config.data_root, config.master_key)
         self._queue = AsyncTaskQueue(
             max_concurrent=config.max_concurrent,
             max_pending=config.max_pending,
@@ -534,7 +537,11 @@ class AgentRuntimeManager:
         selected = configs.get(provider_name)
         if selected is not None:
             data = selected.data
-            api_key = self.provider_credential(selected.name)
+            api_key = self.provider_credential(
+                selected.name,
+                selected.data,
+                credential_context=selected.id,
+            )
             standard = _STANDARD_PROVIDERS.get(selected.name, ("", "openai-compatible"))
             api_base = str(data.get("apiBase") or standard[0])
             api_type = str(data.get("apiType") or standard[1])
@@ -930,12 +937,23 @@ class AgentRuntimeManager:
         normalized = re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_")
         return os.environ.get(f"FASTCLAW_PROVIDER_{normalized}_API_KEY", "")
 
-    def provider_credential(self, name: str) -> str:
+    def provider_credential(
+        self,
+        name: str,
+        data: Mapping[str, Any] | None = None,
+        *,
+        credential_context: str = "",
+    ) -> str:
         configured = self.provider_environment_key(name)
         if configured:
             return configured
         if name == self.config.default_provider_name:
-            return self.config.default_provider_api_key
+            configured = self.config.default_provider_api_key
+            if configured:
+                return configured
+        encrypted = str((data or {}).get("encryptedApiKey") or "")
+        if encrypted:
+            return self.credential_cipher.decrypt(encrypted, context=credential_context)
         return ""
 
     @staticmethod
