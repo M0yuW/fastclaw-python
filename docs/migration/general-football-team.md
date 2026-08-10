@@ -73,20 +73,22 @@ TheSportsDB 免费 v1 的联赛列表有条数限制，因此未提供 country �
 - team form 和浅层 H2H；
 - 体彩当前全赛事列表中的精确 match 查询。
 
+Python 仓库同时维护 `skills/match-data-toolkit`。其中 `espn_data.py` 已改为强制
+`--competition`，使用与 Runtime 同步的 allowlist，并校验 scoreboard/summary 返回的实际
+league slug。ESPN 当前会对 Python urllib/HTTPX 客户端返回 403，因此 macOS 路径使用固定
+`site.api.espn.com` origin、禁止重定向、限制响应大小的系统 curl；用户和模型均不能提供 URL。
+Go 导入版本仅作为来源快照，不再是 Python 项目的唯一维护来源。
+
 仍需继续参数化的能力包括：
 
-1. `espn_data.py`
-   - 将固定 `fifa.world` 改为显式 `--league` slug；
-   - discipline 回溯按所选 competition 过滤，不再搜索字符串 `world cup`；
-   - 每个 event 输出实际 league slug，失配时 fail closed。
-2. `odds_data.py`
+1. `odds_data.py`
    - 将固定 `soccer_fifa_world_cup` 改为 allowlisted `--sport`；
    - 先列出 The Odds API sports catalog，再由可信配置选择 key；
    - 保留 quota 可见性，不允许模型提供 API key。
-3. `hit_rate.py` / `ledger_report.py`
+2. `hit_rate.py` / `ledger_report.py`
    - 使用 `FOOTBALL_LEDGER`，并按 competition/season 分组；
    - 保留 `WC_LEDGER` 兼容路径，但不得把两类账本自动合并。
-4. `SkillScriptTool`
+3. `SkillScriptTool`
    - 为通用 Skill 注入 `FOOTBALL_LEDGER`；
    - 继续由 Runtime 注入路径，禁止模型传入任意账本路径。
 

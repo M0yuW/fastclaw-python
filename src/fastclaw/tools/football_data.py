@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlencode
 
@@ -12,10 +14,12 @@ from fastclaw.providers import ToolDefinition, ToolFunction
 from fastclaw.tools.base import ToolResult
 from fastclaw.tools.football_competitions import (
     FOOTBALL_COMPETITIONS,
+    FootballCompetition,
     resolve_football_competition,
 )
 
 _SPORTS_DB = "https://www.thesportsdb.com/api/v1/json/123"
+_ESPN_SOCCER = "https://site.api.espn.com/apis/site/v2/sports/soccer"
 _SPORTTERY = (
     "https://webapi.sporttery.cn/gateway/uniform/football/getMatchCalculatorV1.qry?channel=c"
 )
@@ -25,11 +29,59 @@ class _Fetcher(Protocol):
     async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult: ...
 
 
+class EspnPublicFetcher:
+    """Fetch only Runtime-constructed ESPN soccer URLs with trusted system curl."""
+
+    _executables = (Path("/usr/bin/curl"), Path("/bin/curl"))
+
+    async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
+        del context
+        url = str(arguments.get("url") or "")
+        if not url.startswith(f"{_ESPN_SOCCER}/"):
+            return ToolResult(
+                content="ESPN URL is outside the fixed soccer API origin", is_error=True
+            )
+        executable = next((path for path in self._executables if path.is_file()), None)
+        if executable is None:
+            return ToolResult(content="trusted system curl is unavailable", is_error=True)
+        process = await asyncio.create_subprocess_exec(
+            str(executable),
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "25",
+            "--max-filesize",
+            "2000000",
+            "--proto",
+            "=https",
+            "--max-redirs",
+            "0",
+            url,
+            env={"PATH": "/usr/bin:/bin"},
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+        except BaseException:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+            raise
+        if process.returncode != 0:
+            return ToolResult(content="ESPN request failed", is_error=True)
+        if len(stdout) > 2_000_000:
+            return ToolResult(content="ESPN response exceeded the safety limit", is_error=True)
+        return ToolResult(content=stdout.decode("utf-8", errors="replace"))
+
+
 class FootballDataTool:
     """Resolve competitions and fetch fixtures without a World Cup hard-code."""
 
-    def __init__(self, fetcher: _Fetcher) -> None:
+    def __init__(self, fetcher: _Fetcher, *, espn_fetcher: _Fetcher | None = None) -> None:
         self._fetcher = fetcher
+        self._espn_fetcher = espn_fetcher or EspnPublicFetcher()
         self.definition = ToolDefinition(
             function=ToolFunction(
                 name="football_data",
@@ -48,6 +100,8 @@ class FootballDataTool:
                             "enum": [
                                 "competition_resolve",
                                 "competition_search",
+                                "espn_schedule",
+                                "espn_summary",
                                 "schedule",
                                 "results",
                                 "standings",
@@ -59,6 +113,7 @@ class FootballDataTool:
                         "competition": {"type": "string"},
                         "country": {"type": "string"},
                         "league_id": {"type": "string"},
+                        "event_id": {"type": "string"},
                         "date": {"type": "string"},
                         "season": {"type": "string"},
                         "team": {"type": "string"},
@@ -78,6 +133,10 @@ class FootballDataTool:
             return self._competition_resolve(arguments)
         if action == "competition_search":
             return await self._competition_search(arguments, context)
+        if action == "espn_schedule":
+            return await self._espn_schedule(arguments, context)
+        if action == "espn_summary":
+            return await self._espn_summary(arguments, context)
         if action in {"schedule", "results", "standings"}:
             return await self._competition_data(action, arguments, context)
         if action == "form":
@@ -107,6 +166,189 @@ class FootballDataTool:
                 "catalog_size": len(FOOTBALL_COMPETITIONS),
             }
         )
+
+    async def _espn_schedule(
+        self, arguments: dict[str, Any], context: ExecutionContext
+    ) -> ToolResult:
+        competition, error = self._trusted_competition(arguments)
+        if error is not None:
+            return error
+        assert competition is not None
+        date = str(arguments.get("date") or "").strip()
+        try:
+            date_key = datetime.strptime(date, "%Y-%m-%d").strftime("%Y%m%d")
+        except ValueError:
+            return self._error("espn_schedule requires date in YYYY-MM-DD format")
+        data, error = await self._get_json(
+            f"{_ESPN_SOCCER}/{competition.espn_slug}/scoreboard?" + urlencode({"dates": date_key}),
+            context,
+            fetcher=self._espn_fetcher,
+        )
+        if error is not None:
+            return error
+        mismatch = self._validate_espn_league(data, competition.espn_slug)
+        if mismatch is not None:
+            return mismatch
+        events = data.get("events") or []
+        rows = [
+            self._espn_event_row(event)
+            for event in events[: self._limit(arguments, 80)]
+            if isinstance(event, dict)
+        ]
+        return self._success(
+            {
+                "source": "espn:scoreboard",
+                "mapping": competition.public_mapping(),
+                "date": date,
+                "count": len(rows),
+                "matches": rows,
+            }
+        )
+
+    async def _espn_summary(
+        self, arguments: dict[str, Any], context: ExecutionContext
+    ) -> ToolResult:
+        competition, error = self._trusted_competition(arguments)
+        if error is not None:
+            return error
+        assert competition is not None
+        event_id = str(arguments.get("event_id") or "").strip()
+        if not event_id or not event_id.isdigit():
+            return self._error("espn_summary requires a numeric event_id")
+        data, error = await self._get_json(
+            f"{_ESPN_SOCCER}/{competition.espn_slug}/summary?" + urlencode({"event": event_id}),
+            context,
+            fetcher=self._espn_fetcher,
+        )
+        if error is not None:
+            return error
+        mismatch = self._validate_espn_league(data, competition.espn_slug)
+        if mismatch is not None:
+            return mismatch
+        header = data.get("header") or {}
+        event = (header.get("competitions") or [{}])[0]
+        teams = self._espn_competitors(event)
+        game_info = data.get("gameInfo") or {}
+        return self._success(
+            {
+                "source": "espn:summary",
+                "mapping": competition.public_mapping(),
+                "event_id": event_id,
+                "date_utc": event.get("date"),
+                "status": ((event.get("status") or {}).get("type") or {}).get("description"),
+                "venue": (game_info.get("venue") or {}).get("fullName"),
+                "attendance": game_info.get("attendance"),
+                "teams": teams,
+                "form": self._espn_form(data),
+                "odds": self._espn_odds(data),
+                "head_to_head": self._espn_head_to_head(data),
+            }
+        )
+
+    @staticmethod
+    def _trusted_competition(
+        arguments: dict[str, Any],
+    ) -> tuple[FootballCompetition | None, ToolResult | None]:
+        query = str(arguments.get("competition") or "").strip()
+        country = str(arguments.get("country") or "").strip()
+        competition = resolve_football_competition(query, country=country)
+        if competition is None:
+            return None, FootballDataTool._error(
+                "ESPN action requires a competition from the trusted runtime catalog"
+            )
+        return competition, None
+
+    @staticmethod
+    def _validate_espn_league(data: dict[str, Any], expected: str) -> ToolResult | None:
+        header = data.get("header") or {}
+        league = header.get("league") or ((data.get("leagues") or [{}])[0])
+        actual = str(league.get("slug") or "") if isinstance(league, dict) else ""
+        if actual != expected:
+            return FootballDataTool._error(
+                "ESPN response competition does not match the trusted runtime mapping"
+            )
+        return None
+
+    @staticmethod
+    def _espn_competitors(event: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        competitors = event.get("competitors") or []
+        result: dict[str, dict[str, Any]] = {}
+        for item in competitors:
+            if not isinstance(item, dict):
+                continue
+            side = str(item.get("homeAway") or "")
+            if side not in {"home", "away"}:
+                continue
+            team = item.get("team") or {}
+            result[side] = {
+                "id": team.get("id"),
+                "name": team.get("displayName"),
+                "score": item.get("score"),
+                "winner": item.get("winner"),
+            }
+        return result
+
+    @staticmethod
+    def _espn_event_row(event: dict[str, Any]) -> dict[str, Any]:
+        competition = (event.get("competitions") or [{}])[0]
+        teams = FootballDataTool._espn_competitors(competition)
+        return {
+            "event_id": event.get("id"),
+            "match": event.get("name"),
+            "date_utc": event.get("date"),
+            "status": ((event.get("status") or {}).get("type") or {}).get("description"),
+            "venue": (competition.get("venue") or {}).get("fullName"),
+            "teams": teams,
+        }
+
+    @staticmethod
+    def _espn_form(data: dict[str, Any]) -> list[dict[str, Any]]:
+        rows = []
+        for item in (data.get("boxscore") or {}).get("form") or []:
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                {
+                    "team": (item.get("team") or {}).get("displayName"),
+                    "events": [
+                        {
+                            "event_id": event.get("id"),
+                            "date_utc": event.get("gameDate"),
+                            "opponent": (event.get("opponent") or {}).get("displayName"),
+                            "result": event.get("gameResult"),
+                            "score": event.get("score"),
+                            "competition": event.get("competitionName"),
+                        }
+                        for event in (item.get("events") or [])[:5]
+                        if isinstance(event, dict)
+                    ],
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _espn_odds(data: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "provider": (item.get("provider") or {}).get("name"),
+                "details": item.get("details"),
+                "over_under": item.get("overUnder"),
+            }
+            for item in (data.get("odds") or [])[:5]
+            if isinstance(item, dict)
+        ]
+
+    @staticmethod
+    def _espn_head_to_head(data: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "event_id": item.get("id"),
+                "date_utc": item.get("date"),
+                "name": item.get("name"),
+            }
+            for item in (data.get("headToHeadGames") or [])[:10]
+            if isinstance(item, dict)
+        ]
 
     async def _competition_search(
         self, arguments: dict[str, Any], context: ExecutionContext
@@ -318,9 +560,13 @@ class FootballDataTool:
         return str(teams[0]["idTeam"]), None
 
     async def _get_json(
-        self, url: str, context: ExecutionContext
+        self,
+        url: str,
+        context: ExecutionContext,
+        *,
+        fetcher: _Fetcher | None = None,
     ) -> tuple[dict[str, Any], ToolResult | None]:
-        fetched = await self._fetcher.execute({"url": url}, context)
+        fetched = await (fetcher or self._fetcher).execute({"url": url}, context)
         if fetched.is_error:
             return {}, fetched
         try:

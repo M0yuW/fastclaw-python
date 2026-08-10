@@ -79,6 +79,7 @@ exclude = [
 "plugins/finance-tools/README.md" = "fastclaw/bundled_plugins/finance-tools/README.md"
 "plugins/finance-tools/LICENSE" = "fastclaw/bundled_plugins/finance-tools/LICENSE"
 "plugins/finance-tools/SOURCE.md" = "fastclaw/bundled_plugins/finance-tools/SOURCE.md"
+"skills/match-data-toolkit" = "fastclaw/bundled_skills/match-data-toolkit"
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
@@ -91,6 +92,7 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+extend-exclude = ["skills/match-data-toolkit"]
 
 [tool.ruff.lint]
 select = ["ASYNC", "B", "E", "F", "I", "RUF", "UP"]

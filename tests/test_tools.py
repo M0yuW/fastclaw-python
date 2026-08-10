@@ -31,6 +31,7 @@ from fastclaw.tools import (
     WriteFileTool,
     resolve_football_competition,
 )
+from fastclaw.tools.football_data import EspnPublicFetcher
 
 
 class FixtureFetcher:
@@ -59,6 +60,14 @@ def context() -> ExecutionContext:
     )
 
 
+@pytest.mark.asyncio
+async def test_espn_fetcher_rejects_non_fixed_origin_without_starting_process() -> None:
+    result = await EspnPublicFetcher().execute({"url": "https://example.com/scoreboard"}, context())
+
+    assert result.is_error
+    assert "fixed soccer API origin" in result.content
+
+
 def test_football_competition_catalog_resolves_reviewed_aliases() -> None:
     sweden = resolve_football_competition("瑞典超", country="瑞典")
     champions_league = resolve_football_competition("UCL", country="Europe")
@@ -73,7 +82,7 @@ def test_football_competition_catalog_resolves_reviewed_aliases() -> None:
 @pytest.mark.asyncio
 async def test_football_data_exposes_only_trusted_provider_mapping() -> None:
     fetcher = FixtureFetcher({})
-    tool = FootballDataTool(fetcher)
+    tool = FootballDataTool(fetcher, espn_fetcher=fetcher)
 
     resolved = await tool.execute(
         {"action": "competition_resolve", "competition": "瑞典超级联赛"}, context()
@@ -90,6 +99,106 @@ async def test_football_data_exposes_only_trusted_provider_mapping() -> None:
     }
     assert rejected.is_error
     assert fetcher.urls == []
+
+
+@pytest.mark.asyncio
+async def test_football_data_espn_queries_use_and_validate_trusted_mapping() -> None:
+    fetcher = FixtureFetcher(
+        {
+            "scoreboard": {
+                "leagues": [{"slug": "swe.1", "name": "Swedish Allsvenskan"}],
+                "events": [
+                    {
+                        "id": "401842783",
+                        "name": "IF Brommapojkarna at IK Sirius",
+                        "date": "2026-08-10T17:00Z",
+                        "status": {"type": {"description": "Scheduled"}},
+                        "competitions": [
+                            {
+                                "competitors": [
+                                    {
+                                        "homeAway": "home",
+                                        "team": {"id": "1", "displayName": "IK Sirius"},
+                                    },
+                                    {
+                                        "homeAway": "away",
+                                        "team": {
+                                            "id": "2",
+                                            "displayName": "IF Brommapojkarna",
+                                        },
+                                    },
+                                ]
+                            }
+                        ],
+                    }
+                ],
+            },
+            "summary": {
+                "header": {
+                    "league": {"slug": "swe.1"},
+                    "competitions": [
+                        {
+                            "date": "2026-08-10T17:00Z",
+                            "status": {"type": {"description": "Scheduled"}},
+                            "competitors": [
+                                {
+                                    "homeAway": "home",
+                                    "team": {"id": "1", "displayName": "IK Sirius"},
+                                },
+                                {
+                                    "homeAway": "away",
+                                    "team": {
+                                        "id": "2",
+                                        "displayName": "IF Brommapojkarna",
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                }
+            },
+        }
+    )
+    tool = FootballDataTool(fetcher, espn_fetcher=fetcher)
+
+    schedule = await tool.execute(
+        {
+            "action": "espn_schedule",
+            "competition": "瑞典超",
+            "date": "2026-08-10",
+        },
+        context(),
+    )
+    summary = await tool.execute(
+        {
+            "action": "espn_summary",
+            "competition": "瑞典超",
+            "event_id": "401842783",
+        },
+        context(),
+    )
+
+    assert json.loads(schedule.content)["matches"][0]["teams"]["home"]["name"] == ("IK Sirius")
+    assert json.loads(summary.content)["mapping"]["espn_slug"] == "swe.1"
+    assert "/swe.1/scoreboard?dates=20260810" in fetcher.urls[0]
+    assert "/swe.1/summary?event=401842783" in fetcher.urls[1]
+
+
+@pytest.mark.asyncio
+async def test_football_data_espn_rejects_mismatched_response_league() -> None:
+    fetcher = FixtureFetcher({"scoreboard": {"leagues": [{"slug": "fifa.world"}], "events": []}})
+
+    result = await FootballDataTool(fetcher, espn_fetcher=fetcher).execute(
+        {
+            "action": "espn_schedule",
+            "competition": "瑞典超",
+            "date": "2026-08-10",
+        },
+        context(),
+    )
+
+    assert result.is_error
+    assert "does not match" in json.loads(result.content)["error"]
 
 
 @pytest.mark.asyncio
