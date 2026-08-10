@@ -235,7 +235,12 @@ async def test_football_data_resolves_non_world_cup_competition_and_schedule() -
         context(),
     )
     scheduled = await tool.execute(
-        {"action": "schedule", "league_id": "4613", "date": "2026-08-10"},
+        {
+            "action": "schedule",
+            "competition": "Allsvenskan",
+            "country": "Sweden",
+            "date": "2026-08-10",
+        },
         context(),
     )
 

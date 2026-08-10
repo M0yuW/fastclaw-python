@@ -12,8 +12,8 @@ Usage:
     python3 espn_data.py --competition "瑞典超" --match "Sirius" "Brommapojkarna" --date 2026-08-10
     python3 espn_data.py --competition "FIFA World Cup" --form Portugal --event 760496
 
-All output is JSON to stdout. Network/API failures degrade to
-{"error": ..., "note": "fall back to OCR/web_search"}.
+All output is JSON to stdout. Network/API failures return sanitized source status and never
+authorize filling missing facts from model memory.
 """
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from common.utils import output_json
+from common.football_competitions import COMPETITIONS as PROVIDER_COMPETITIONS
 
 BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer"
 BJ = timezone(timedelta(hours=8))
@@ -52,6 +53,38 @@ COMPETITIONS = (
     ("Norwegian Eliteserien", "Norway", "nor.1", ("Eliteserien", "挪超", "挪威超级联赛")),
     ("Major League Soccer", "United States", "usa.1", ("MLS", "美职联")),
 )
+
+# Keep the legacy four-field public shape while sourcing every provider identity from the
+# single reviewed Skill catalog shared with odds_data.py.
+COMPETITIONS = tuple(
+    (name, country, espn_slug, aliases)
+    for name, country, espn_slug, _odds_sport_key, aliases in PROVIDER_COMPETITIONS
+)
+
+
+class EspnSourceError(RuntimeError):
+    def __init__(self, code: str, safe_reason: str) -> None:
+        super().__init__(safe_reason)
+        self.code = code
+        self.safe_reason = safe_reason
+
+
+def _failure(error: BaseException) -> dict:
+    if isinstance(error, EspnSourceError):
+        code, reason = error.code, error.safe_reason
+    elif isinstance(error, (TimeoutError, subprocess.TimeoutExpired)):
+        code, reason = "espn_timeout", "ESPN supplemental data timed out"
+    elif isinstance(error, json.JSONDecodeError):
+        code, reason = "espn_malformed_json", "ESPN returned malformed JSON"
+    else:
+        code, reason = "espn_request_failed", "ESPN supplemental data is unavailable"
+    return {
+        "source": "espn",
+        "status": "unavailable",
+        "error_code": code,
+        "safe_reason": reason,
+        "as_of": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _normalize(value: str) -> str:
@@ -91,14 +124,28 @@ def _get(url: str) -> dict:
 
 
 def _get_with_system_curl(url: str) -> dict:
-    if not url.startswith(f"{BASE}/"):
-        raise ValueError("ESPN URL is outside the fixed soccer API origin")
+    parsed = urllib.parse.urlsplit(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        port = -1
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "site.api.espn.com"
+        or port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
+        or not parsed.path.startswith("/apis/site/v2/sports/soccer/")
+    ):
+        raise EspnSourceError("espn_url_rejected", "ESPN URL failed the fixed-origin policy")
     executable = next(
         (path for path in (Path("/usr/bin/curl"), Path("/bin/curl")) if path.is_file()),
         None,
     )
     if executable is None:
-        raise RuntimeError("ESPN rejected Python HTTP and trusted system curl is unavailable")
+        raise EspnSourceError(
+            "espn_curl_unavailable", "ESPN supplemental source is not ready on this host"
+        )
     result = subprocess.run(
         [
             str(executable),
@@ -111,6 +158,8 @@ def _get_with_system_curl(url: str) -> dict:
             "2000000",
             "--proto",
             "=https",
+            "--proto-redir",
+            "=https",
             "--max-redirs",
             "0",
             url,
@@ -121,9 +170,11 @@ def _get_with_system_curl(url: str) -> dict:
         timeout=30,
     )
     if result.returncode != 0:
-        raise RuntimeError("ESPN request failed")
+        raise EspnSourceError("espn_request_failed", "ESPN supplemental data is unavailable")
     if len(result.stdout) > 2_000_000:
-        raise RuntimeError("ESPN response exceeded the safety limit")
+        raise EspnSourceError(
+            "espn_response_too_large", "ESPN response exceeded the safety limit"
+        )
     return json.loads(result.stdout.decode("utf-8"))
 
 
@@ -203,10 +254,10 @@ def _validate_league(data: dict, expected: str) -> dict | None:
 def fetch_schedule(date: str, mapping: dict) -> dict:
     slug = mapping["espn_slug"]
     try:
+        datetime.strptime(date, "%Y-%m-%d")
         data = _get(f"{BASE}/{slug}/scoreboard?dates={_date_key(date)}")
-    except Exception as e:
-        return {"date": date, "matches": [], "error": str(e),
-                "note": "ESPN scoreboard failed; fall back to OCR/web_search"}
+    except Exception as error:
+        return {"date": date, "matches": [], **_failure(error)}
     if mismatch := _validate_league(data, slug):
         return mismatch
     events = data.get("events") or []
@@ -380,13 +431,19 @@ def fetch_discipline(team: str, event_id: str, mapping: dict) -> dict:
 
 def fetch_summary(event_id: str, mapping: dict) -> dict:
     slug = mapping["espn_slug"]
+    if not str(event_id).isdigit():
+        return {
+            "event": event_id,
+            **_failure(
+                EspnSourceError("espn_event_rejected", "ESPN event ID must be numeric")
+            ),
+        }
     try:
         data = _get(
             f"{BASE}/{slug}/summary?event={urllib.parse.quote(str(event_id))}"
         )
-    except Exception as e:
-        return {"event": event_id, "error": str(e),
-                "note": "ESPN summary failed; fall back to OCR/web_search"}
+    except Exception as error:
+        return {"event": event_id, **_failure(error)}
 
     if mismatch := _validate_league(data, slug):
         return mismatch

@@ -24,7 +24,10 @@ ENV FASTCLAW_DATA_ROOT=/data \
     FASTCLAW_WEB_ROOT=/opt/fastclaw/web \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
-RUN groupadd --system --gid 10001 fastclaw \
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 fastclaw \
     && useradd --system --uid 10001 --gid fastclaw --home-dir /data fastclaw \
     && install -d -o fastclaw -g fastclaw -m 0700 /data /opt/fastclaw/web
 COPY --from=python-builder /build/dist/*.whl /tmp/
