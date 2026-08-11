@@ -210,8 +210,9 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
             soul=(
                 "Verify the exact competition, season, stage, fixture identity, kickoff time, "
                 "venue, score state, standings, and recent form. Use dated primary or reputable "
-                "sources. Resolve the named competition through football_data before using a "
-                "provider identifier; never construct an ESPN slug yourself. Never mix "
+                "sources. Use football_data evidence so TheSportsDB confirms the fixture before "
+                "ESPN supplements it; never provide a URL, league ID, slug, sport key, or API "
+                "key. Never mix "
                 "competitions or seasons, and mark unavailable data unknown. "
                 "Return as_of, competition, season, match, lean, confidence, evidence, and URLs."
             ),
@@ -235,7 +236,9 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
             soul=(
                 "Analyze timestamped 1X2 and totals prices only for the requested fixture and "
                 "competition. State bookmaker or market source, remove vig when possible, expose "
-                "missing coverage, and provide price calibration rather than betting advice."
+                "missing coverage, and provide price calibration rather than betting advice. "
+                "Use the evidence action's independent Odds API/Sporttery result and do not let "
+                "odds redefine the primary fixture."
             ),
             allowed_tools=("football_data", "web_fetch"),
         ),
