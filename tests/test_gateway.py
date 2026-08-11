@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastclaw.agent import AgentEvent, AgentEventType
 from fastclaw.app import create_app
 from fastclaw.gateway import GatewaySettings
-from fastclaw.gateway.router import _web_event, _web_history_message
+from fastclaw.gateway.router import _clean_session_preview, _web_event, _web_history_message
 from fastclaw.identity import hash_api_key, hash_password
 from fastclaw.orchestration import TaskSnapshot
 from fastclaw.providers import FunctionCall, ToolCall
@@ -28,6 +28,10 @@ from fastclaw.storage import (
     UserRecord,
 )
 from fastclaw.teams import TeamService
+
+
+def test_session_preview_strips_markdown_title_prefixes() -> None:
+    assert _clean_session_preview("---\n\n## ⚠️ Important **result**") == "⚠️ Important result"
 
 
 @asynccontextmanager
@@ -92,6 +96,32 @@ async def test_team_api_is_idempotent_and_enforces_lifecycle(tmp_path: Path) -> 
     async with gateway_client(tmp_path / "teams.db") as (client, database, _):
         await onboard(client)
         await login(client)
+        templates = (await client.get("/api/agent-team-templates")).json()["templates"]
+        general_football = next(
+            item for item in templates if item["key"] == "football-competition-analysis"
+        )
+        assert len(general_football["roles"]) == 7
+        football_preview = await client.post(
+            "/api/agent-teams/preview",
+            json={
+                "name": "League analysis",
+                "templateKey": "football-competition-analysis",
+                "clientRequestId": "football-preview-request",
+            },
+        )
+        assert football_preview.status_code == 200
+        assert football_preview.json()["ok"] is True
+        assert football_preview.json()["checks"]["skills"] == {
+            "required": [],
+            "prepared": True,
+            "details": {},
+        }
+        assert football_preview.json()["checks"]["tools"]["required"] == [
+            "football_data",
+            "football_ledger",
+            "spawn_subagent",
+            "web_fetch",
+        ]
         preview = await client.post(
             "/api/agent-teams/preview",
             json={
@@ -181,6 +211,33 @@ async def test_team_api_is_idempotent_and_enforces_lifecycle(tmp_path: Path) -> 
             assert all(agent is None for agent in deleted_agents)
 
 
+async def test_general_football_team_can_be_created_from_public_template(tmp_path: Path) -> None:
+    async with gateway_client(tmp_path / "football-team.db") as (client, _database, app):
+        await onboard(client)
+        await login(client)
+
+        response = await client.post(
+            "/api/agent-teams",
+            json={
+                "name": "General football analysis",
+                "description": "Competition-scoped fixture analysis",
+                "templateKey": "football-competition-analysis",
+                "clientRequestId": "general-football-create",
+            },
+        )
+
+        assert response.status_code == 201
+        team = response.json()["team"]
+        assert team["templateKey"] == "football-competition-analysis"
+        assert len(team["members"]) == 7
+        coordinator = next(
+            member for member in team["members"] if member["memberType"] == "coordinator"
+        )
+        profile = app.state.gateway.agent_manager.profiles[coordinator["agentId"]]
+        assert profile.allowed_tools == frozenset({"spawn_subagent", "football_ledger"})
+        assert "competition, season or edition" in profile.system_prompt
+
+
 def test_sse_tool_result_preserves_call_identity_for_pairing() -> None:
     call = ToolCall(id="call-1", function=FunctionCall(name="read_file", arguments="{}"))
     payload = _web_event(
@@ -256,7 +313,7 @@ def test_sse_content_delta_preserves_legacy_content_alias() -> None:
 
 
 async def test_onboard_cookie_auth_status_agents_and_masked_provider(tmp_path: Path) -> None:
-    async with gateway_client(tmp_path / "gateway.db") as (client, database, _app):
+    async with gateway_client(tmp_path / "gateway.db") as (client, database, app):
         root = await client.get("/")
         before = await client.get("/api/status")
         created = await onboard(client)
@@ -286,7 +343,7 @@ async def test_onboard_cookie_auth_status_agents_and_masked_provider(tmp_path: P
         token = created_key.json()["token"]
         listed_keys = await client.get("/api/apikeys")
         bearer_me = await client.get("/api/me", headers={"Authorization": f"Bearer {token}"})
-        rejected_provider_secret = await client.post(
+        saved_provider_secret = await client.post(
             "/api/providers",
             json={
                 "name": "deepseek",
@@ -326,13 +383,65 @@ async def test_onboard_cookie_auth_status_agents_and_masked_provider(tmp_path: P
         assert token.startswith("fc_")
         assert token not in json.dumps(listed_keys.json())
         assert bearer_me.json()["authMethod"] == "apikey"
-        assert rejected_provider_secret.status_code == 400
+        assert saved_provider_secret.status_code == 201
         assert all("apiKey" not in item.data for item in stored_providers)
+        deepseek = next(item for item in stored_providers if item.name == "deepseek")
+        assert str(deepseek.data["encryptedApiKey"]).startswith("fcsec:v1:")
+        assert "must-not-persist" not in json.dumps(deepseek.data)
+        assert (
+            app.state.agent_manager.provider_credential(
+                deepseek.name,
+                deepseek.data,
+                credential_context=deepseek.id,
+            )
+            == "must-not-persist"
+        )
 
         logged_out = await client.post("/api/logout")
         denied = await client.get("/api/me")
         assert logged_out.status_code == 200
         assert denied.status_code == 401
+
+
+async def test_agent_provider_key_is_encrypted_and_used_by_runtime(tmp_path: Path) -> None:
+    async with gateway_client(tmp_path / "agent-provider.db") as (client, database, app):
+        created = await onboard(client)
+        await login(client)
+
+        updated = await client.put(
+            f"/api/agents/{created['agentId']}",
+            json={
+                "model": "scoped/model-1",
+                "providers": {
+                    "scoped": {
+                        "apiBase": "https://scoped.test/v1",
+                        "apiKey": "agent-provider-secret",
+                        "apiType": "openai-compatible",
+                        "models": [{"id": "model-1", "name": "Model 1"}],
+                    }
+                },
+            },
+        )
+        config = await client.get(f"/api/agents/{created['agentId']}/config")
+        async with UnitOfWork(database) as unit:
+            store = unit.require_store()
+            agent = await store.get_agent(created["agentId"])
+            providers = await store.list_configs(
+                kind="provider",
+                user_id=created["userId"],
+                agent_id=created["agentId"],
+            )
+
+        assert updated.status_code == 200
+        assert config.json()["providers"]["scoped"]["apiKey"] == "agen****cret"
+        assert agent is not None
+        assert "providers" not in agent.config
+        assert len(providers) == 1
+        assert "agent-provider-secret" not in json.dumps(providers[0].data)
+        profile = await app.state.agent_manager.profile(created["agentId"], created["userId"])
+        selection = await app.state.agent_manager.provider_selection(profile)
+        assert selection.source == "agent"
+        assert selection.api_key == "agent-provider-secret"
 
 
 async def test_team_member_agent_cannot_be_deleted_directly(tmp_path: Path) -> None:

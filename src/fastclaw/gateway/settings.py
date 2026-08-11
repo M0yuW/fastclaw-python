@@ -19,6 +19,7 @@ class GatewaySettings:
     provider_api_key: str = ""
     provider_api_base: str = ""
     provider_api_type: str = "openai-compatible"
+    master_key: str = ""
     default_model: str = ""
     web_root: Path | None = None
 
@@ -48,6 +49,7 @@ class GatewaySettings:
             provider_api_key=os.environ.get("FASTCLAW_PROVIDER_API_KEY", ""),
             provider_api_base=os.environ.get("FASTCLAW_PROVIDER_API_BASE", ""),
             provider_api_type=os.environ.get("FASTCLAW_PROVIDER_API_TYPE", "openai-compatible"),
+            master_key=os.environ.get("FASTCLAW_MASTER_KEY", ""),
             default_model=os.environ.get("FASTCLAW_DEFAULT_MODEL", ""),
             web_root=web_root if web_root.is_dir() else None,
         )

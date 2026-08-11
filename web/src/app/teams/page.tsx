@@ -20,6 +20,7 @@ export default function TeamsPage() {
   const [templateKey, setTemplateKey] = useState("finance-market-research");
   const [specialists, setSpecialists] = useState("");
   const [model, setModel] = useState("");
+  const [specialistModel, setSpecialistModel] = useState("");
   const [providerName, setProviderName] = useState("");
   const [providerApiBase, setProviderApiBase] = useState("");
   const [providerApiType, setProviderApiType] = useState("openai-compatible");
@@ -37,6 +38,7 @@ export default function TeamsPage() {
     getTeamTemplates().then((items) => { setTemplates(items); if (items[0]) setTemplateKey(items[0].key); }).catch(() => {});
     getConfig().then((config) => {
       setModel(config.agents.defaults.model || "");
+      setSpecialistModel(config.agents.defaults.model || "");
       const firstProvider = Object.entries(config.providers)[0];
       if (firstProvider) {
         const [configuredName, configured] = firstProvider;
@@ -86,7 +88,7 @@ export default function TeamsPage() {
         return false;
       }
       if (!providerSaved && !(await saveProviderProfile())) return false;
-      const result = await previewTeam({ name: name || "Preview", templateKey, clientRequestId: requestId || crypto.randomUUID(), model, providerName: providerName.trim(), specialists: customRoles() });
+      const result = await previewTeam({ name: name || "Preview", templateKey, clientRequestId: requestId || crypto.randomUUID(), model, specialistModel, providerName: providerName.trim(), specialists: customRoles() });
       const checks = result.checks;
       const skillText = checks?.skills?.required?.length
         ? `Skills: ${checks.skills.prepared ? "ready" : "not prepared"} (${checks.skills.required.join(", ")})`
@@ -119,7 +121,7 @@ export default function TeamsPage() {
     if (!name.trim()) return;
     if (!previewReady && !(await runPreview())) return;
     setSaving(true); setError("");
-    const result = await createTeam({ name: name.trim(), description, templateKey, clientRequestId: requestId, model, providerName: providerName.trim(), specialists: customRoles() });
+    const result = await createTeam({ name: name.trim(), description, templateKey, clientRequestId: requestId, model, specialistModel, providerName: providerName.trim(), specialists: customRoles() });
     setSaving(false);
     if (!result.ok) return setError(result.detail || result.error || "Team creation failed");
     setOpen(false); setName(""); setDescription(""); setSpecialists(""); setRequestId(""); setPreview([]); setPreviewReady(false); load();
@@ -152,11 +154,16 @@ export default function TeamsPage() {
           </div>
           {templateKey === "custom" && <div><Label htmlFor="team-specialists">Specialists</Label><Textarea id="team-specialists" placeholder="One specialist name per line" value={specialists} onChange={(event) => { setSpecialists(event.target.value); invalidatePreview(); }} /></div>}
           <div className="space-y-3 rounded-md border p-4">
-            <div><p className="text-sm font-medium">Step 2 — Model and provider</p><p className="text-xs text-muted-foreground">These values are applied to every coordinator and specialist created in this team.</p></div>
+            <div><p className="text-sm font-medium">Step 2 — Models and provider</p><p className="text-xs text-muted-foreground">Use a stronger coordinator model and a faster specialist model when the provider supports both.</p></div>
             <div>
               <Label htmlFor="team-model">Model ID</Label>
               <Input id="team-model" placeholder="deepseek-v4-flash" value={model} onChange={(event) => { setModel(event.target.value); invalidatePreview(); }} />
               <p className="mt-1 text-xs text-muted-foreground">Enter the provider’s exact model ID. Do not add a provider prefix here.</p>
+            </div>
+            <div>
+              <Label htmlFor="team-specialist-model">Specialist model ID</Label>
+              <Input id="team-specialist-model" placeholder="deepseek-v4-flash" value={specialistModel} onChange={(event) => { setSpecialistModel(event.target.value); invalidatePreview(); }} />
+              <p className="mt-1 text-xs text-muted-foreground">Leave blank to reuse the coordinator model.</p>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div><Label htmlFor="team-provider-name">Provider name</Label><Input id="team-provider-name" placeholder="deepseek" value={providerName} onChange={(event) => { setProviderName(event.target.value); setProviderSaved(false); invalidatePreview(); }} /></div>

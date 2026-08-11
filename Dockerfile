@@ -16,6 +16,7 @@ COPY src/ ./src/
 COPY migrations/ ./migrations/
 COPY alembic.ini ./
 COPY plugins/ ./plugins/
+COPY skills/ ./skills/
 RUN python -m build --wheel
 
 FROM python:3.12-slim-bookworm AS runtime
@@ -24,7 +25,11 @@ ENV FASTCLAW_DATA_ROOT=/data \
     FASTCLAW_WEB_ROOT=/opt/fastclaw/web \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
-RUN groupadd --system --gid 10001 fastclaw \
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && test -x /usr/bin/curl \
+    && groupadd --system --gid 10001 fastclaw \
     && useradd --system --uid 10001 --gid fastclaw --home-dir /data fastclaw \
     && install -d -o fastclaw -g fastclaw -m 0700 /data /opt/fastclaw/web
 COPY --from=python-builder /build/dist/*.whl /tmp/

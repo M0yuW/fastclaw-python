@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
@@ -114,6 +115,18 @@ def tool_round() -> tuple[ProviderEvent, ...]:
     )
 
 
+def delegation_round() -> tuple[ProviderEvent, ...]:
+    return (
+        ProviderEvent(
+            type=ProviderEventType.TOOL_CALL_DELTA,
+            tool_index=0,
+            tool_name="spawn_subagent",
+            tool_arguments='{"agent_id":"specialist","task":"research"}',
+        ),
+        ProviderEvent(type=ProviderEventType.DONE, finish_reason="tool_calls"),
+    )
+
+
 def final_round() -> tuple[ProviderEvent, ...]:
     return (
         ProviderEvent(type=ProviderEventType.CONTENT_DELTA, content="finished"),
@@ -214,6 +227,40 @@ async def test_react_loop_calls_provider_once_per_round_and_persists_final_histo
 
 
 @pytest.mark.asyncio
+async def test_agent_run_logs_provider_and_tool_stages(caplog: pytest.LogCaptureFixture) -> None:
+    provider = ScriptedProvider([tool_round(), final_round()])
+    runner = AgentRunner(provider, ToolRegistry([EchoTool()]), StubPersistence())
+    context = run_context()
+    context = ExecutionContext(
+        user_id=context.user_id,
+        agent_id=context.agent_id,
+        session_id=context.session_id,
+        root_execution_id=context.root_execution_id,
+        call_path=context.call_path,
+        task_id="delegation-1",
+    )
+
+    with caplog.at_level(logging.INFO):
+        stream = runner.stream(AgentRunRequest(model="deepseek/model", message="start"), context)
+        _ = [event async for event in stream]
+
+    stages = [getattr(record, "stage", "") for record in caplog.records if hasattr(record, "stage")]
+    assert stages == [
+        "provider_started",
+        "provider_finished",
+        "tool_started",
+        "tool_finished",
+        "provider_started",
+        "provider_finished",
+    ]
+    assert all(
+        getattr(record, "task_id", "") == "delegation-1"
+        for record in caplog.records
+        if hasattr(record, "stage")
+    )
+
+
+@pytest.mark.asyncio
 async def test_react_loop_uses_ordered_batch_protocol_for_one_model_round() -> None:
     provider = ScriptedProvider([batch_tool_round(), final_round()])
     persistence = StubPersistence()
@@ -291,6 +338,20 @@ class SlowTool(EchoTool):
         raise AssertionError("sleep_forever returned")
 
 
+class SlowDelegationTool:
+    definition = ToolDefinition(
+        function=ToolFunction(
+            name="spawn_subagent",
+            parameters={"type": "object"},
+        )
+    )
+
+    async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
+        del arguments, context
+        await anyio.sleep(0.03)
+        return ToolResult(content="specialist evidence")
+
+
 class DirectReturnTool(EchoTool):
     async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
         del arguments, context
@@ -364,6 +425,75 @@ async def test_tool_timeout_is_visible_and_does_not_hang_the_turn() -> None:
     timeout_event = next(event for event in events if event.type is AgentEventType.TOOL_RESULT)
     assert timeout_event.is_error
     assert "timed out" in timeout_event.tool_result
+
+
+@pytest.mark.asyncio
+async def test_delegation_uses_its_independent_timeout_budget() -> None:
+    provider = ScriptedProvider([delegation_round(), final_round()])
+    runner = AgentRunner(
+        provider,
+        ToolRegistry([SlowDelegationTool()]),
+        StubPersistence(),
+    )
+    stream = runner.stream(
+        AgentRunRequest(
+            model="fixture",
+            message="start",
+            tool_timeout=0.01,
+            delegation_timeout=0.2,
+        ),
+        run_context(),
+    )
+
+    events = [event async for event in stream]
+
+    result = next(event for event in events if event.type is AgentEventType.TOOL_RESULT)
+    assert result.is_error is False
+    assert result.tool_result == "specialist evidence"
+
+
+@pytest.mark.asyncio
+async def test_all_failed_tool_round_can_fail_closed_without_model_retry() -> None:
+    provider = ScriptedProvider([tool_round()])
+    persistence = StubPersistence()
+    stream = AgentRunner(provider, ToolRegistry([FailingTool()]), persistence).stream(
+        AgentRunRequest(
+            model="fixture",
+            message="# Match prediction",
+            max_failed_tool_rounds=1,
+        ),
+        run_context(),
+    )
+
+    _ = [event async for event in stream]
+
+    assert len(provider.requests) == 1
+    assert stream.result().metadata["evidenceGate"] == "all_tools_failed"
+    assert "不会生成推测性结论" in str(stream.result().content)
+    assert persistence.saved[0].title == "Match prediction"
+    assert persistence.saved[0].messages[-1]["timestamp"] != "1970-01-01T00:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_football_scope_guard_clarifies_before_provider_or_tools() -> None:
+    provider = ScriptedProvider([])
+    persistence = StubPersistence()
+    stream = AgentRunner(provider, ToolRegistry(), persistence).stream(
+        AgentRunRequest(
+            model="fixture",
+            message="天狼星 vs 布洛马波卡纳",
+            scope_guard="football",
+        ),
+        run_context(),
+    )
+
+    _ = [event async for event in stream]
+
+    assert provider.requests == []
+    assert "赛事名称" in str(stream.result().content)
+    assert "比赛日期" in str(stream.result().content)
+    assert stream.result().metadata == {"scopeGate": "football"}
+    assert persistence.saved[0].title == "天狼星 vs 布洛马波卡纳"
 
 
 @pytest.mark.asyncio
