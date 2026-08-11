@@ -15,6 +15,7 @@ class ExecutionContext:
     session_id: str
     root_execution_id: str
     call_path: tuple[str, ...] = ()
+    task_id: str = ""
 
 
 _execution: ContextVar[ExecutionContext | None] = ContextVar("fastclaw_execution", default=None)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 from collections.abc import Awaitable, Callable
 
@@ -102,6 +103,33 @@ async def test_spawn_subagent_ignores_model_supplied_identity() -> None:
         assert received[0].user_id == "user-1"
         assert received[0].root_execution_id == "root-1"
         assert received[0].call_path == ("worker",)
+    finally:
+        await bus.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_delegation_emits_sanitized_stage_lifecycle(caplog: pytest.LogCaptureFixture) -> None:
+    bus = InProcessMessageBus()
+    received: list[ExecutionContext] = []
+
+    async def handler(task: str, child: ExecutionContext) -> str:
+        assert task == "private task body"
+        received.append(child)
+        return "complete"
+
+    bus.register(user_id="user-1", agent_id="worker", handler=handler)
+    try:
+        with caplog.at_level(logging.INFO, logger="fastclaw.orchestration.bus"):
+            result = await bus.request(context(), "worker", "private task body")
+
+        stage_records = [record for record in caplog.records if hasattr(record, "stage")]
+        stages = [record.stage for record in stage_records]
+        assert stages == ["queued", "handler_started", "reply_published", "completed"]
+        assert received[0].task_id == result.correlation_id
+        assert all("private task body" not in record.getMessage() for record in caplog.records)
+        assert all(
+            getattr(record, "task_id", "") == result.correlation_id for record in stage_records
+        )
     finally:
         await bus.shutdown()
 

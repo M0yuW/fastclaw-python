@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, cast
@@ -223,6 +224,40 @@ async def test_react_loop_calls_provider_once_per_round_and_persists_final_histo
         "assistant",
     ]
     assert saved.messages[1]["_raw"]["tool_calls"][0]["function"]["name"] == "echo"
+
+
+@pytest.mark.asyncio
+async def test_agent_run_logs_provider_and_tool_stages(caplog: pytest.LogCaptureFixture) -> None:
+    provider = ScriptedProvider([tool_round(), final_round()])
+    runner = AgentRunner(provider, ToolRegistry([EchoTool()]), StubPersistence())
+    context = run_context()
+    context = ExecutionContext(
+        user_id=context.user_id,
+        agent_id=context.agent_id,
+        session_id=context.session_id,
+        root_execution_id=context.root_execution_id,
+        call_path=context.call_path,
+        task_id="delegation-1",
+    )
+
+    with caplog.at_level(logging.INFO):
+        stream = runner.stream(AgentRunRequest(model="deepseek/model", message="start"), context)
+        _ = [event async for event in stream]
+
+    stages = [getattr(record, "stage", "") for record in caplog.records if hasattr(record, "stage")]
+    assert stages == [
+        "provider_started",
+        "provider_finished",
+        "tool_started",
+        "tool_finished",
+        "provider_started",
+        "provider_finished",
+    ]
+    assert all(
+        getattr(record, "task_id", "") == "delegation-1"
+        for record in caplog.records
+        if hasattr(record, "stage")
+    )
 
 
 @pytest.mark.asyncio

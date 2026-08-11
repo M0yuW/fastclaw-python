@@ -11,6 +11,7 @@ from typing import Protocol
 from uuid import uuid4
 
 from fastclaw.execution import ExecutionContext
+from fastclaw.observability import log_stage
 from fastclaw.orchestration.queue import (
     AsyncTaskQueue,
     BackpressureError,
@@ -143,18 +144,61 @@ class InProcessMessageBus:
             context,
             agent_id=target_agent_id,
             call_path=(*context.call_path, target_agent_id),
+            task_id=correlation_id,
         )
 
         async def run() -> TaskResult:
+            handler_started = asyncio.get_running_loop().time()
+            log_stage(
+                logger,
+                "handler_started",
+                context=child_context,
+                target_agent_id=target_agent_id,
+            )
             try:
                 value = await handler(task, child_context)
             except asyncio.CancelledError:
+                log_stage(
+                    logger,
+                    "handler_finished",
+                    context=child_context,
+                    target_agent_id=target_agent_id,
+                    outcome="cancelled",
+                    duration_ms=int((asyncio.get_running_loop().time() - handler_started) * 1000),
+                    level=logging.WARNING,
+                )
                 raise
             except MessageBusError:
+                log_stage(
+                    logger,
+                    "handler_finished",
+                    context=child_context,
+                    target_agent_id=target_agent_id,
+                    outcome="failed",
+                    duration_ms=int((asyncio.get_running_loop().time() - handler_started) * 1000),
+                    level=logging.WARNING,
+                )
                 raise
             except Exception as exc:
                 logger.exception("delegated task %s failed", correlation_id)
+                log_stage(
+                    logger,
+                    "handler_finished",
+                    context=child_context,
+                    target_agent_id=target_agent_id,
+                    outcome="failed",
+                    duration_ms=int((asyncio.get_running_loop().time() - handler_started) * 1000),
+                    level=logging.ERROR,
+                )
                 raise DelegatedTaskError(correlation_id) from exc
+            log_stage(
+                logger,
+                "reply_published",
+                context=child_context,
+                target_agent_id=target_agent_id,
+                outcome="completed",
+                duration_ms=int((asyncio.get_running_loop().time() - handler_started) * 1000),
+            )
             return TaskResult(correlation_id=correlation_id, value=value)
 
         ticket: WaitTicket | None = None
@@ -166,8 +210,23 @@ class InProcessMessageBus:
                 inherit_slot=bool(context.call_path),
                 handler=run,
             )
+            log_stage(
+                logger,
+                "queued",
+                context=context,
+                task_id=correlation_id,
+                target_agent_id=target_agent_id,
+            )
             try:
                 result = await ticket.result()
+                log_stage(
+                    logger,
+                    "completed",
+                    context=child_context,
+                    target_agent_id=target_agent_id,
+                    outcome="completed",
+                    duration_ms=int((asyncio.get_running_loop().time() - started_at) * 1000),
+                )
                 logger.info(
                     "delegation completed "
                     "(correlation=%s root=%s source=%s target=%s duration_ms=%d)",
@@ -179,6 +238,15 @@ class InProcessMessageBus:
                 )
                 return result
             except asyncio.CancelledError:
+                log_stage(
+                    logger,
+                    "completed",
+                    context=child_context,
+                    target_agent_id=target_agent_id,
+                    outcome="cancelled",
+                    duration_ms=int((asyncio.get_running_loop().time() - started_at) * 1000),
+                    level=logging.WARNING,
+                )
                 logger.warning(
                     "delegation cancelled "
                     "(correlation=%s root=%s source=%s target=%s duration_ms=%d)",
