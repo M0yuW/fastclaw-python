@@ -216,6 +216,7 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "Return as_of, competition, season, match, lean, confidence, evidence, and URLs."
             ),
             allowed_tools=("football_data", "web_fetch"),
+            max_failed_tool_rounds=1,
         ),
         TeamRole(
             "tactics-analyst",
@@ -227,6 +228,7 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "inference, cite dated sources, and account for two-leg or extra-time rules."
             ),
             allowed_tools=("football_data", "web_fetch"),
+            max_failed_tool_rounds=1,
         ),
         TeamRole(
             "odds-analyst",
@@ -238,6 +240,7 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "missing coverage, and provide price calibration rather than betting advice."
             ),
             allowed_tools=("football_data", "web_fetch"),
+            max_failed_tool_rounds=1,
         ),
         TeamRole(
             "history-analyst",
@@ -249,6 +252,7 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "the limits of historical transfer explicit."
             ),
             allowed_tools=("football_data", "web_fetch"),
+            max_failed_tool_rounds=1,
         ),
         TeamRole(
             "risk-officer",
@@ -260,6 +264,7 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "gaps. Never turn an unverified absence or rumor into a confirmed fact."
             ),
             allowed_tools=("football_data", "web_fetch"),
+            max_failed_tool_rounds=1,
         ),
         TeamRole(
             "ev-analyst",
@@ -271,6 +276,7 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "evidence. Do not change the evidence confidence and do not give stake advice."
             ),
             allowed_tools=("football_data", "web_fetch"),
+            max_failed_tool_rounds=1,
         ),
     ),
 )

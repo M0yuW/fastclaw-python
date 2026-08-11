@@ -152,6 +152,7 @@ async def test_general_football_team_creation_persists_role_prompts(tmp_path: Pa
         assert data_analyst is not None
         assert data_analyst.config["model"] == "deepseek-v4-flash"
         assert data_analyst.config["allowedTools"] == ["football_data", "web_fetch"]
+        assert data_analyst.config["maxFailedToolRounds"] == 1
         assert "skills" not in data_analyst.config
     finally:
         await database.close()
@@ -199,6 +200,7 @@ def test_general_football_template_is_public_and_competition_scoped() -> None:
     assert len(template.roles) == 7
     assert template.roles[0].allowed_tools == ("spawn_subagent", "football_ledger")
     assert all(role.allowed_tools == ("football_data", "web_fetch") for role in template.roles[1:])
+    assert all(role.max_failed_tool_rounds == 1 for role in template.roles[1:])
     assert all(not role.skills for role in template.roles)
     combined_prompt = "\n".join(role.soul for role in template.roles)
     assert "competition" in combined_prompt.lower()

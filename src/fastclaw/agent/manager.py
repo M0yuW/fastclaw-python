@@ -957,6 +957,21 @@ class AgentRuntimeManager:
     @staticmethod
     def _request(profile: AgentRuntimeProfile, model: str, message: str) -> AgentRunRequest:
         config = profile.agent.config
+        configured_max_failed_tool_rounds = config.get("maxFailedToolRounds")
+        if configured_max_failed_tool_rounds is None:
+            # Older persisted football teams predate the fail-closed specialist
+            # policy.  Their profiles do not have maxFailedToolRounds, so keep
+            # an unavailable external data source from consuming the entire
+            # coordinator delegation budget with model retries.  An explicit
+            # value always wins, including 0 for an intentionally unlimited
+            # retry policy.
+            default_max_failed_tool_rounds = int(
+                config.get("teamMemberType") == "specialist"
+                and profile.allowed_tools is not None
+                and "football_data" in profile.allowed_tools
+            )
+        else:
+            default_max_failed_tool_rounds = int(configured_max_failed_tool_rounds or 0)
         return AgentRunRequest(
             model=model,
             message=message,
@@ -971,7 +986,7 @@ class AgentRuntimeManager:
                 int(config["thinkingBudgetTokens"]) if config.get("thinkingBudgetTokens") else None
             ),
             delegation_timeout=float(config.get("delegationTimeoutSeconds") or 120),
-            max_failed_tool_rounds=int(config.get("maxFailedToolRounds") or 0),
+            max_failed_tool_rounds=default_max_failed_tool_rounds,
             scope_guard=str(config.get("scopeGuard") or ""),
         )
 

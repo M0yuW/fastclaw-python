@@ -12,6 +12,7 @@ from fastclaw.agent.manager import (
     AgentManagerShutdownError,
     AgentRuntimeConfig,
     AgentRuntimeManager,
+    AgentRuntimeProfile,
 )
 from fastclaw.agent.models import AgentRunError
 from fastclaw.execution import ExecutionContext
@@ -93,6 +94,46 @@ class CoordinatingProvider:
             yield ProviderEvent(type=ProviderEventType.DONE, finish_reason="tool_calls")
 
         return ProviderStream(events())
+
+
+def test_existing_football_specialists_fail_closed_when_config_lacks_policy() -> None:
+    now = datetime.now(UTC)
+    profile = AgentRuntimeProfile(
+        agent=AgentRecord(
+            id="football-specialist",
+            user_id="user-1",
+            name="Competition data analyst",
+            config={"teamMemberType": "specialist"},
+            created_at=now,
+            updated_at=now,
+        ),
+        system_prompt="",
+        allowed_tools=frozenset({"football_data", "web_fetch"}),
+    )
+
+    request = AgentRuntimeManager._request(profile, "fixture/specialist", "check match")
+
+    assert request.max_failed_tool_rounds == 1
+
+
+def test_explicit_specialist_retry_policy_is_preserved() -> None:
+    now = datetime.now(UTC)
+    profile = AgentRuntimeProfile(
+        agent=AgentRecord(
+            id="football-specialist",
+            user_id="user-1",
+            name="Competition data analyst",
+            config={"teamMemberType": "specialist", "maxFailedToolRounds": 0},
+            created_at=now,
+            updated_at=now,
+        ),
+        system_prompt="",
+        allowed_tools=frozenset({"football_data", "web_fetch"}),
+    )
+
+    request = AgentRuntimeManager._request(profile, "fixture/specialist", "check match")
+
+    assert request.max_failed_tool_rounds == 0
 
 
 class BlockingProvider(CoordinatingProvider):
