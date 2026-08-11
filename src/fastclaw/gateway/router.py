@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -2111,7 +2112,10 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                 async for event in stream:
                     yield _sse(_web_event(event))
             finally:
-                await stream.aclose()
+                # The browser owns only this SSE presentation channel.  A
+                # refresh or network disconnect must not cancel the Agent
+                # execution that is already running in the manager.
+                stream.detach()
 
         return StreamingResponse(events(), media_type="text/event-stream")
 
@@ -2180,15 +2184,21 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                             )
                     yield "data: [DONE]\n\n"
                 finally:
-                    await stream.aclose()
+                    stream.detach()
 
             return StreamingResponse(chunks(), media_type="text/event-stream")
         try:
             async for _ in stream:
                 pass
             result = stream.result()
+        except asyncio.CancelledError:
+            # A disconnected compatibility request must not cancel the
+            # execution that the manager has already started.
+            stream.detach()
+            raise
         finally:
-            await stream.aclose()
+            if not stream.detached:
+                await stream.aclose()
         return JSONResponse(
             {
                 "id": completion_id,

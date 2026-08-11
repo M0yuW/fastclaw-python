@@ -176,6 +176,7 @@ class ManagedAgentStream(AsyncIterator[AgentEvent]):
         self._result: ChatMessage | None = None
         self._error = ""
         self._closed = False
+        self._detached = False
         self._saw_error = False
         self._saw_done = False
 
@@ -184,6 +185,11 @@ class ManagedAgentStream(AsyncIterator[AgentEvent]):
                 self._saw_error = True
             if event.type is AgentEventType.DONE:
                 self._saw_done = True
+            # The HTTP consumer may disappear while the root run is still
+            # executing.  Do not let a disconnected SSE client turn the
+            # unbounded event queue into a memory leak.
+            if self._detached:
+                return
             self._events.put_nowait(event)
 
         async def supervise() -> None:
@@ -221,7 +227,8 @@ class ManagedAgentStream(AsyncIterator[AgentEvent]):
                 self._manager._untrack_root(self.context.agent_id, self.context.root_execution_id)
                 if not self._saw_done:
                     self._error = self._error or "agent stream ended without a terminal event"
-                self._events.put_nowait(self._STOP)
+                if not self._detached:
+                    self._events.put_nowait(self._STOP)
 
         self._manager._track_root(self.context.agent_id, self.context.root_execution_id)
         self._task = asyncio.create_task(supervise())
@@ -230,6 +237,8 @@ class ManagedAgentStream(AsyncIterator[AgentEvent]):
         return self
 
     async def __anext__(self) -> AgentEvent:
+        if self._closed:
+            raise StopAsyncIteration
         item = await self._events.get()
         if item is self._STOP:
             self._closed = True
@@ -247,6 +256,31 @@ class ManagedAgentStream(AsyncIterator[AgentEvent]):
         if self._result is None:
             raise AgentRunError("agent stream did not complete successfully")
         return self._result
+
+    @property
+    def detached(self) -> bool:
+        return self._detached
+
+    def detach(self) -> None:
+        """Detach the event consumer without cancelling the root execution.
+
+        SSE is a presentation channel, not the lifetime owner of an Agent
+        run.  A browser refresh, network interruption, or proxy timeout must
+        therefore leave the producer and its queue job alive.  Once detached,
+        future events are discarded and already queued events are drained so
+        a long-running run cannot accumulate an unbounded in-memory backlog.
+        Explicit cancellation continues to use :meth:`aclose`.
+        """
+
+        if self._detached:
+            return
+        self._detached = True
+        self._closed = True
+        while True:
+            try:
+                self._events.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
     async def aclose(self) -> None:
         if self._closed and self._task.done():
@@ -466,8 +500,17 @@ class AgentRuntimeManager:
             async for _ in stream:
                 pass
             return stream.result()
+        except asyncio.CancelledError:
+            # The compatibility non-streaming endpoint is still request-bound
+            # at the HTTP layer.  If that request is cancelled because the
+            # browser disconnected, preserve the Agent run just like the SSE
+            # endpoint does.  Explicit stop/archive paths call cancel_root
+            # directly and are unaffected.
+            stream.detach()
+            raise
         finally:
-            await stream.aclose()
+            if not stream.detached:
+                await stream.aclose()
 
     async def cancel_root(self, root_execution_id: str) -> None:
         await self.bus.cancel_root(root_execution_id)
