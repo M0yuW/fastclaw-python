@@ -22,12 +22,12 @@ registry with one application-scoped `AgentRuntimeManager`.
 
 ## Provider credentials
 
-Imported provider records remain non-secret. A provider named `deepseek` or
-`openrouter` can obtain its key from
+Imported provider records remain non-secret. New or rotated credentials entered
+through Provider CRUD are AES-GCM encrypted under a data-root master key. A
+provider named `deepseek` or `openrouter` can override its stored key with
 `FASTCLAW_PROVIDER_DEEPSEEK_API_KEY` or
-`FASTCLAW_PROVIDER_OPENROUTER_API_KEY`, respectively. The database supplies the
-non-secret endpoint and API type. The older generic environment settings remain
-available as a compatibility fallback.
+`FASTCLAW_PROVIDER_OPENROUTER_API_KEY`, respectively. The older generic
+environment settings remain available as a compatibility fallback.
 
 ## Readiness
 
@@ -44,8 +44,8 @@ Skill-reference validation is completed in the following asset/skill phase.
   Agent session rows.
 - Closing a streaming root run closes the provider stream and does not persist a
   partial assistant message.
-- Named environment credentials resolve without copying a secret into the
-  imported provider row.
+- Stored credentials round-trip through authenticated encryption, and named
+  environment credentials override them without being copied into a provider row.
 - Direct-return tool results finish and persist without a second model request.
 - Existing queue tests retain cross-tenant, cycle, backpressure, cancellation,
   deduplication, and shutdown coverage.

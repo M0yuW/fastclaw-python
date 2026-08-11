@@ -25,6 +25,7 @@ from sqlalchemy import text
 from fastclaw.agent.models import AgentEvent, AgentEventType, AgentRunError, AgentRunRequest
 from fastclaw.agent.persistence import DatabaseSessionPersistence
 from fastclaw.agent.runner import AgentRunner
+from fastclaw.credentials import CredentialCipher
 from fastclaw.execution import ExecutionContext
 from fastclaw.orchestration import (
     AsyncTaskQueue,
@@ -76,6 +77,7 @@ class AgentRuntimeConfig:
     default_provider_api_base: str = ""
     default_provider_api_type: str = "openai-compatible"
     default_model: str = ""
+    master_key: str = ""
     max_concurrent: int = 8
     max_pending: int = 256
     enable_plugins: bool = True
@@ -174,6 +176,7 @@ class ManagedAgentStream(AsyncIterator[AgentEvent]):
         self._result: ChatMessage | None = None
         self._error = ""
         self._closed = False
+        self._detached = False
         self._saw_error = False
         self._saw_done = False
 
@@ -182,6 +185,11 @@ class ManagedAgentStream(AsyncIterator[AgentEvent]):
                 self._saw_error = True
             if event.type is AgentEventType.DONE:
                 self._saw_done = True
+            # The HTTP consumer may disappear while the root run is still
+            # executing.  Do not let a disconnected SSE client turn the
+            # unbounded event queue into a memory leak.
+            if self._detached:
+                return
             self._events.put_nowait(event)
 
         async def supervise() -> None:
@@ -219,7 +227,8 @@ class ManagedAgentStream(AsyncIterator[AgentEvent]):
                 self._manager._untrack_root(self.context.agent_id, self.context.root_execution_id)
                 if not self._saw_done:
                     self._error = self._error or "agent stream ended without a terminal event"
-                self._events.put_nowait(self._STOP)
+                if not self._detached:
+                    self._events.put_nowait(self._STOP)
 
         self._manager._track_root(self.context.agent_id, self.context.root_execution_id)
         self._task = asyncio.create_task(supervise())
@@ -228,6 +237,8 @@ class ManagedAgentStream(AsyncIterator[AgentEvent]):
         return self
 
     async def __anext__(self) -> AgentEvent:
+        if self._closed:
+            raise StopAsyncIteration
         item = await self._events.get()
         if item is self._STOP:
             self._closed = True
@@ -245,6 +256,31 @@ class ManagedAgentStream(AsyncIterator[AgentEvent]):
         if self._result is None:
             raise AgentRunError("agent stream did not complete successfully")
         return self._result
+
+    @property
+    def detached(self) -> bool:
+        return self._detached
+
+    def detach(self) -> None:
+        """Detach the event consumer without cancelling the root execution.
+
+        SSE is a presentation channel, not the lifetime owner of an Agent
+        run.  A browser refresh, network interruption, or proxy timeout must
+        therefore leave the producer and its queue job alive.  Once detached,
+        future events are discarded and already queued events are drained so
+        a long-running run cannot accumulate an unbounded in-memory backlog.
+        Explicit cancellation continues to use :meth:`aclose`.
+        """
+
+        if self._detached:
+            return
+        self._detached = True
+        self._closed = True
+        while True:
+            try:
+                self._events.get_nowait()
+            except asyncio.QueueEmpty:
+                break
 
     async def aclose(self) -> None:
         if self._closed and self._task.done():
@@ -270,6 +306,7 @@ class AgentRuntimeManager:
         self.database = database
         self.runtime = runtime
         self.config = config
+        self.credential_cipher = CredentialCipher(config.data_root, config.master_key)
         self._queue = AsyncTaskQueue(
             max_concurrent=config.max_concurrent,
             max_pending=config.max_pending,
@@ -463,8 +500,17 @@ class AgentRuntimeManager:
             async for _ in stream:
                 pass
             return stream.result()
+        except asyncio.CancelledError:
+            # The compatibility non-streaming endpoint is still request-bound
+            # at the HTTP layer.  If that request is cancelled because the
+            # browser disconnected, preserve the Agent run just like the SSE
+            # endpoint does.  Explicit stop/archive paths call cancel_root
+            # directly and are unaffected.
+            stream.detach()
+            raise
         finally:
-            await stream.aclose()
+            if not stream.detached:
+                await stream.aclose()
 
     async def cancel_root(self, root_execution_id: str) -> None:
         await self.bus.cancel_root(root_execution_id)
@@ -534,7 +580,11 @@ class AgentRuntimeManager:
         selected = configs.get(provider_name)
         if selected is not None:
             data = selected.data
-            api_key = self.provider_credential(selected.name)
+            api_key = self.provider_credential(
+                selected.name,
+                selected.data,
+                credential_context=selected.id,
+            )
             standard = _STANDARD_PROVIDERS.get(selected.name, ("", "openai-compatible"))
             api_base = str(data.get("apiBase") or standard[0])
             api_type = str(data.get("apiType") or standard[1])
@@ -930,12 +980,23 @@ class AgentRuntimeManager:
         normalized = re.sub(r"[^A-Z0-9]+", "_", name.upper()).strip("_")
         return os.environ.get(f"FASTCLAW_PROVIDER_{normalized}_API_KEY", "")
 
-    def provider_credential(self, name: str) -> str:
+    def provider_credential(
+        self,
+        name: str,
+        data: Mapping[str, Any] | None = None,
+        *,
+        credential_context: str = "",
+    ) -> str:
         configured = self.provider_environment_key(name)
         if configured:
             return configured
         if name == self.config.default_provider_name:
-            return self.config.default_provider_api_key
+            configured = self.config.default_provider_api_key
+            if configured:
+                return configured
+        encrypted = str((data or {}).get("encryptedApiKey") or "")
+        if encrypted:
+            return self.credential_cipher.decrypt(encrypted, context=credential_context)
         return ""
 
     @staticmethod

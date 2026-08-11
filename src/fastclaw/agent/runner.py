@@ -15,6 +15,7 @@ from fastclaw.agent.models import AgentEvent, AgentEventType, AgentRunError, Age
 from fastclaw.agent.normalizer import normalize_messages
 from fastclaw.agent.persistence import SessionPersistence
 from fastclaw.execution import ExecutionContext, use_execution
+from fastclaw.observability import log_stage
 from fastclaw.providers import (
     ChatMessage,
     ChatRequest,
@@ -150,23 +151,57 @@ class AgentRunner:
                 for current_round in range(request.max_rounds):
                     round_index = current_round
                     current_stage = "provider_stream"
-                    provider_stream = self._provider.stream(
-                        ChatRequest(
-                            messages=tuple(history),
-                            model=request.model,
-                            tools=self._tools.definitions(request.allowed_tools),
-                            max_tokens=request.max_tokens,
-                            temperature=request.temperature,
-                            thinking_budget_tokens=request.thinking_budget_tokens,
-                        )
+                    provider_started_at = asyncio.get_running_loop().time()
+                    provider_name = request.model.split("/", 1)[0]
+                    log_stage(
+                        logger,
+                        "provider_started",
+                        context=context,
+                        provider=provider_name,
                     )
-                    async for provider_event in provider_stream:
-                        if provider_event.type is ProviderEventType.CONTENT_DELTA:
-                            yield event(
-                                AgentEventType.CONTENT_DELTA,
-                                content=provider_event.content,
+                    try:
+                        provider_stream = self._provider.stream(
+                            ChatRequest(
+                                messages=tuple(history),
+                                model=request.model,
+                                tools=self._tools.definitions(request.allowed_tools),
+                                max_tokens=request.max_tokens,
+                                temperature=request.temperature,
+                                thinking_budget_tokens=request.thinking_budget_tokens,
                             )
-                    response = provider_stream.result()
+                        )
+                        async for provider_event in provider_stream:
+                            if provider_event.type is ProviderEventType.CONTENT_DELTA:
+                                yield event(
+                                    AgentEventType.CONTENT_DELTA,
+                                    content=provider_event.content,
+                                )
+                        response = provider_stream.result()
+                    except BaseException as exc:
+                        log_stage(
+                            logger,
+                            "provider_finished",
+                            context=context,
+                            provider=provider_name,
+                            outcome=(
+                                "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
+                            ),
+                            duration_ms=int(
+                                (asyncio.get_running_loop().time() - provider_started_at) * 1000
+                            ),
+                            level=logging.WARNING,
+                        )
+                        raise
+                    log_stage(
+                        logger,
+                        "provider_finished",
+                        context=context,
+                        provider=provider_name,
+                        outcome="completed",
+                        duration_ms=int(
+                            (asyncio.get_running_loop().time() - provider_started_at) * 1000
+                        ),
+                    )
                     provider_stream = None
                     current_stage = "provider_response"
                     assistant = ChatMessage(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Iterable
 from typing import Any
@@ -10,6 +11,7 @@ from uuid import uuid4
 import anyio
 
 from fastclaw.execution import ExecutionContext
+from fastclaw.observability import log_stage
 from fastclaw.providers import ToolDefinition
 from fastclaw.tools.base import BatchTool, Tool, ToolResult
 
@@ -49,10 +51,31 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult(content=f"tool {name!r} is not registered", is_error=True)
+        started_at = asyncio.get_running_loop().time()
+        log_stage(logger, "tool_started", context=context, tool=name)
         try:
             with anyio.fail_after(timeout_seconds):
-                return await tool.execute(arguments, context)
+                result = await tool.execute(arguments, context)
+            log_stage(
+                logger,
+                "tool_finished",
+                context=context,
+                tool=name,
+                outcome="failed" if result.is_error else "completed",
+                duration_ms=int((asyncio.get_running_loop().time() - started_at) * 1000),
+                level=logging.WARNING if result.is_error else logging.INFO,
+            )
+            return result
         except TimeoutError:
+            log_stage(
+                logger,
+                "tool_finished",
+                context=context,
+                tool=name,
+                outcome="timed_out",
+                duration_ms=int((asyncio.get_running_loop().time() - started_at) * 1000),
+                level=logging.WARNING,
+            )
             logger.warning(
                 "tool %s timed out after %.1fs (root=%s agent=%s call_path=%s)",
                 name,
@@ -67,6 +90,15 @@ class ToolRegistry:
                 metadata={"errorCode": "timeout", "timeoutSeconds": timeout_seconds},
             )
         except Exception:
+            log_stage(
+                logger,
+                "tool_finished",
+                context=context,
+                tool=name,
+                outcome="failed",
+                duration_ms=int((asyncio.get_running_loop().time() - started_at) * 1000),
+                level=logging.ERROR,
+            )
             return self._unexpected_failure(name)
 
     def supports_batch(
@@ -92,6 +124,8 @@ class ToolRegistry:
             raise ValueError(f"tool {name!r} does not support batch execution")
         tool = self._tools[name]
         assert isinstance(tool, BatchTool)
+        started_at = asyncio.get_running_loop().time()
+        log_stage(logger, "tool_started", context=context, tool=name)
         try:
             with anyio.fail_after(timeout_seconds):
                 results = await tool.execute_many(arguments, context)
@@ -99,8 +133,27 @@ class ToolRegistry:
                 raise RuntimeError("batch tool returned an unexpected result count")
             if any(result.direct_return for result in results):
                 raise RuntimeError("batch tools cannot return direct responses")
+            has_error = any(result.is_error for result in results)
+            log_stage(
+                logger,
+                "tool_finished",
+                context=context,
+                tool=name,
+                outcome="failed" if has_error else "completed",
+                duration_ms=int((asyncio.get_running_loop().time() - started_at) * 1000),
+                level=logging.WARNING if has_error else logging.INFO,
+            )
             return results
         except TimeoutError:
+            log_stage(
+                logger,
+                "tool_finished",
+                context=context,
+                tool=name,
+                outcome="timed_out",
+                duration_ms=int((asyncio.get_running_loop().time() - started_at) * 1000),
+                level=logging.WARNING,
+            )
             logger.warning(
                 "batch tool %s timed out after %.1fs (root=%s agent=%s call_path=%s calls=%d)",
                 name,
@@ -119,6 +172,15 @@ class ToolRegistry:
                 for _ in arguments
             )
         except Exception:
+            log_stage(
+                logger,
+                "tool_finished",
+                context=context,
+                tool=name,
+                outcome="failed",
+                duration_ms=int((asyncio.get_running_loop().time() - started_at) * 1000),
+                level=logging.ERROR,
+            )
             failure = self._unexpected_failure(name)
             return tuple(failure for _ in arguments)
 

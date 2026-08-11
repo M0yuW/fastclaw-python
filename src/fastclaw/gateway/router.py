@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -410,20 +411,29 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                 )
             )
             if provider_name and payload.api_base:
+                provider_config_id = f"cfg_{secrets.token_hex(10)}"
+                provider_data = {
+                    "apiBase": payload.api_base,
+                    "apiType": payload.api_type,
+                    "authType": payload.auth_type,
+                    "model": model,
+                }
+                if payload.api_key:
+                    provider_data["encryptedApiKey"] = (
+                        gateway.agent_manager.credential_cipher.encrypt(
+                            payload.api_key,
+                            context=provider_config_id,
+                        )
+                    )
                 await store.save_config(
                     ConfigRecord(
-                        id=f"cfg_{secrets.token_hex(10)}",
+                        id=provider_config_id,
                         kind="provider",
                         scope="user",
                         scope_id=user_id,
                         user_id=user_id,
                         name=provider_name,
-                        data={
-                            "apiBase": payload.api_base,
-                            "apiType": payload.api_type,
-                            "authType": payload.auth_type,
-                            "model": model,
-                        },
+                        data=provider_data,
                         created_at=now,
                         updated_at=now,
                     )
@@ -451,7 +461,7 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             "ok": True,
             "userId": user_id,
             "agentId": agent_id,
-            "providerCredentialStored": False,
+            "providerCredentialStored": bool(payload.api_key),
         }
 
     @router.post("/api/onboard")
@@ -1030,15 +1040,39 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
     ) -> dict[str, Any]:
         agent = await service.require_agent(auth, agent_id)
         async with UnitOfWork(gateway.database) as unit:
-            raw = await unit.require_store().get_agent_file(agent.id, agent.user_id, "agent.json")
+            store = unit.require_store()
+            raw = await store.get_agent_file(agent.id, agent.user_id, "agent.json")
+            provider_configs = await store.list_configs(
+                kind="provider",
+                user_id=agent.user_id,
+                agent_id=agent.id,
+            )
+        config = dict(agent.config)
         if raw is not None:
             try:
                 parsed = json.loads(raw.data)
             except (UnicodeDecodeError, json.JSONDecodeError):
                 parsed = None
             if isinstance(parsed, dict):
-                return {**parsed, **agent.config}
-        return dict(agent.config)
+                config = {**parsed, **config}
+        config.pop("providers", None)
+        config["providers"] = {
+            item.name: {
+                "apiBase": str(item.data.get("apiBase") or ""),
+                "apiKey": mask_secret(
+                    gateway.agent_manager.provider_credential(
+                        item.name,
+                        item.data,
+                        credential_context=item.id,
+                    )
+                ),
+                "apiType": str(item.data.get("apiType") or "openai-compatible"),
+                "authType": str(item.data.get("authType") or "bearer-token"),
+                "models": item.data.get("models") or [],
+            }
+            for item in provider_configs
+        }
+        return config
 
     @router.put("/api/agents/{agent_id}")
     async def update_agent(
@@ -1046,6 +1080,7 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
     ) -> dict[str, Any]:
         agent = await require_mutable_agent(auth, agent_id)
         values = payload.model_dump(exclude_unset=True, by_alias=True)
+        provider_values = values.pop("providers", None)
         if _find_plaintext_credentials(values):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
@@ -1056,15 +1091,81 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         if not name:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "agent name is required")
         config = dict(agent.config)
+        config.pop("providers", None)
         if values.get("policy") == "custom":
             values.pop("policy")
             config.pop("policy", None)
         config.update(values)
-        updated = agent.model_copy(
-            update={"name": name, "config": config, "updated_at": datetime.now(UTC)}
-        )
+        now = datetime.now(UTC)
+        updated = agent.model_copy(update={"name": name, "config": config, "updated_at": now})
         async with UnitOfWork(gateway.database) as unit:
-            await unit.require_store().save_agent(updated)
+            store = unit.require_store()
+            if provider_values is not None:
+                existing_providers = {
+                    item.name: item
+                    for item in await store.list_configs(
+                        kind="provider",
+                        user_id=agent.user_id,
+                        agent_id=agent.id,
+                    )
+                }
+                requested_names = {str(provider_name) for provider_name in provider_values}
+                for removed_name in existing_providers.keys() - requested_names:
+                    await store.delete_config(existing_providers[removed_name].id)
+                allowed_provider_fields = {
+                    "apiBase",
+                    "apiKey",
+                    "apiType",
+                    "authType",
+                    "models",
+                }
+                for provider_name, raw_provider in provider_values.items():
+                    if not isinstance(raw_provider, dict):
+                        raise HTTPException(
+                            status.HTTP_400_BAD_REQUEST,
+                            "provider configuration must be an object",
+                        )
+                    unexpected = set(raw_provider) - allowed_provider_fields
+                    if unexpected:
+                        raise HTTPException(
+                            status.HTTP_400_BAD_REQUEST,
+                            "unsupported provider configuration fields",
+                        )
+                    existing = existing_providers.get(str(provider_name))
+                    config_id = (
+                        existing.id if existing is not None else f"cfg_{secrets.token_hex(10)}"
+                    )
+                    requested_key = str(raw_provider.get("apiKey") or "")
+                    provider_data: dict[str, Any] = {
+                        "apiBase": str(raw_provider.get("apiBase") or ""),
+                        "apiType": str(raw_provider.get("apiType") or "openai-compatible"),
+                        "authType": str(raw_provider.get("authType") or "bearer-token"),
+                        "models": raw_provider.get("models") or [],
+                    }
+                    if requested_key and "****" not in requested_key:
+                        provider_data["encryptedApiKey"] = (
+                            gateway.agent_manager.credential_cipher.encrypt(
+                                requested_key,
+                                context=config_id,
+                            )
+                        )
+                    elif existing is not None and existing.data.get("encryptedApiKey"):
+                        provider_data["encryptedApiKey"] = existing.data["encryptedApiKey"]
+                    await store.save_config(
+                        ConfigRecord(
+                            id=config_id,
+                            kind="provider",
+                            scope="agent",
+                            scope_id=agent.id,
+                            user_id=agent.user_id,
+                            agent_id=agent.id,
+                            name=str(provider_name),
+                            data=provider_data,
+                            created_at=existing.created_at if existing is not None else now,
+                            updated_at=now,
+                        )
+                    )
+            await store.save_agent(updated)
         resolved = (await service.agent_runtime_profile(updated)).agent
         return {"ok": True, "agent": _agent_json(resolved)}
 
@@ -1361,7 +1462,13 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                     "apiBase": str(item.data.get("apiBase") or ""),
                     "apiType": str(item.data.get("apiType") or "openai-compatible"),
                     "authType": str(item.data.get("authType") or "bearer-token"),
-                    "apiKey": mask_secret(gateway.agent_manager.provider_credential(item.name)),
+                    "apiKey": mask_secret(
+                        gateway.agent_manager.provider_credential(
+                            item.name,
+                            item.data,
+                            credential_context=item.id,
+                        )
+                    ),
                     "models": item.data.get("models") or [],
                     "updatedAt": item.updated_at.isoformat(),
                 }
@@ -1375,11 +1482,6 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
     ) -> dict[str, Any]:
         if auth.identity.read_only or auth.identity.auth_method == "apikey":
             raise HTTPException(status.HTTP_403_FORBIDDEN, "credential is read-only")
-        if payload.api_key:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST,
-                f"set FASTCLAW_PROVIDER_{payload.name.upper().replace('-', '_')}_API_KEY instead",
-            )
         if payload.scope == "system":
             if auth.identity.role != "super_admin":
                 raise HTTPException(status.HTTP_403_FORBIDDEN, "admin required")
@@ -1397,20 +1499,29 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             existing = await store.find_config(
                 kind="provider", scope=payload.scope, scope_id=scope_id, name=payload.name
             )
+        record_id = existing.id if existing is not None else f"cfg_{secrets.token_hex(10)}"
+        provider_data: dict[str, Any] = {
+            "apiBase": payload.api_base,
+            "apiType": payload.api_type,
+            "authType": payload.auth_type,
+            "models": payload.models,
+        }
+        if payload.api_key:
+            provider_data["encryptedApiKey"] = gateway.agent_manager.credential_cipher.encrypt(
+                payload.api_key,
+                context=record_id,
+            )
+        elif existing is not None and existing.data.get("encryptedApiKey"):
+            provider_data["encryptedApiKey"] = existing.data["encryptedApiKey"]
         record = ConfigRecord(
-            id=existing.id if existing is not None else f"cfg_{secrets.token_hex(10)}",
+            id=record_id,
             kind="provider",
             scope=payload.scope,
             scope_id=scope_id,
             user_id=auth.identity.effective_user_id,
             agent_id=scope_id if payload.scope == "agent" else "",
             name=payload.name,
-            data={
-                "apiBase": payload.api_base,
-                "apiType": payload.api_type,
-                "authType": payload.auth_type,
-                "models": payload.models,
-            },
+            data=provider_data,
             created_at=existing.created_at if existing is not None else now,
             updated_at=now,
         )
@@ -1452,9 +1563,9 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         data.pop("apiKey", None)
         requested_key = str(patch.pop("apiKey", ""))
         if requested_key and "****" not in requested_key:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST,
-                f"set FASTCLAW_PROVIDER_{record.name.upper().replace('-', '_')}_API_KEY instead",
+            data["encryptedApiKey"] = gateway.agent_manager.credential_cipher.encrypt(
+                requested_key,
+                context=record.id,
             )
         data.update(patch)
         updated = record.model_copy(
@@ -1514,7 +1625,11 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         return await run_provider_test(
             name=record.name,
             api_base=str(record.data.get("apiBase") or ""),
-            api_key=gateway.agent_manager.provider_credential(record.name),
+            api_key=gateway.agent_manager.provider_credential(
+                record.name,
+                record.data,
+                credential_context=record.id,
+            ),
             api_type=str(record.data.get("apiType") or "openai-compatible"),
             model=payload.model,
         )
@@ -1524,7 +1639,13 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         records = await provider_records(auth)
         providers = {
             item.name: {
-                "apiKey": mask_secret(gateway.agent_manager.provider_credential(item.name)),
+                "apiKey": mask_secret(
+                    gateway.agent_manager.provider_credential(
+                        item.name,
+                        item.data,
+                        credential_context=item.id,
+                    )
+                ),
                 "apiBase": str(item.data.get("apiBase") or ""),
                 "apiType": str(item.data.get("apiType") or "openai-compatible"),
                 "authType": str(item.data.get("authType") or "bearer-token"),
@@ -1991,7 +2112,10 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                 async for event in stream:
                     yield _sse(_web_event(event))
             finally:
-                await stream.aclose()
+                # The browser owns only this SSE presentation channel.  A
+                # refresh or network disconnect must not cancel the Agent
+                # execution that is already running in the manager.
+                stream.detach()
 
         return StreamingResponse(events(), media_type="text/event-stream")
 
@@ -2060,15 +2184,21 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                             )
                     yield "data: [DONE]\n\n"
                 finally:
-                    await stream.aclose()
+                    stream.detach()
 
             return StreamingResponse(chunks(), media_type="text/event-stream")
         try:
             async for _ in stream:
                 pass
             result = stream.result()
+        except asyncio.CancelledError:
+            # A disconnected compatibility request must not cancel the
+            # execution that the manager has already started.
+            stream.detach()
+            raise
         finally:
-            await stream.aclose()
+            if not stream.detached:
+                await stream.aclose()
         return JSONResponse(
             {
                 "id": completion_id,

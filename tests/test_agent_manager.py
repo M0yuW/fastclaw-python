@@ -113,6 +113,31 @@ class BlockingProvider(CoordinatingProvider):
         return ProviderStream(events())
 
 
+class ResumableProvider(CoordinatingProvider):
+    """Provider fixture that can finish after its HTTP consumer detaches."""
+
+    def __init__(self) -> None:
+        super().__init__("")
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.finished = asyncio.Event()
+
+    def stream(self, request: ChatRequest) -> ProviderStream:
+        self.requests.append(request)
+
+        async def events() -> AsyncIterator[ProviderEvent]:
+            try:
+                self.started.set()
+                yield ProviderEvent(type=ProviderEventType.CONTENT_DELTA, content="partial")
+                await self.release.wait()
+                yield ProviderEvent(type=ProviderEventType.CONTENT_DELTA, content="completed")
+                yield ProviderEvent(type=ProviderEventType.DONE, finish_reason="stop")
+            finally:
+                self.finished.set()
+
+        return ProviderStream(events())
+
+
 async def build_manager(
     path: Path,
     provider: CoordinatingProvider,
@@ -414,6 +439,95 @@ async def test_closing_root_stream_cancels_provider_and_does_not_persist_partial
         async with UnitOfWork(database) as unit:
             stored = await unit.require_store().get_session("user-1", agent.id, "cancelled")
         assert stored is None
+    finally:
+        await close_manager(manager, runtime, database)
+
+
+async def test_detaching_root_stream_keeps_agent_running_and_persists_final_session(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    agent = AgentRecord(
+        id="resumable",
+        user_id="user-1",
+        name="Resumable",
+        config={"model": "fixture/resumable", "policy": "no-tools"},
+        created_at=now,
+        updated_at=now,
+    )
+    provider = ResumableProvider()
+    manager, runtime, database = await build_manager(tmp_path / "detach.db", provider, (agent,))
+    try:
+        stream = await manager.stream(
+            user_id="user-1",
+            agent_id=agent.id,
+            session_id="detached",
+            message="continue after refresh",
+        )
+        assert (await anext(stream)).content == "partial"
+
+        stream.detach()
+        provider.release.set()
+        await asyncio.wait_for(provider.finished.wait(), timeout=1)
+
+        stored = None
+        for _ in range(100):
+            async with UnitOfWork(database) as unit:
+                stored = await unit.require_store().get_session("user-1", agent.id, "detached")
+            if stored is not None:
+                break
+            await asyncio.sleep(0.01)
+
+        assert stored is not None
+        assert stored.messages[-1]["role"] == "assistant"
+        assert stored.messages[-1]["content"] == "partialcompleted"
+    finally:
+        await close_manager(manager, runtime, database)
+
+
+async def test_cancelled_non_stream_chat_detaches_instead_of_cancelling_agent(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    agent = AgentRecord(
+        id="resumable-chat",
+        user_id="user-1",
+        name="Resumable chat",
+        config={"model": "fixture/resumable", "policy": "no-tools"},
+        created_at=now,
+        updated_at=now,
+    )
+    provider = ResumableProvider()
+    manager, runtime, database = await build_manager(
+        tmp_path / "detach-chat.db", provider, (agent,)
+    )
+    try:
+        request = asyncio.create_task(
+            manager.chat(
+                user_id="user-1",
+                agent_id=agent.id,
+                session_id="detached-chat",
+                message="continue after request cancellation",
+            )
+        )
+        await asyncio.wait_for(provider.started.wait(), timeout=1)
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+        provider.release.set()
+        await asyncio.wait_for(provider.finished.wait(), timeout=1)
+
+        stored = None
+        for _ in range(100):
+            async with UnitOfWork(database) as unit:
+                stored = await unit.require_store().get_session("user-1", agent.id, "detached-chat")
+            if stored is not None:
+                break
+            await asyncio.sleep(0.01)
+
+        assert stored is not None
+        assert stored.messages[-1]["content"] == "partialcompleted"
     finally:
         await close_manager(manager, runtime, database)
 
