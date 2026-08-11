@@ -9,12 +9,13 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True, slots=True)
 class FootballCompetition:
-    """A product-facing competition with a verified ESPN site slug."""
+    """A product-facing competition with reviewed provider identities."""
 
     key: str
     name: str
     country: str
     espn_slug: str
+    odds_sport_key: str
     aliases: tuple[str, ...]
 
     def public_mapping(self) -> dict[str, str]:
@@ -35,6 +36,7 @@ FOOTBALL_COMPETITIONS: tuple[FootballCompetition, ...] = (
         "FIFA World Cup",
         "Worldwide",
         "fifa.world",
+        "soccer_fifa_world_cup",
         ("World Cup", "世界杯", "世界杯足球赛", "FIFA世界杯"),
     ),
     FootballCompetition(
@@ -42,6 +44,7 @@ FOOTBALL_COMPETITIONS: tuple[FootballCompetition, ...] = (
         "UEFA Champions League",
         "Europe",
         "uefa.champions",
+        "soccer_uefa_champs_league",
         ("Champions League", "UCL", "欧冠", "欧洲冠军联赛"),
     ),
     FootballCompetition(
@@ -49,6 +52,7 @@ FOOTBALL_COMPETITIONS: tuple[FootballCompetition, ...] = (
         "UEFA Europa League",
         "Europe",
         "uefa.europa",
+        "soccer_uefa_europa_league",
         ("Europa League", "UEL", "欧联", "欧联杯", "欧洲联赛"),
     ),
     FootballCompetition(
@@ -56,6 +60,7 @@ FOOTBALL_COMPETITIONS: tuple[FootballCompetition, ...] = (
         "English Premier League",
         "England",
         "eng.1",
+        "soccer_epl",
         ("Premier League", "EPL", "英超", "英格兰超级联赛"),
     ),
     FootballCompetition(
@@ -63,6 +68,7 @@ FOOTBALL_COMPETITIONS: tuple[FootballCompetition, ...] = (
         "Spanish LALIGA",
         "Spain",
         "esp.1",
+        "soccer_spain_la_liga",
         ("La Liga", "LALIGA", "西甲", "西班牙甲级联赛"),
     ),
     FootballCompetition(
@@ -70,6 +76,7 @@ FOOTBALL_COMPETITIONS: tuple[FootballCompetition, ...] = (
         "German Bundesliga",
         "Germany",
         "ger.1",
+        "soccer_germany_bundesliga",
         ("Bundesliga", "德甲", "德国甲级联赛"),
     ),
     FootballCompetition(
@@ -77,6 +84,7 @@ FOOTBALL_COMPETITIONS: tuple[FootballCompetition, ...] = (
         "Italian Serie A",
         "Italy",
         "ita.1",
+        "soccer_italy_serie_a",
         ("Serie A", "意甲", "意大利甲级联赛"),
     ),
     FootballCompetition(
@@ -84,6 +92,7 @@ FOOTBALL_COMPETITIONS: tuple[FootballCompetition, ...] = (
         "French Ligue 1",
         "France",
         "fra.1",
+        "soccer_france_ligue_one",
         ("Ligue 1", "法甲", "法国甲级联赛"),
     ),
     FootballCompetition(
@@ -91,6 +100,7 @@ FOOTBALL_COMPETITIONS: tuple[FootballCompetition, ...] = (
         "Dutch Eredivisie",
         "Netherlands",
         "ned.1",
+        "soccer_netherlands_eredivisie",
         ("Eredivisie", "荷甲", "荷兰甲级联赛"),
     ),
     FootballCompetition(
@@ -98,6 +108,7 @@ FOOTBALL_COMPETITIONS: tuple[FootballCompetition, ...] = (
         "Portuguese Primeira Liga",
         "Portugal",
         "por.1",
+        "soccer_portugal_primeira_liga",
         ("Primeira Liga", "Liga Portugal", "葡超", "葡萄牙超级联赛"),
     ),
     FootballCompetition(
@@ -105,6 +116,7 @@ FOOTBALL_COMPETITIONS: tuple[FootballCompetition, ...] = (
         "Swedish Allsvenskan",
         "Sweden",
         "swe.1",
+        "soccer_sweden_allsvenskan",
         ("Allsvenskan", "瑞典超", "瑞典超级联赛"),
     ),
     FootballCompetition(
@@ -112,6 +124,7 @@ FOOTBALL_COMPETITIONS: tuple[FootballCompetition, ...] = (
         "Norwegian Eliteserien",
         "Norway",
         "nor.1",
+        "soccer_norway_eliteserien",
         ("Eliteserien", "挪超", "挪威超级联赛"),
     ),
     FootballCompetition(
@@ -119,6 +132,7 @@ FOOTBALL_COMPETITIONS: tuple[FootballCompetition, ...] = (
         "Major League Soccer",
         "United States",
         "usa.1",
+        "soccer_usa_mls",
         ("MLS", "美职联", "美国职业足球大联盟"),
     ),
 )

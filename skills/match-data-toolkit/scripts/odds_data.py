@@ -1,185 +1,211 @@
 #!/usr/bin/env python3
-"""
-World Cup Odds Fetcher (The Odds API)
-=====================================
-Fetch FIFA World Cup match odds (1X2 / over-under) from The Odds API.
-Used as the *second* layer behind web_search — call this only when web
-search can't supply odds or when precise implied probabilities are needed.
-Free tier is quota-limited (500 req), so every response echoes the
-remaining quota and the script never loops over many requests.
+"""Constrained The Odds API client for reviewed football competitions."""
 
-Key is read from the ODDS_API_KEY environment variable (never hardcoded,
-so this script is safe to commit).
-
-Usage:
-    ODDS_API_KEY=xxx python3 odds_data.py --list
-    ODDS_API_KEY=xxx python3 odds_data.py --match "France" "Sweden"
-
-Output is JSON to stdout; errors to stderr. On failure/empty it returns
-{"error": ..., "note": "fall back to web_search"} so the agent degrades.
-"""
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
-import json
+import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from common.utils import output_json, error_exit
+from common.football_competitions import COMPETITIONS, resolve_competition
+from common.utils import output_json
 
-SPORT = "soccer_fifa_world_cup"
 BASE = "https://api.the-odds-api.com/v4"
-REGIONS = "eu"          # eu/uk give 1X2 broadly; au lacks spreads
-MARKETS = "h2h,totals"  # 1X2 + over/under; spreads (handicap) intentionally omitted
-BJ = timezone(timedelta(hours=8))
+MAX_BYTES = 2_000_000
+ALLOWED_REGIONS = frozenset({"us", "uk", "eu", "au"})
+ALLOWED_MARKETS = frozenset({"h2h", "totals"})
+ALLOWED_FORMATS = frozenset({"decimal", "american"})
 
 
-def _key() -> str:
-    k = os.environ.get("ODDS_API_KEY", "").strip()
-    if not k:
-        error_exit("ODDS_API_KEY env var not set")
-    return k
+def _status(
+    state: str,
+    *,
+    error_code: str | None = None,
+    safe_reason: str | None = None,
+    data: object = None,
+    quota: dict[str, str | None] | None = None,
+) -> dict:
+    result = {
+        "source": "the_odds_api",
+        "status": state,
+        "as_of": datetime.now(timezone.utc).isoformat(),
+    }
+    if error_code:
+        result["error_code"] = error_code
+    if safe_reason:
+        result["safe_reason"] = safe_reason
+    if data is not None:
+        result["data"] = data
+    if quota is not None:
+        result["quota"] = quota
+    return result
 
 
-def _get(path: str, params: dict):
-    """GET an Odds API endpoint; return (parsed_json, remaining_quota)."""
-    params = dict(params, apiKey=_key())
-    url = f"{BASE}/{path}?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": "wc-odds/1.0"})
-    with urllib.request.urlopen(req, timeout=25) as r:
-        remaining = r.headers.get("x-requests-remaining")
-        return json.loads(r.read().decode("utf-8")), remaining
+def _request(path: str, params: dict[str, str], api_key: str) -> tuple[object, dict]:
+    query = urllib.parse.urlencode({**params, "apiKey": api_key})
+    request = urllib.request.Request(
+        f"{BASE}/{path.lstrip('/')}?{query}",
+        headers={"Accept": "application/json", "User-Agent": "fastclaw-football/1.0"},
+    )
+    with urllib.request.urlopen(request, timeout=25) as response:
+        body = response.read(MAX_BYTES + 1)
+        if len(body) > MAX_BYTES:
+            raise ValueError("response_too_large")
+        quota = {
+            "requests_remaining": response.headers.get("x-requests-remaining"),
+            "requests_used": response.headers.get("x-requests-used"),
+            "requests_last": response.headers.get("x-requests-last"),
+        }
+        return json.loads(body.decode("utf-8")), quota
 
 
-def _bj(iso: str) -> str:
+def fetch_odds(
+    competition_name: str,
+    *,
+    regions: tuple[str, ...] = ("eu",),
+    markets: tuple[str, ...] = ("h2h", "totals"),
+    odds_format: str = "decimal",
+    commence_from: str = "",
+    commence_to: str = "",
+) -> dict:
+    mapping = resolve_competition(competition_name)
+    if mapping is None:
+        return _status(
+            "rejected",
+            error_code="competition_not_reviewed",
+            safe_reason="Competition is not in the reviewed provider catalog",
+        )
+    if not set(regions).issubset(ALLOWED_REGIONS) or not regions:
+        return _status("rejected", error_code="regions_rejected", safe_reason="Unsupported region")
+    if not set(markets).issubset(ALLOWED_MARKETS) or not markets:
+        return _status("rejected", error_code="markets_rejected", safe_reason="Unsupported market")
+    if odds_format not in ALLOWED_FORMATS:
+        return _status(
+            "rejected", error_code="odds_format_rejected", safe_reason="Unsupported odds format"
+        )
+    for value in (commence_from, commence_to):
+        if value:
+            try:
+                datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return _status(
+                    "rejected",
+                    error_code="time_window_rejected",
+                    safe_reason="Commencement window must use ISO-8601 timestamps",
+                )
+    api_key = os.environ.get("ODDS_API_KEY", "").strip()
+    if not api_key:
+        return _status(
+            "unavailable",
+            error_code="odds_key_missing",
+            safe_reason="The Odds API is not configured; query current Sporttery fixtures",
+        )
     try:
-        dt = datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(BJ)
-        return dt.strftime("%Y-%m-%d %H:%M (北京时间)")
-    except Exception:
-        return iso
+        catalog, catalog_quota = _request("sports", {}, api_key)
+        if not isinstance(catalog, list):
+            return _status(
+                "rejected",
+                error_code="catalog_unexpected_payload",
+                safe_reason="The sports catalog response was not recognized",
+                quota=catalog_quota,
+            )
+        available = {
+            str(item.get("key"))
+            for item in catalog
+            if isinstance(item, dict) and item.get("active") is not False
+        }
+        sport_key = mapping["odds_sport_key"]
+        if sport_key not in available:
+            return _status(
+                "rejected",
+                error_code="odds_sport_not_in_catalog",
+                safe_reason="The reviewed competition is not in the current sports catalog",
+                quota=catalog_quota,
+            )
+        params = {
+            "regions": ",".join(regions),
+            "markets": ",".join(markets),
+            "oddsFormat": odds_format,
+        }
+        if commence_from:
+            params["commenceTimeFrom"] = commence_from
+        if commence_to:
+            params["commenceTimeTo"] = commence_to
+        games, quota = _request(f"sports/{sport_key}/odds", params, api_key)
+        if not isinstance(games, list):
+            return _status(
+                "rejected",
+                error_code="odds_unexpected_payload",
+                safe_reason="The odds response was not recognized",
+                quota=quota,
+            )
+        return _status("success" if games else "empty", data=games, quota=quota)
+    except (urllib.error.URLError, TimeoutError):
+        return _status(
+            "unavailable",
+            error_code="odds_request_failed",
+            safe_reason="The Odds API request did not complete; query current Sporttery fixtures",
+        )
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _status(
+            "rejected",
+            error_code="odds_malformed_json",
+            safe_reason="The Odds API returned malformed JSON",
+        )
+    except ValueError:
+        return _status(
+            "rejected",
+            error_code="odds_response_rejected",
+            safe_reason="The Odds API response exceeded a safety constraint",
+        )
 
 
-def _implied(price):
-    """Decimal odds -> implied probability (raw, not vig-adjusted)."""
-    try:
-        return round(1.0 / float(price), 4)
-    except Exception:
-        return None
-
-
-def _consensus(games: list, want_home: str | None = None,
-               want_away: str | None = None) -> list:
-    """Reduce raw bookmaker data to a per-match consensus (averaged 1X2 +
-    implied probabilities + a sample over/under). Optionally filter to one
-    match by team-name substring."""
-    out = []
-    for g in games:
-        home, away = g.get("home_team", ""), g.get("away_team", "")
-        if want_home and want_home.lower() not in (home + away).lower():
-            continue
-        if want_away and want_away.lower() not in (home + away).lower():
-            continue
-        h2h_prices = {"home": [], "away": [], "draw": []}
-        ou_sample = None
-        for b in g.get("bookmakers") or []:
-            for m in b.get("markets") or []:
-                if m.get("key") == "h2h":
-                    for o in m.get("outcomes") or []:
-                        n = o.get("name")
-                        if n == home:
-                            h2h_prices["home"].append(o.get("price"))
-                        elif n == away:
-                            h2h_prices["away"].append(o.get("price"))
-                        elif n == "Draw":
-                            h2h_prices["draw"].append(o.get("price"))
-                elif m.get("key") == "totals" and ou_sample is None:
-                    ou_sample = {o.get("name"): {"point": o.get("point"),
-                                                 "price": o.get("price")}
-                                 for o in (m.get("outcomes") or [])}
-
-        def avg(xs):
-            xs = [float(x) for x in xs if x]
-            return round(sum(xs) / len(xs), 3) if xs else None
-
-        ah, aa, ad = avg(h2h_prices["home"]), avg(h2h_prices["away"]), avg(h2h_prices["draw"])
-        out.append({
-            "match": f"{home} vs {away}",
-            "home": home, "away": away,
-            "kickoff_bj": _bj(g.get("commence_time", "")),
-            "bookmaker_count": len(g.get("bookmakers") or []),
-            "avg_odds": {"home": ah, "draw": ad, "away": aa},
-            "implied_prob": {"home": _implied(ah), "draw": _implied(ad),
-                             "away": _implied(aa)},
-            "over_under_sample": ou_sample,
-        })
-    return out
-
-
-def fetch_list() -> dict:
-    """List upcoming World Cup matches with quota info (cheap recon)."""
-    try:
-        games, remaining = _get(f"sports/{SPORT}/odds/",
-                                {"regions": REGIONS, "markets": "h2h",
-                                 "oddsFormat": "decimal"})
-    except Exception as e:
-        return {"matches": [], "error": str(e),
-                "note": "odds list failed; fall back to web_search"}
-    if isinstance(games, dict):
-        return {"matches": [], "error": games.get("message"),
-                "note": "fall back to web_search"}
-    rows = [{"match": f'{g.get("home_team")} vs {g.get("away_team")}',
-             "kickoff_bj": _bj(g.get("commence_time", ""))} for g in games]
-    return {"requests_remaining": remaining, "count": len(rows), "matches": rows}
-
-
-def fetch_match(team_a: str, team_b: str) -> dict:
-    """Odds + implied probabilities for a single match."""
-    try:
-        games, remaining = _get(f"sports/{SPORT}/odds/",
-                                {"regions": REGIONS, "markets": MARKETS,
-                                 "oddsFormat": "decimal"})
-    except Exception as e:
-        return {"match": f"{team_a} vs {team_b}", "error": str(e),
-                "note": "odds fetch failed; fall back to web_search"}
-    if isinstance(games, dict):
-        return {"error": games.get("message"), "note": "fall back to web_search"}
-    rows = _consensus(games, want_home=team_a, want_away=team_b)
-    if not rows:
-        return {"requests_remaining": remaining,
-                "match": f"{team_a} vs {team_b}", "odds": [],
-                "note": "no matching fixture in odds feed; fall back to web_search"}
-    return {"requests_remaining": remaining, "as_of": _bj(
-        datetime.now(timezone.utc).isoformat()), "odds": rows}
-
-
-def main():
-    p = argparse.ArgumentParser(
-        description="World Cup Odds Fetcher (The Odds API; web_search first)")
-    p.add_argument("teams", nargs="*", help="two team names for --match")
-    p.add_argument("--list", action="store_true",
-                   help="list fixtures + remaining quota (1 request)")
-    p.add_argument("--match", action="store_true",
-                   help="odds + implied prob for one match (1 request)")
-    args = p.parse_args()
-
-    try:
-        if args.list:
-            data = fetch_list()
-        elif args.match:
-            if len(args.teams) < 2:
-                error_exit("--match requires two team names")
-            data = fetch_match(args.teams[0], args.teams[1])
-        else:
-            error_exit("Specify --list or --match A B")
-            return
-        output_json(data)
-    except Exception as e:
-        error_exit(f"Error fetching odds: {e}")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Reviewed football odds source")
+    parser.add_argument("--competition")
+    parser.add_argument("--regions", default="eu")
+    parser.add_argument("--markets", default="h2h,totals")
+    parser.add_argument("--odds-format", default="decimal", choices=sorted(ALLOWED_FORMATS))
+    parser.add_argument("--commence-from", default="")
+    parser.add_argument("--commence-to", default="")
+    parser.add_argument("--list-competitions", action="store_true")
+    args = parser.parse_args()
+    if args.list_competitions:
+        output_json(
+            {
+                "competitions": [
+                    {"competition": name, "country": country}
+                    for name, country, _espn, _odds, _aliases in COMPETITIONS
+                ]
+            }
+        )
+        return
+    if not args.competition:
+        output_json(
+            _status(
+                "rejected",
+                error_code="competition_required",
+                safe_reason="--competition is required",
+            )
+        )
+        return
+    output_json(
+        fetch_odds(
+            args.competition,
+            regions=tuple(filter(None, args.regions.split(","))),
+            markets=tuple(filter(None, args.markets.split(","))),
+            odds_format=args.odds_format,
+            commence_from=args.commence_from,
+            commence_to=args.commence_to,
+        )
+    )
 
 
 if __name__ == "__main__":
