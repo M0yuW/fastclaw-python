@@ -13,6 +13,7 @@ from fastclaw.agent.manager import (
     AgentRuntimeConfig,
     AgentRuntimeManager,
     AgentRuntimeProfile,
+    _explicit_ev_request,
 )
 from fastclaw.agent.models import AgentRunError
 from fastclaw.execution import ExecutionContext
@@ -94,6 +95,11 @@ class CoordinatingProvider:
             yield ProviderEvent(type=ProviderEventType.DONE, finish_reason="tool_calls")
 
         return ProviderStream(events())
+
+
+def test_ev_dispatch_requires_explicit_market_intent() -> None:
+    assert not _explicit_ev_request("分析这两场比赛的基本面和战术")
+    assert _explicit_ev_request("请补充赔率、EV 和 Sporttery 价格")
 
 
 def test_existing_football_specialists_fail_closed_when_config_lacks_policy() -> None:
@@ -475,8 +481,15 @@ async def test_closing_root_stream_cancels_provider_and_does_not_persist_partial
             message="start",
         )
         assert (await anext(stream)).content == "partial"
+        assert (
+            await manager.cancel_session_roots(
+                user_id="user-1", agent_id=agent.id, session_id="cancelled"
+            )
+            == 1
+        )
         await stream.aclose()
         await asyncio.wait_for(provider.closed.wait(), timeout=1)
+        assert not manager._session_roots
         async with UnitOfWork(database) as unit:
             stored = await unit.require_store().get_session("user-1", agent.id, "cancelled")
         assert stored is None

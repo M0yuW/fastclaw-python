@@ -298,11 +298,13 @@ class WebFetchTool:
         max_bytes: int = 1_000_000,
         max_redirects: int = 5,
         resolver: HostResolver | None = None,
+        blocked_hosts: frozenset[str] = frozenset(),
     ) -> None:
         self._client = client
         self._max_bytes = max_bytes
         self._max_redirects = max_redirects
         self._resolver = resolver or self._resolve_host
+        self._blocked_hosts = frozenset(host.casefold().strip(".") for host in blocked_hosts)
         self.definition = ToolDefinition(
             function=ToolFunction(
                 name="web_fetch",
@@ -351,6 +353,12 @@ class WebFetchTool:
             return None, "URL credentials are denied"
         if parsed.hostname is None:
             return None, "URL host is required"
+        hostname = parsed.hostname.casefold().strip(".")
+        if any(
+            hostname == blocked or hostname.endswith(f".{blocked}")
+            for blocked in self._blocked_hosts
+        ):
+            return None, "URL host is denied for this Agent role"
         try:
             port = parsed.port or (443 if parsed.scheme == "https" else 80)
         except ValueError:

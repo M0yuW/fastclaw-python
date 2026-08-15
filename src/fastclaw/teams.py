@@ -124,7 +124,10 @@ WORLD_CUP_ANALYSIS = TeamTemplate(
             "Data analyst",
             "specialist",
             soul=(
-                "Analyze match data and state the date, source, and limits of every factual claim."
+                "Analyze schedule, results, standings, recent form, and confirmed match facts. "
+                "Use match-data-toolkit and ESPN-supported data sources, and state the date, "
+                "source, and limits of every factual claim. Do not use Sporttery, betting odds, "
+                "or market prices; if a fact is unavailable, mark it unknown."
             ),
             skills=("match-data-toolkit",),
             allowed_tools=("exec", "web_fetch"),
@@ -142,8 +145,10 @@ WORLD_CUP_ANALYSIS = TeamTemplate(
             "Odds analyst",
             "specialist",
             soul=(
-                "Analyze odds, implied probabilities, and uncertainty without presenting "
-                "betting advice."
+                "Analyze timestamped bookmaker or exchange odds, implied probabilities, and "
+                "uncertainty without presenting betting advice. Use web sources or "
+                "odds_data.py from match-data-toolkit. Do not call Sporttery or use its "
+                "getMatchCalculatorV1 endpoint."
             ),
             skills=("match-data-toolkit",),
             allowed_tools=("exec", "web_fetch"),
@@ -171,7 +176,13 @@ WORLD_CUP_ANALYSIS = TeamTemplate(
             "ev-analyst",
             "EV analyst",
             "specialist",
-            soul="Assess expected-value assumptions and sensitivity; never claim certainty.",
+            soul=(
+                "Assess expected-value assumptions and sensitivity; never claim certainty. "
+                "You are the only analyst role permitted to use Sporttery. Use "
+                "match-data-toolkit/scripts/sporttery_data.py for official SP prices and "
+                "compare them with the coordinator's model probabilities. Do not give stake "
+                "advice."
+            ),
             skills=("match-data-toolkit",),
             allowed_tools=("exec", "web_fetch"),
         ),
@@ -196,7 +207,11 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "competition or season, keep predictions conditional, and never invent live "
                 "facts. If every required tool fails, stop and report that no evidence-backed "
                 "prediction is available; never substitute model memory. Record predictions with "
-                "football_ledger only after reconciling all specialist results."
+                "football_ledger only after reconciling all specialist results. For football "
+                "teams, delegate the data analyst first and wait for its confirmed base evidence; "
+                "only then delegate tactics, odds, history, and risk with that evidence. EV is "
+                "optional: do not delegate it unless the original user explicitly requests "
+                "odds, market prices, betting, Sporttery, EV, expected value, or sensitivity."
             ),
             allowed_tools=("spawn_subagent", "football_ledger"),
             delegation_timeout_seconds=120,
@@ -210,13 +225,13 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
             soul=(
                 "Verify the exact competition, season, stage, fixture identity, kickoff time, "
                 "venue, score state, standings, and recent form. Use dated primary or reputable "
-                "sources. Use football_data evidence so TheSportsDB confirms the fixture before "
-                "ESPN supplements it; never provide a URL, league ID, slug, sport key, or API "
-                "key. Never mix "
+                "sources. Use football_data base_evidence so TheSportsDB confirms the fixture "
+                "and base data once; never provide a URL, league ID, slug, sport key, or API "
+                "key. Do not use Sporttery or betting-market data. Never mix "
                 "competitions or seasons, and mark unavailable data unknown. "
                 "Return as_of, competition, season, match, lean, confidence, evidence, and URLs."
             ),
-            allowed_tools=("football_data", "web_fetch"),
+            allowed_tools=("football_data", "football_context"),
             max_failed_tool_rounds=1,
         ),
         TeamRole(
@@ -225,10 +240,12 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
             "specialist",
             soul=(
                 "Analyze formations, matchup mechanisms, lineup availability, rotation, and the "
-                "competition format. Separate confirmed lineup or injury facts from tactical "
-                "inference, cite dated sources, and account for two-leg or extra-time rules."
+                "competition format. Read football_context first and reuse its confirmed fixture "
+                "and base evidence. Do not open arbitrary web pages or re-query TheSportsDB; "
+                "if lineup or injury evidence is absent, mark it unknown. Separate confirmed "
+                "facts from tactical inference and account for two-leg or extra-time rules."
             ),
-            allowed_tools=("football_data", "web_fetch"),
+            allowed_tools=("football_context",),
             max_failed_tool_rounds=1,
         ),
         TeamRole(
@@ -239,10 +256,11 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "Analyze timestamped 1X2 and totals prices only for the requested fixture and "
                 "competition. State bookmaker or market source, remove vig when possible, expose "
                 "missing coverage, and provide price calibration rather than betting advice. "
-                "Use the evidence action's independent Odds API/Sporttery result and do not let "
-                "odds redefine the primary fixture."
+                "Read football_context first, then use football_odds for the independent Odds "
+                "API market request. Do not call TheSportsDB or Sporttery, and do not let odds "
+                "redefine the primary fixture."
             ),
-            allowed_tools=("football_data", "web_fetch"),
+            allowed_tools=("football_odds", "football_context"),
             max_failed_tool_rounds=1,
         ),
         TeamRole(
@@ -251,10 +269,13 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
             "specialist",
             soul=(
                 "Assess relevant head-to-head and competition history without treating old squads, "
-                "managers, formats, or venues as current evidence. Cite dates and sources and make "
-                "the limits of historical transfer explicit."
+                "managers, formats, or venues as current evidence. Read football_context first and "
+                "reuse its confirmed fixture and base data. Do not open arbitrary web pages or "
+                "re-query TheSportsDB; if historical evidence is absent, mark it unknown. Cite "
+                "dates already present in the shared evidence and make the limits of historical "
+                "transfer explicit."
             ),
-            allowed_tools=("football_data", "web_fetch"),
+            allowed_tools=("football_context",),
             max_failed_tool_rounds=1,
         ),
         TeamRole(
@@ -266,7 +287,7 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "injuries, suspensions, fatigue, weather, travel, rotation, format rules, and data "
                 "gaps. Never turn an unverified absence or rumor into a confirmed fact."
             ),
-            allowed_tools=("football_data", "web_fetch"),
+            allowed_tools=("football_context",),
             max_failed_tool_rounds=1,
         ),
         TeamRole(
@@ -276,9 +297,13 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
             soul=(
                 "Compare the coordinator's stated probabilities with timestamped market prices, "
                 "show assumptions and sensitivity, and report whether price already reflects the "
-                "evidence. Do not change the evidence confidence and do not give stake advice."
+                "evidence. You are only invoked when the user explicitly asks for odds, market "
+                "prices, Sporttery, EV, expected value, or sensitivity. You are the only analyst "
+                "role permitted to use Sporttery; use the Runtime-managed source for official SP "
+                "prices. Do not open arbitrary web pages, change evidence confidence, or give "
+                "stake advice."
             ),
-            allowed_tools=("football_data", "web_fetch"),
+            allowed_tools=("football_data", "football_context"),
             max_failed_tool_rounds=1,
         ),
     ),

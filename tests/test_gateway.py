@@ -117,10 +117,11 @@ async def test_team_api_is_idempotent_and_enforces_lifecycle(tmp_path: Path) -> 
             "details": {},
         }
         assert football_preview.json()["checks"]["tools"]["required"] == [
+            "football_context",
             "football_data",
             "football_ledger",
+            "football_odds",
             "spawn_subagent",
-            "web_fetch",
         ]
         preview = await client.post(
             "/api/agent-teams/preview",
@@ -656,6 +657,20 @@ async def test_chat_stream_and_history_use_configured_provider(tmp_path: Path) -
         assert [message["role"] for message in messages] == ["system", "user", "assistant"]
         assert "You are the imported analyst." in messages[0]["content"]
         assert messages[-1]["content"] == "hello world"
+
+
+async def test_chat_stop_is_scoped_to_authenticated_agent_and_session(tmp_path: Path) -> None:
+    async with gateway_client(tmp_path / "chat-stop.db") as (client, _database, _app):
+        created = await onboard(client)
+        await login(client)
+
+        stopped = await client.post(
+            "/api/chat/stop",
+            json={"agentId": created["agentId"], "sessionId": "no-active-run"},
+        )
+
+        assert stopped.status_code == 200
+        assert stopped.json() == {"ok": True, "cancelled": False, "count": 0}
 
 
 async def test_admin_act_as_is_tenant_scoped_and_read_only(tmp_path: Path) -> None:

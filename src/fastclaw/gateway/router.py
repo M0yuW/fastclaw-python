@@ -29,6 +29,7 @@ from fastclaw.gateway.models import (
     APIKeyAgents,
     APIKeyCreate,
     ChatInput,
+    ChatStopInput,
     LoginRequest,
     OnboardRequest,
     OpenAIChatInput,
@@ -708,8 +709,10 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         required_tools = sorted({tool for role in template.roles for tool in role.allowed_tools})
         available_tools = {
             "exec",
+            "football_context",
             "football_data",
             "football_ledger",
+            "football_odds",
             "list_dir",
             "read_file",
             "spawn_subagent",
@@ -2118,6 +2121,20 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                 stream.detach()
 
         return StreamingResponse(events(), media_type="text/event-stream")
+
+    @router.post("/api/chat/stop")
+    async def stop_chat(
+        payload: ChatStopInput, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        if auth.identity.read_only:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "actAs is read-only")
+        await service.require_agent(auth, payload.agent_id)
+        cancelled = await gateway.agent_manager.cancel_session_roots(
+            user_id=auth.identity.effective_user_id,
+            agent_id=payload.agent_id,
+            session_id=payload.session_id,
+        )
+        return {"ok": True, "cancelled": cancelled > 0, "count": cancelled}
 
     @router.get("/v1/agents")
     async def v1_agents(auth: AuthContext = auth_dependency) -> dict[str, Any]:

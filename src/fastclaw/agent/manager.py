@@ -26,7 +26,7 @@ from fastclaw.agent.models import AgentEvent, AgentEventType, AgentRunError, Age
 from fastclaw.agent.persistence import DatabaseSessionPersistence
 from fastclaw.agent.runner import AgentRunner
 from fastclaw.credentials import CredentialCipher
-from fastclaw.execution import ExecutionContext
+from fastclaw.execution import ExecutionContext, SharedExecutionState
 from fastclaw.orchestration import (
     AsyncTaskQueue,
     InProcessMessageBus,
@@ -41,8 +41,10 @@ from fastclaw.runtime import Runtime, RuntimeState
 from fastclaw.skills import Skill, SkillCatalog, SkillError
 from fastclaw.storage import AgentRecord, ConfigRecord, Database, UnitOfWork
 from fastclaw.tools import (
+    FootballContextTool,
     FootballDataTool,
     FootballLedgerTool,
+    FootballOddsTool,
     ListDirTool,
     ReadFileTool,
     SkillScriptTool,
@@ -66,6 +68,17 @@ parallel, emit several ordinary `spawn_subagent` tool calls in the same
 assistant turn. Do not use legacy `delegations`, `sharedContext`, or `agentId`
 wrapper fields.
 """
+
+_EV_REQUEST_PATTERN = re.compile(
+    r"(?:\bev\b|expected\s+value|sporttery|odds?|bet(?:ting)?|wager|stake|price|"
+    r"赔率|盘口|投注|下注|体彩|期望值|去水|市场价格|敏感性)",
+    re.IGNORECASE,
+)
+
+
+def _explicit_ev_request(message: str) -> bool:
+    """Return whether the current user request explicitly asks for EV/market data."""
+    return bool(_EV_REQUEST_PATTERN.search(message.strip()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,19 +152,48 @@ def _default_tools(
         if isinstance(configured_targets, list)
         else None
     )
-    web_fetch = WebFetchTool(runtime.web_http_client)
+    team_data_agent_id = str(profile.agent.config.get("teamDataAgentId") or "")
+    football_mode = str(profile.agent.config.get("footballDataMode") or "")
+    web_fetch = WebFetchTool(
+        runtime.web_http_client,
+        blocked_hosts=frozenset({"thesportsdb.com"})
+        if football_mode == "context"
+        else frozenset(),
+    )
+    agent_role = str(profile.agent.config.get("teamRole") or "").casefold()
+    agent_name = profile.agent.name.casefold()
+    allow_sporttery = agent_role == "ev-analyst" or "ev analyst" in agent_name
     tools: list[Any] = [
         ReadFileTool(workspace),
         ListDirTool(workspace),
         WriteFileTool(workspace),
         web_fetch,
-        FootballDataTool(web_fetch),
-        SpawnSubagentTool(bus, team_targets),
+        FootballContextTool(),
+        FootballDataTool(
+            web_fetch,
+            allow_sporttery=allow_sporttery,
+            role_mode=(
+                "data"
+                if football_mode == "data"
+                else "ev"
+                if football_mode == "ev"
+                else "full"
+            ),
+        ),
+        FootballOddsTool(),
+        SpawnSubagentTool(bus, team_targets, data_agent_id=team_data_agent_id),
         FootballLedgerTool(data_root),
         WorldCupLedgerTool(data_root),
     ]
     if profile.skills:
-        tools.append(SkillScriptTool(catalog, profile.skills, forbidden_roots=(legacy_data_root,)))
+        tools.append(
+            SkillScriptTool(
+                catalog,
+                profile.skills,
+                forbidden_roots=(legacy_data_root,),
+                forbidden_scripts=() if allow_sporttery else ("sporttery_data.py",),
+            )
+        )
     tools.extend(plugins.tools())
     return ToolRegistry(tools)
 
@@ -224,13 +266,13 @@ class ManagedAgentStream(AsyncIterator[AgentEvent]):
                         )
                     )
             finally:
-                self._manager._untrack_root(self.context.agent_id, self.context.root_execution_id)
+                self._manager._untrack_root(self.context)
                 if not self._saw_done:
                     self._error = self._error or "agent stream ended without a terminal event"
                 if not self._detached:
                     self._events.put_nowait(self._STOP)
 
-        self._manager._track_root(self.context.agent_id, self.context.root_execution_id)
+        self._manager._track_root(self.context)
         self._task = asyncio.create_task(supervise())
 
     def __aiter__(self) -> ManagedAgentStream:
@@ -315,6 +357,7 @@ class AgentRuntimeManager:
         self._tool_factory = tool_factory
         self._profiles: dict[str, AgentRuntimeProfile] = {}
         self._agent_roots: dict[str, set[str]] = {}
+        self._session_roots: dict[tuple[str, str, str], set[str]] = {}
         self.skill_catalog = SkillCatalog(config.data_root / "skills")
         package_plugins = Path(__file__).resolve().parents[1] / "bundled_plugins"
         checkout_plugins = Path(__file__).resolve().parents[3] / "plugins"
@@ -460,6 +503,7 @@ class AgentRuntimeManager:
             session_id=session_id,
             root_execution_id=root_execution_id or f"run_{uuid4().hex}",
             call_path=(agent_id,),
+            shared_state=SharedExecutionState(ev_requested=_explicit_ev_request(message)),
         )
         request = self._request(profile, selection.model, message)
 
@@ -519,15 +563,30 @@ class AgentRuntimeManager:
         roots = {root for agent_id in agent_ids for root in self._agent_roots.get(agent_id, set())}
         await asyncio.gather(*(self.cancel_root(root) for root in roots))
 
-    def _track_root(self, agent_id: str, root_execution_id: str) -> None:
-        self._agent_roots.setdefault(agent_id, set()).add(root_execution_id)
+    async def cancel_session_roots(self, *, user_id: str, agent_id: str, session_id: str) -> int:
+        """Cancel all active roots for one tenant/agent/session tuple."""
+        key = (user_id, agent_id, session_id)
+        roots = tuple(self._session_roots.get(key, ()))
+        await asyncio.gather(*(self.cancel_root(root) for root in roots))
+        return len(roots)
 
-    def _untrack_root(self, agent_id: str, root_execution_id: str) -> None:
-        roots = self._agent_roots.get(agent_id)
+    def _track_root(self, context: ExecutionContext) -> None:
+        self._agent_roots.setdefault(context.agent_id, set()).add(context.root_execution_id)
+        key = (context.user_id, context.agent_id, context.session_id)
+        self._session_roots.setdefault(key, set()).add(context.root_execution_id)
+
+    def _untrack_root(self, context: ExecutionContext) -> None:
+        roots = self._agent_roots.get(context.agent_id)
         if roots is not None:
-            roots.discard(root_execution_id)
+            roots.discard(context.root_execution_id)
             if not roots:
-                self._agent_roots.pop(agent_id, None)
+                self._agent_roots.pop(context.agent_id, None)
+        key = (context.user_id, context.agent_id, context.session_id)
+        session_roots = self._session_roots.get(key)
+        if session_roots is not None:
+            session_roots.discard(context.root_execution_id)
+            if not session_roots:
+                self._session_roots.pop(key, None)
 
     async def readiness(self) -> dict[str, bool]:
         database_ready = False
@@ -699,7 +758,20 @@ class AgentRuntimeManager:
             if (source_is_team_member or target_is_team_member) and not permitted:
                 raise AgentRunError("team delegation is restricted to active specialists")
         profile = self._profiles[agent_id]
+        target_role = str(profile.agent.config.get("teamRole") or "").casefold()
+        if target_role == "ev-analyst" and not context.shared_state.ev_requested:
+            raise AgentRunError(
+                "EV analyst is only available when the user explicitly requests odds or EV analysis"
+            )
         selection = await self.provider_selection(profile)
+        shared_evidence = context.shared_state.render_football_base()
+        if shared_evidence and "## Shared football base evidence" not in task:
+            task = (
+                f"{task}\n\n## Shared football base evidence\n"
+                "The data analyst already confirmed this fixture. Reuse this evidence; "
+                "do not re-query TheSportsDB or replace the confirmed fixture.\n"
+                f"{shared_evidence}"
+            )
         request = self._request(profile, selection.model, task)
         return await self._run(profile, selection, request, context, lambda event: None)
 
@@ -851,12 +923,13 @@ class AgentRuntimeManager:
                 )
             )
         policy = str(effective_config.get("policy") or "").strip()
+        configured_allowed_tools = effective_config.get("allowedTools")
         if policy == "no-tools":
             allowed_tools: frozenset[str] | None = frozenset()
         elif policy == "delegate-only":
             allowed_tools = frozenset({"spawn_subagent"})
         else:
-            configured = effective_config.get("allowedTools")
+            configured = configured_allowed_tools
             if isinstance(configured, list):
                 allowed_tools = frozenset(str(item) for item in configured)
             elif skills:
@@ -896,7 +969,55 @@ class AgentRuntimeManager:
                     for member in members
                     if member.member_type == "specialist" and member.status == "active"
                 ]
+                data_member = next(
+                    (
+                        member
+                        for member in members
+                        if member.member_type == "specialist"
+                        and member.role_key == "data-analyst"
+                        and member.status == "active"
+                    ),
+                    None,
+                )
+                if data_member is not None:
+                    effective_config["teamDataAgentId"] = data_member.agent_id
             break
+        competition_team_tools = {"football_data", "football_odds", "football_context"}
+        is_competition_team = (
+            isinstance(configured_allowed_tools, list)
+            and bool(competition_team_tools.intersection(configured_allowed_tools))
+        )
+        role_key = str(effective_config.get("teamRole") or "")
+        if is_competition_team and role_key in {
+            "data-analyst",
+            "odds-analyst",
+            "tactics-analyst",
+            "history-analyst",
+            "risk-officer",
+            "ev-analyst",
+        }:
+            if role_key == "data-analyst":
+                effective_config["footballDataMode"] = "data"
+                allowed_tools = frozenset({"football_data", "football_context"})
+            elif role_key == "odds-analyst":
+                effective_config["footballDataMode"] = "odds"
+                allowed_tools = frozenset({"football_odds", "football_context"})
+            elif role_key == "ev-analyst":
+                effective_config["footballDataMode"] = "ev"
+                allowed_tools = frozenset({"football_data", "football_context"})
+            else:
+                effective_config["footballDataMode"] = "context"
+                allowed_tools = frozenset({"football_context"})
+        if is_competition_team and role_key == "coordinator":
+            prompt_parts.append(
+                "## Football evidence order\n\n"
+                "Delegate the data-analyst first and wait for its base_evidence result. "
+                "Only after that result succeeds may you delegate tactics, odds, history, "
+                "or risk. Those specialists receive the shared evidence and must not repeat "
+                "the primary football-data lookup. EV is optional and must only be delegated "
+                "when the original user explicitly requests odds, market prices, betting, "
+                "Sporttery, EV, expected value, or sensitivity."
+            )
         system_prompt = "\n\n".join(prompt_parts).replace(
             str(self.config.legacy_data_root), str(self.config.data_root)
         )

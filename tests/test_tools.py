@@ -258,7 +258,7 @@ async def test_football_data_resolves_non_world_cup_competition_and_schedule() -
 
 
 @pytest.mark.asyncio
-async def test_football_data_sporttery_match_is_not_world_cup_filtered() -> None:
+async def test_football_data_sporttery_match_is_ev_only() -> None:
     fetcher = FixtureFetcher(
         {
             "getMatchCalculatorV1": {
@@ -283,7 +283,7 @@ async def test_football_data_sporttery_match_is_not_world_cup_filtered() -> None
         }
     )
 
-    result = await FootballDataTool(fetcher).execute(
+    result = await FootballDataTool(fetcher, allow_sporttery=True).execute(
         {
             "action": "sporttery_match",
             "team_a": "Sirius",
@@ -295,6 +295,24 @@ async def test_football_data_sporttery_match_is_not_world_cup_filtered() -> None
     payload = json.loads(result.content)
     assert payload["competition"] == "瑞典超级联赛"
     assert payload["match_id"] == "swe-1"
+
+
+@pytest.mark.asyncio
+async def test_football_data_rejects_sporttery_for_non_ev_roles() -> None:
+    fetcher = FixtureFetcher({})
+
+    result = await FootballDataTool(fetcher).execute(
+        {
+            "action": "sporttery_match",
+            "team_a": "Sirius",
+            "team_b": "Brommapojkarna",
+        },
+        context(),
+    )
+
+    assert result.is_error
+    assert "EV analyst role" in result.content
+    assert fetcher.urls == []
 
 
 @pytest.mark.asyncio

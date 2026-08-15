@@ -59,9 +59,10 @@ are created atomically. Health and readiness probes remain available at
 
 Provider credentials can be entered in the Web UI. They are encrypted with
 AES-GCM before persistence; API responses expose only a mask. A local
-`master.key` is created under the data root with mode `0600` and must be backed
-up separately from the database. `FASTCLAW_MASTER_KEY` can supply the same
-32-byte URL-safe-base64 master key in managed deployments.
+`master.key` is created under the data root. macOS/Linux restrict it to mode
+`0600`; Windows protects its contents with current-user DPAPI instead of relying
+on POSIX mode bits. `FASTCLAW_MASTER_KEY` can supply the same 32-byte
+URL-safe-base64 master key in managed or cross-device deployments.
 
 Environment variables remain available as higher-priority operational
 overrides:

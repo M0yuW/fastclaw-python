@@ -23,6 +23,7 @@ class SkillScriptTool:
         skills: tuple[Skill, ...],
         *,
         forbidden_roots: tuple[Path, ...] = (),
+        forbidden_scripts: tuple[str, ...] = (),
         max_output_bytes: int = 1_000_000,
         termination_grace_seconds: float = 1.0,
     ) -> None:
@@ -31,6 +32,7 @@ class SkillScriptTool:
         self._forbidden_roots = tuple(
             str(root.expanduser().resolve()).rstrip(os.sep) for root in forbidden_roots
         )
+        self._forbidden_scripts = {Path(value).name.casefold() for value in forbidden_scripts}
         self._max_output_bytes = max_output_bytes
         self._termination_grace_seconds = termination_grace_seconds
         self.definition = ToolDefinition(
@@ -64,6 +66,8 @@ class SkillScriptTool:
         script_value, script_arguments = self._parse_argv(argv)
         if any(root and root in value for root in self._forbidden_roots for value in argv):
             raise ValueError("legacy Runtime paths are denied")
+        if Path(script_value).name.casefold() in self._forbidden_scripts:
+            raise ValueError("this Skill script is not allowed for the current Agent role")
         script = self._resolve_script(skill, script_value)
         interpreter = self._catalog.interpreter(skill)
         environment = {

@@ -3,7 +3,7 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { getStatus, getChatHistory, getChatSessions, sendChatStream, type AgentInfo, type ChatHistoryMessage } from "@/lib/api";
+import { getStatus, getChatHistory, getChatSessions, sendChatStream, stopChat, type AgentInfo, type ChatHistoryMessage } from "@/lib/api";
 import { createChatStreamBatcher, reduceChatStreamEvents, type StreamMessage } from "@/lib/chat-stream";
 import { useAgentName } from "@/hooks/use-agent-name";
 import { Bot, Send, Copy, Check, SquarePen, MessageSquare, Wrench, ChevronDown, ChevronRight, Square } from "lucide-react";
@@ -85,8 +85,11 @@ export default function ChatPage() {
   const sessionsGenerationRef = useRef(0);
 
   const abortStream = useCallback(() => {
+    if (selectedAgent && sessionId) {
+      void stopChat(selectedAgent, sessionId).catch(() => {});
+    }
     abortRef.current?.abort();
-  }, []);
+  }, [selectedAgent, sessionId]);
   const invalidateStream = useCallback(() => {
     streamGenerationRef.current++;
     abortRef.current?.abort();

@@ -3,7 +3,7 @@
 import { useEffect, useState, useRef, useCallback, useId, useMemo } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Button } from "@/components/ui/button";
-import { getAgent, getChatHistory, getChatSessions, listAgentFiles, renameChatSession, sendChatStream, uploadAgentFiles, getAuthToken, getSkills, type ChatHistoryMessage, type SkillInfo, type ToolResultMetadata } from "@/lib/api";
+import { getAgent, getChatHistory, getChatSessions, listAgentFiles, renameChatSession, sendChatStream, stopChat, uploadAgentFiles, getAuthToken, getSkills, type ChatHistoryMessage, type SkillInfo, type ToolResultMetadata } from "@/lib/api";
 import { createChatStreamBatcher, reduceChatStreamEvents, type StreamMessage } from "@/lib/chat-stream";
 import { useAgentIdFromURL } from "@/hooks/use-agent-id";
 import { Bot, Send, Copy, Check, Pencil, Wrench, ChevronDown, ChevronRight, Download, X, File, FileText, Image as ImageIcon, FileCode, Film, Music, Puzzle, SlidersHorizontal, ShieldCheck, Paperclip, Square } from "lucide-react";
@@ -312,8 +312,11 @@ export default function AgentChatPage() {
   const sessionsGenerationRef = useRef(0);
 
   const abortStream = useCallback(() => {
+    if (selectedAgent && sessionId) {
+      void stopChat(selectedAgent, sessionId).catch(() => {});
+    }
     abortRef.current?.abort();
-  }, []);
+  }, [selectedAgent, sessionId]);
   const invalidateStream = useCallback(() => {
     streamGenerationRef.current++;
     abortRef.current?.abort();

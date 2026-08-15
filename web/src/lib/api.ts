@@ -605,6 +605,16 @@ export async function sendChat(agentId: string, sessionId: string, message: stri
   return res.json();
 }
 
+export async function stopChat(agentId: string, sessionId: string): Promise<{ ok: boolean; cancelled: boolean; count: number }> {
+  const res = await apiFetch("/api/chat/stop", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ agentId, sessionId }),
+  });
+  if (!res.ok) throw new Error(`stop failed: ${res.status}`);
+  return res.json();
+}
+
 export interface ToolResultMetadata {
   sandbox?: boolean;
   isError?: boolean;

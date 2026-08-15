@@ -24,6 +24,11 @@ from fastclaw.tools.football_evidence import (
     TheOddsApiSource,
     utc_now,
 )
+from fastclaw.tools.football_shared import (
+    FootballEvidenceCache,
+    football_event_key,
+    get_football_evidence_cache,
+)
 
 _SPORTS_DB = "https://www.thesportsdb.com/api/v1/json/123"
 _ESPN_SOCCER = "https://site.api.espn.com/apis/site/v2/sports/soccer"
@@ -135,37 +140,64 @@ class FootballDataTool:
         *,
         espn_fetcher: _Fetcher | None = None,
         odds_source: OddsSource | None = None,
+        allow_sporttery: bool = False,
+        role_mode: str = "full",
+        cache: FootballEvidenceCache | None = None,
     ) -> None:
         self._fetcher = fetcher
         self._espn_fetcher = espn_fetcher or EspnPublicFetcher()
         self._odds_source = odds_source or TheOddsApiSource.from_environment()
+        self._allow_sporttery = allow_sporttery
+        self._role_mode = role_mode
+        self._cache = cache or get_football_evidence_cache()
+        description = (
+            "Resolve a football competition and fetch dated fixtures, results, standings, "
+            "team form, head-to-head, or an evidence bundle. Provider identifiers and URLs "
+            "are selected only by the Runtime."
+        )
+        if role_mode == "data":
+            description = (
+                "Fetch one cached base evidence bundle for the confirmed football fixture. "
+                "This data-only action uses TheSportsDB and ESPN supplements and never calls "
+                "The Odds API or Sporttery."
+            )
+        elif role_mode == "ev":
+            description = (
+                "Fetch official Sporttery prices only when the user explicitly requests EV or "
+                "market analysis for the confirmed fixture."
+            )
+        actions = [
+            "competition_resolve",
+            "competition_search",
+            "espn_schedule",
+            "espn_summary",
+            "schedule",
+            "results",
+            "standings",
+            "form",
+            "h2h",
+        ]
+        if role_mode == "data":
+            actions = ["base_evidence"]
+            # Existing persisted prompts may still name the old action. Keep
+            # it as a compatibility alias routed to the same data-only path.
+            actions.append("evidence")
+        elif role_mode == "ev":
+            actions = ["sporttery_match"]
+        else:
+            actions.append("evidence")
+        if allow_sporttery and "sporttery_match" not in actions:
+            actions.append("sporttery_match")
         self.definition = ToolDefinition(
             function=ToolFunction(
                 name="football_data",
-                description=(
-                    "Resolve a football competition and fetch dated fixtures, results, "
-                    "standings, team form, head-to-head, or an evidence bundle. Provider "
-                    "identifiers and URLs are selected only by the Runtime. Use evidence for "
-                    "a production match analysis with partial-source degradation."
-                ),
+                description=description,
                 parameters={
                     "type": "object",
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": [
-                                "competition_resolve",
-                                "competition_search",
-                                "espn_schedule",
-                                "espn_summary",
-                                "schedule",
-                                "results",
-                                "standings",
-                                "form",
-                                "h2h",
-                                "sporttery_match",
-                                "evidence",
-                            ],
+                            "enum": actions,
                         },
                         "competition": {"type": "string"},
                         "country": {"type": "string"},
@@ -204,6 +236,12 @@ class FootballDataTool:
         if forbidden.intersection(arguments):
             return self._error("provider URLs, credentials, and identifiers are Runtime-managed")
         action = str(arguments.get("action") or "")
+        if self._role_mode == "data" and action not in {"base_evidence", "evidence"}:
+            return self._error("data analyst may only request the shared base_evidence bundle")
+        if self._role_mode == "ev" and not context.shared_state.ev_requested:
+            return self._error("EV market lookup requires an explicit user request")
+        if self._role_mode == "ev" and action != "sporttery_match":
+            return self._error("EV analyst may only request Sporttery market prices")
         if action == "competition_resolve":
             return self._competition_resolve(arguments)
         if action == "competition_search":
@@ -219,9 +257,13 @@ class FootballDataTool:
         if action == "h2h":
             return await self._h2h(arguments, context)
         if action == "sporttery_match":
+            if not self._allow_sporttery:
+                return self._error("sporttery_match is restricted to the EV analyst role")
             return await self._sporttery_match(arguments, context)
+        if action == "base_evidence":
+            return await self._evidence(arguments, context, include_odds=False)
         if action == "evidence":
-            return await self._evidence(arguments, context)
+            return await self._evidence(arguments, context, include_odds=self._role_mode != "data")
         return self._error("unsupported football_data action")
 
     def _competition_resolve(self, arguments: dict[str, Any]) -> ToolResult:
@@ -427,7 +469,13 @@ class FootballDataTool:
             if isinstance(item, dict)
         ]
 
-    async def _evidence(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
+    async def _evidence(
+        self,
+        arguments: dict[str, Any],
+        context: ExecutionContext,
+        *,
+        include_odds: bool = True,
+    ) -> ToolResult:
         competition, trusted_error = self._trusted_competition(arguments)
         if trusted_error is not None:
             return trusted_error
@@ -445,6 +493,13 @@ class FootballDataTool:
         options_error = self._validate_evidence_options(arguments)
         if options_error is not None:
             return options_error
+        cache_key = football_event_key(competition.name, season, date, team_a, team_b)
+        if not include_odds:
+            cached = await self._cache.get("base", cache_key)
+            if cached is not None:
+                if not cached.is_error:
+                    context.shared_state.publish_football_base(cache_key.value, cached.content)
+                return cached
 
         sources: list[SourceResult] = []
         warnings: list[str] = []
@@ -495,6 +550,33 @@ class FootballDataTool:
         sources.append(espn)
         self._warn_if_degraded(espn, warnings)
 
+        if not include_odds:
+            result = ToolResult(
+                content=json.dumps(
+                    {
+                        "fixture": fixture,
+                        "results": results,
+                        "standings": standings,
+                        "details": details,
+                        "form": form,
+                        "head_to_head": head_to_head,
+                        "odds": {"status": "not_requested"},
+                        "sources": [source.report() for source in sources],
+                        "warnings": list(dict.fromkeys(warnings)),
+                        "completeness": "partial"
+                        if any(source.status != "success" for source in sources)
+                        else "complete",
+                        "base_evidence_key": cache_key.value,
+                        "as_of": utc_now(),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+            await self._cache.put("base", cache_key, result)
+            context.shared_state.publish_football_base(cache_key.value, result.content)
+            return result
+
         regions = tuple(str(value) for value in arguments.get("regions") or ("eu",))
         markets = tuple(str(value) for value in arguments.get("markets") or ("h2h", "totals"))
         odds_format = str(arguments.get("odds_format") or "decimal")
@@ -523,7 +605,7 @@ class FootballDataTool:
                 safe_reason="No matching odds fixture was returned",
             )
         sources.append(odds_source)
-        if odds_source.status != "success":
+        if odds_source.status != "success" and self._allow_sporttery:
             sporttery = await self._sporttery_evidence(team_a, team_b, context)
             sources.append(sporttery)
             if sporttery.status == "success":
@@ -531,6 +613,9 @@ class FootballDataTool:
             else:
                 odds = {"status": "unavailable"}
                 warnings.append("odds_unavailable")
+        elif odds_source.status != "success":
+            odds = {"status": "unavailable"}
+            warnings.append("odds_unavailable")
 
         degraded = any(source.status != "success" for source in sources)
         payload = {

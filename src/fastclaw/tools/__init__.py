@@ -8,6 +8,7 @@ from fastclaw.tools.football_competitions import (
     FootballCompetition,
     resolve_football_competition,
 )
+from fastclaw.tools.football_context import FootballContextTool, FootballOddsTool
 from fastclaw.tools.football_data import FootballDataTool
 from fastclaw.tools.registry import ToolRegistry
 from fastclaw.tools.skill import SkillScriptTool
@@ -19,8 +20,10 @@ __all__ = [
     "BatchTool",
     "ExecTool",
     "FootballCompetition",
+    "FootballContextTool",
     "FootballDataTool",
     "FootballLedgerTool",
+    "FootballOddsTool",
     "ListDirTool",
     "ReadFileTool",
     "SkillScriptTool",

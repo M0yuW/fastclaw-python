@@ -85,6 +85,11 @@ class ChatInput(WireModel):
     image_urls: list[str] = Field(default_factory=list)
 
 
+class ChatStopInput(WireModel):
+    agent_id: str
+    session_id: str
+
+
 class OpenAIMessage(WireModel):
     role: str
     content: str

@@ -15,6 +15,7 @@ from fastclaw.execution import ExecutionContext
 from fastclaw.tools import FOOTBALL_COMPETITIONS, FootballDataTool, ToolResult
 from fastclaw.tools.football_data import EspnPublicFetcher
 from fastclaw.tools.football_evidence import SourceResult, TheOddsApiSource
+from fastclaw.tools.football_shared import FootballEvidenceCache
 
 
 class FixtureFetcher:
@@ -155,6 +156,7 @@ async def run_evidence(
     responses: dict[str, object] | None = None,
     *,
     odds: SourceResult | None = None,
+    allow_sporttery: bool = False,
 ) -> tuple[ToolResult, FixtureFetcher]:
     fetcher = FixtureFetcher(responses or fixture_responses())
     odds_result = odds or SourceResult(
@@ -172,8 +174,40 @@ async def run_evidence(
         fetcher,
         espn_fetcher=fetcher,
         odds_source=StaticOdds(odds_result),
+        allow_sporttery=allow_sporttery,
     )
     return await tool.execute(evidence_arguments(), context()), fetcher
+
+
+@pytest.mark.asyncio
+async def test_data_base_evidence_is_cached_by_fixture_identity() -> None:
+    fetcher = FixtureFetcher(fixture_responses())
+    cache = FootballEvidenceCache()
+    first_tool = FootballDataTool(
+        fetcher,
+        espn_fetcher=fetcher,
+        role_mode="data",
+        cache=cache,
+    )
+    second_tool = FootballDataTool(
+        fetcher,
+        espn_fetcher=fetcher,
+        role_mode="data",
+        cache=cache,
+    )
+
+    first = await first_tool.execute(
+        {**evidence_arguments(), "action": "base_evidence"}, context()
+    )
+    request_count = len(fetcher.urls)
+    second = await second_tool.execute(
+        {**evidence_arguments(), "action": "base_evidence"}, context()
+    )
+
+    assert not first.is_error
+    assert not second.is_error
+    assert second.metadata["cacheHit"] is True
+    assert len(fetcher.urls) == request_count
 
 
 @pytest.mark.asyncio
@@ -270,14 +304,31 @@ async def test_espn_fixture_identity_mismatch_is_rejected(bad_value: str) -> Non
 
 
 @pytest.mark.asyncio
-async def test_odds_failure_falls_back_to_sporttery() -> None:
+async def test_odds_failure_does_not_call_sporttery_for_non_ev_roles() -> None:
     unavailable = SourceResult(
         "the_odds_api",
         "unavailable",
         error_code="odds_key_missing",
         safe_reason="The Odds API is not configured",
     )
-    result, _fetcher = await run_evidence(odds=unavailable)
+    result, fetcher = await run_evidence(odds=unavailable)
+    payload = json.loads(result.content)
+
+    assert not result.is_error
+    assert payload["odds"] == {"status": "unavailable"}
+    assert "odds_unavailable" in payload["warnings"]
+    assert not any("getMatchCalculatorV1" in url for url in fetcher.urls)
+
+
+@pytest.mark.asyncio
+async def test_ev_role_can_use_sporttery_as_fallback() -> None:
+    unavailable = SourceResult(
+        "the_odds_api",
+        "unavailable",
+        error_code="odds_key_missing",
+        safe_reason="The Odds API is not configured",
+    )
+    result, _fetcher = await run_evidence(odds=unavailable, allow_sporttery=True)
     payload = json.loads(result.content)
 
     assert not result.is_error
@@ -286,10 +337,32 @@ async def test_odds_failure_falls_back_to_sporttery() -> None:
 
 
 @pytest.mark.asyncio
+async def test_ev_sporttery_requires_explicit_user_request() -> None:
+    fetcher = FixtureFetcher(fixture_responses())
+    tool = FootballDataTool(fetcher, allow_sporttery=True, role_mode="ev")
+    arguments = {
+        "action": "sporttery_match",
+        "team_a": "IK Sirius",
+        "team_b": "IF Brommapojkarna",
+    }
+
+    blocked = await tool.execute(arguments, context())
+    assert blocked.is_error
+    assert "explicit user request" in blocked.content
+    assert fetcher.urls == []
+
+    explicit = context()
+    explicit.shared_state.ev_requested = True
+    allowed = await tool.execute(arguments, explicit)
+    assert not allowed.is_error
+    assert any("getMatchCalculatorV1" in url for url in fetcher.urls)
+
+
+@pytest.mark.asyncio
 async def test_both_odds_sources_can_fail_without_failing_primary() -> None:
     responses = fixture_responses()
     responses["getMatchCalculatorV1"] = ToolResult(content="offline", is_error=True)
-    result, _fetcher = await run_evidence(
+    result, fetcher = await run_evidence(
         responses,
         odds=SourceResult("the_odds_api", "unavailable", error_code="odds_request_failed"),
     )
@@ -299,6 +372,7 @@ async def test_both_odds_sources_can_fail_without_failing_primary() -> None:
     assert payload["fixture"]["event_id"] == "21001"
     assert payload["odds"] == {"status": "unavailable"}
     assert "odds_unavailable" in payload["warnings"]
+    assert not any("getMatchCalculatorV1" in url for url in fetcher.urls)
 
 
 @pytest.mark.asyncio

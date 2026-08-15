@@ -15,9 +15,16 @@ logger = logging.getLogger(__name__)
 
 
 class SpawnSubagentTool:
-    def __init__(self, bus: MessageBus, target_agent_ids: tuple[str, ...] | None = None) -> None:
+    def __init__(
+        self,
+        bus: MessageBus,
+        target_agent_ids: tuple[str, ...] | None = None,
+        *,
+        data_agent_id: str = "",
+    ) -> None:
         self._bus = bus
         self._target_agent_ids = target_agent_ids
+        self._data_agent_id = data_agent_id
         agent_id: dict[str, object] = {"type": "string"}
         if target_agent_ids is not None:
             agent_id["enum"] = list(target_agent_ids)
@@ -43,6 +50,13 @@ class SpawnSubagentTool:
             return ToolResult(content="invalid delegation arguments", is_error=True)
         if self._target_agent_ids is not None and agent_id not in self._target_agent_ids:
             return ToolResult(content="delegation target is not allowed", is_error=True)
+        if self._data_agent_id and not context.shared_state.has_football_base():
+            if agent_id != self._data_agent_id:
+                return ToolResult(
+                    content="the data analyst must confirm football evidence before other specialists",
+                    is_error=True,
+                    metadata={"errorCode": "football_data_first"},
+                )
         result = await self._bus.request(
             context,
             target_agent_id=agent_id,
@@ -78,6 +92,35 @@ class SpawnSubagentTool:
                 continue
             requests.append(DelegationRequest(agent_id=agent_id, task=task))
             request_indexes.append(index)
+
+        if self._data_agent_id and not context.shared_state.has_football_base():
+            data_indexes = [
+                index
+                for index, item in enumerate(arguments)
+                if item.get("agent_id") == self._data_agent_id
+            ]
+            results: list[ToolResult] = []
+            data_index = data_indexes[0] if data_indexes else -1
+            if data_index >= 0:
+                data_result = await self.execute(arguments[data_index], context)
+            else:
+                data_result = ToolResult(
+                    content="the data analyst must run first",
+                    is_error=True,
+                    metadata={"errorCode": "football_data_first"},
+                )
+            for index, _item in enumerate(arguments):
+                if index == data_index:
+                    results.append(data_result)
+                else:
+                    results.append(
+                        ToolResult(
+                            content="the data analyst must confirm football evidence before other specialists",
+                            is_error=True,
+                            metadata={"errorCode": "football_data_first"},
+                        )
+                    )
+            return tuple(results)
 
         try:
             outcomes = await self._bus.batch(context, requests)
