@@ -225,7 +225,7 @@ async def test_continued_session_rehydrates_base_before_specialist_gate() -> Non
         ),
         ToolResult(
             content=(
-                '{"evidence_schema_version":2,"fixture":'
+                '{"evidence_schema_version":3,"fixture":'
                 '{"competition":"Spanish La Liga"},"historical_context":{}}'
             ),
         ),

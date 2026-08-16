@@ -14,7 +14,9 @@ from fastclaw.tools.football_competitions import (
     normalize_competition_name,
 )
 
-FOOTBALL_EVIDENCE_SCHEMA_VERSION = 2
+# Version 3 adds an explicit prior-season H2H search result to the base bundle.
+# Sessions created under version 2 must refresh instead of reusing an empty H2H.
+FOOTBALL_EVIDENCE_SCHEMA_VERSION = 3
 
 
 def football_evidence_is_current(content: str) -> bool:
