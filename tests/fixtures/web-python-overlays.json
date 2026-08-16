@@ -2,7 +2,8 @@
   "addedFiles": {
     "e2e/runtime.spec.ts": "Python Gateway browser acceptance test",
     "playwright.config.ts": "Python Gateway browser test orchestration",
-    "src/app/teams/page.tsx": "Coordinator team creation and lifecycle page"
+    "src/app/teams/page.tsx": "Coordinator team creation and lifecycle page",
+    "src/lib/tool-summary.ts": "Safe nested tool argument summaries"
   },
   "modifiedFiles": {
     "package.json": {
@@ -15,7 +16,11 @@
     },
     "src/app/agents/[id]/chat/page.tsx": {
       "reason": "Surface failed tool results instead of rendering successful status",
-      "sha256": "de800c9f61569bb6e07bba938c183b1736bdd26f5777af2da9442999d958020a"
+      "sha256": "879633aafddc6a523cd9f724b4a126b4b40e004132b40f50506031eb6028715e"
+    },
+    "src/app/chat/page.tsx": {
+      "reason": "Use safe summaries for nested tool arguments in the legacy chat page",
+      "sha256": "eb195c90ab4c919a86c63aafa58f39feec048c95562eca57b52ecfda4606c80f"
     },
     "src/app/agents/[id]/skills/page.tsx": {
       "reason": "Use the local skills catalog instead of exposing a remote search or agent path",
@@ -26,8 +31,8 @@
       "sha256": "126d4b29dbafc2e69aea2933a7857f1236fcfc50a4cd38dfccbc0d56cb352940"
     },
     "src/lib/api.ts": {
-      "reason": "Read-only actAs, chat compatibility, and Teams API lifecycle requests",
-      "sha256": "3f9efe90d74bfb123d1bdc775b51d1ffdffb2b9a058a38cdc9926193a00815d8"
+      "reason": "Typed chat tool failure and ledger metadata for the updated tool-status UI",
+      "sha256": "c15417a9a17cbcb2c0835fb4d9e58c64b3afecc061decfaa7f17bc5875bf6422"
     },
     "src/app/skills/page.tsx": {
       "reason": "Restrict skill discovery and installation to the local catalog",

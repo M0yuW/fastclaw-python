@@ -12,10 +12,17 @@ import httpx
 import pytest
 
 from fastclaw.execution import ExecutionContext
-from fastclaw.tools import FOOTBALL_COMPETITIONS, FootballDataTool, ToolResult
+from fastclaw.football_identity import TeamIdentityResolver
+from fastclaw.tools import (
+    FOOTBALL_COMPETITIONS,
+    FootballContextTool,
+    FootballDataTool,
+    FootballOddsTool,
+    ToolResult,
+)
 from fastclaw.tools.football_data import EspnPublicFetcher
 from fastclaw.tools.football_evidence import SourceResult, TheOddsApiSource
-from fastclaw.tools.football_shared import FootballEvidenceCache
+from fastclaw.tools.football_shared import FootballEvidenceCache, football_event_key
 
 
 class FixtureFetcher:
@@ -40,6 +47,63 @@ class FixtureFetcher:
         return ToolResult(content="fixture not found", is_error=True)
 
 
+class HistoricalFixtureFetcher(FixtureFetcher):
+    """Route prior-division fixtures separately from the current-season list."""
+
+    async def execute(
+        self, arguments: dict[str, object], execution: ExecutionContext
+    ) -> ToolResult:
+        url = str(arguments["url"])
+        self.urls.append(url)
+        if "eventsseason.php?id=4400&s=2025-2026" in url:
+            return ToolResult(
+                content=json.dumps(
+                    {
+                        "events": [
+                            {
+                                "idEvent": "2450001",
+                                "strLeague": "Spanish La Liga 2",
+                                "strSeason": "2025-2026",
+                                "strEvent": "Racing de Santander vs Castellón",
+                                "strHomeTeam": "Racing de Santander",
+                                "strAwayTeam": "Castellón",
+                                "idHomeTeam": "133726",
+                                "idAwayTeam": "134700",
+                                "dateEvent": "2025-08-16",
+                                "intHomeScore": "3",
+                                "intAwayScore": "1",
+                                "strStatus": "FT",
+                            }
+                        ]
+                    }
+                )
+            )
+        if "eventsseason.php?id=4335&s=2025-2026" in url:
+            return ToolResult(
+                content=json.dumps(
+                    {
+                        "events": [
+                            {
+                                "idEvent": "2450002",
+                                "strLeague": "Spanish La Liga",
+                                "strSeason": "2025-2026",
+                                "strEvent": "Villarreal vs Sevilla",
+                                "strHomeTeam": "Villarreal",
+                                "strAwayTeam": "Sevilla",
+                                "idHomeTeam": "133740",
+                                "idAwayTeam": "133735",
+                                "dateEvent": "2025-08-17",
+                                "intHomeScore": "2",
+                                "intAwayScore": "0",
+                                "strStatus": "FT",
+                            }
+                        ]
+                    }
+                )
+            )
+        return await super().execute(arguments, execution)
+
+
 class StaticOdds:
     def __init__(self, result: SourceResult) -> None:
         self.result = result
@@ -55,6 +119,26 @@ def context() -> ExecutionContext:
         session_id="session-1",
         root_execution_id="run-1",
     )
+
+
+def test_team_identity_resolver_unifies_translations_prefixes_and_provider_ids() -> None:
+    resolver = TeamIdentityResolver()
+
+    assert resolver.resolve("西班牙人").canonical_id == "espanyol"
+    assert resolver.resolve("RCD Espanyol").canonical_id == "espanyol"
+    assert resolver.resolve("Levante UD").canonical_id == "levante"
+    assert resolver.resolve("莱万特").canonical_id == "levante"
+    assert resolver.resolve("Villarreal CF").canonical_id == "villarreal"
+
+    primary = resolver.resolve("RCD Espanyol", provider="thesportsdb", provider_id="100")
+    same_provider_id = resolver.resolve(
+        "Provider display label", provider="thesportsdb", provider_id="100"
+    )
+    unrelated_name = resolver.resolve(
+        "Provider display label", provider="thesportsdb", provider_id="101"
+    )
+    assert resolver.equivalent(primary, same_provider_id)
+    assert not resolver.equivalent(primary, unrelated_name)
 
 
 PRIMARY_EVENT = {
@@ -119,6 +203,19 @@ def fixture_responses() -> dict[str, object]:
             "boxscore": {"form": []},
             "headToHeadGames": [],
         },
+        "searchteams.php": {"teams": [{"idTeam": "100", "strTeam": "IK Sirius"}]},
+        "eventslast.php": {"results": [PRIMARY_EVENT]},
+        "lookupevent.php": {
+            "events": [
+                {
+                    **PRIMARY_EVENT,
+                    "strHomeFormation": "4-3-3",
+                    "strAwayFormation": "4-4-2",
+                    "strHomeLineupGoalkeeper": "Goalkeeper",
+                    "strAwayLineupGoalkeeper": "Away Goalkeeper",
+                }
+            ]
+        },
         "getMatchCalculatorV1": {
             "value": {
                 "matchInfoList": [
@@ -150,6 +247,129 @@ def evidence_arguments(**extra: object) -> dict[str, object]:
         "team_b": "IF Brommapojkarna",
         **extra,
     }
+
+
+def dutch_fixture_responses() -> dict[str, object]:
+    return {
+        "search_all_leagues.php": {
+            "countries": [
+                {
+                    "idLeague": "4641",
+                    "strLeague": "Dutch Eerste Divisie",
+                    "strCountry": "The Netherlands",
+                },
+                {
+                    "idLeague": "4337",
+                    "strLeague": "Dutch Eredivisie",
+                    "strLeagueAlternate": "Eredivisie",
+                    "strCountry": "The Netherlands",
+                },
+            ]
+        },
+        "eventsday.php": {
+            "events": [
+                {
+                    "idEvent": "2489078",
+                    "strLeague": "Dutch Eredivisie",
+                    "strSeason": "2026-2027",
+                    "strHomeTeam": "Excelsior",
+                    "strAwayTeam": "PSV Eindhoven",
+                    "dateEvent": "2026-08-15",
+                    "strTime": "18:00:00",
+                    "strVenue": "Van Donge and De Roo Stadion",
+                }
+            ]
+        },
+        "eventsseason.php": {"events": []},
+        "lookuptable.php": {"table": []},
+        "scoreboard": {"leagues": [{"slug": "ned.1"}], "events": []},
+    }
+
+
+@pytest.mark.asyncio
+async def test_dutch_competition_uses_provider_country_and_team_prefix_aliases() -> None:
+    fetcher = FixtureFetcher(dutch_fixture_responses())
+    tool = FootballDataTool(fetcher, espn_fetcher=fetcher)
+    result = await tool.execute(
+        {
+            "action": "evidence",
+            "competition": "荷甲",
+            "date": "2026-08-15",
+            "season": "2026-2027",
+            "team_a": "SBV Excelsior",
+            "team_b": "PSV Eindhoven",
+        },
+        context(),
+    )
+    assert not result.is_error
+    payload = json.loads(result.content)
+    assert payload["fixture"]["event_id"] == "2489078"
+    assert any("c=The+Netherlands" in url for url in fetcher.urls)
+
+
+@pytest.mark.asyncio
+async def test_data_role_can_query_results_for_ledger_settlement_review() -> None:
+    fetcher = FixtureFetcher(fixture_responses())
+    tool = FootballDataTool(fetcher, role_mode="data")
+
+    result = await tool.execute(
+        {
+            "action": "results",
+            "competition": "瑞典超",
+            "country": "Sweden",
+            "season": "2026",
+            "date": "2026-08-10",
+        },
+        context(),
+    )
+
+    assert not result.is_error
+    payload = json.loads(result.content)
+    assert payload["action"] == "results"
+    assert payload["rows"][0]["home"] == "IK Sirius"
+    assert payload["source"] == "thesportsdb:eventsday.php"
+
+
+@pytest.mark.asyncio
+async def test_settlement_review_forbids_base_evidence_context_and_odds() -> None:
+    fetcher = FixtureFetcher(fixture_responses())
+    execution = context()
+    execution.shared_state.football_settlement_review = True
+    data_tool = FootballDataTool(fetcher, role_mode="data")
+
+    base = await data_tool.execute(
+        {**evidence_arguments(), "action": "base_evidence"}, execution
+    )
+    evidence = await data_tool.execute(
+        {**evidence_arguments(), "action": "evidence"}, execution
+    )
+    context_result = await FootballContextTool().execute(
+        {
+            "competition": "瑞典超",
+            "season": "2026",
+            "date": "2026-08-10",
+            "team_a": "IK Sirius",
+            "team_b": "IF Brommapojkarna",
+        },
+        execution,
+    )
+    odds = await FootballOddsTool().execute(
+        {
+            "competition": "瑞典超",
+            "season": "2026",
+            "date": "2026-08-10",
+            "team_a": "IK Sirius",
+            "team_b": "IF Brommapojkarna",
+        },
+        execution,
+    )
+
+    assert base.is_error and "action=results" in base.content
+    assert evidence.is_error and "action=results" in evidence.content
+    assert context_result.is_error
+    assert context_result.metadata["errorCode"] == "football_settlement_context_forbidden"
+    assert odds.is_error and "settlement review" in odds.content
+    assert fetcher.urls == []
 
 
 async def run_evidence(
@@ -211,6 +431,407 @@ async def test_data_base_evidence_is_cached_by_fixture_identity() -> None:
 
 
 @pytest.mark.asyncio
+async def test_context_reuses_base_evidence_across_execution_states() -> None:
+    cache = FootballEvidenceCache()
+    fetcher = FixtureFetcher(fixture_responses())
+    data_tool = FootballDataTool(
+        fetcher,
+        espn_fetcher=fetcher,
+        role_mode="data",
+        cache=cache,
+    )
+    first = await data_tool.execute(
+        {**evidence_arguments(), "action": "base_evidence"}, context()
+    )
+    assert not first.is_error
+
+    fresh_context = ExecutionContext(
+        user_id="user-1",
+        agent_id="agent-2",
+        session_id="new-session",
+        root_execution_id="run-2",
+    )
+    result = await FootballContextTool(cache=cache).execute(
+        {
+            "competition": "瑞典超",
+            "season": "2026",
+            "date": "2026-08-10",
+            "team_a": "IK Sirius",
+            "team_b": "IF Brommapojkarna",
+        },
+        fresh_context,
+    )
+
+    assert not result.is_error
+    assert result.metadata["cacheHit"] is True
+    assert result.metadata["baseEvidenceKey"]
+    assert fresh_context.shared_state.has_football_base()
+
+
+@pytest.mark.asyncio
+async def test_context_rejects_stale_cached_base_without_historical_context() -> None:
+    cache = FootballEvidenceCache()
+    key = football_event_key(
+        "瑞典超",
+        "2026",
+        "2026-08-10",
+        "IK Sirius",
+        "IF Brommapojkarna",
+    )
+    await cache.put(
+        "base",
+        key,
+        ToolResult(
+            content=json.dumps(
+                {
+                    "fixture": {
+                        "competition": "Swedish Allsvenskan",
+                        "season": "2026",
+                        "date": "2026-08-10",
+                        "home": "IK Sirius",
+                        "away": "IF Brommapojkarna",
+                    }
+                }
+            )
+        ),
+    )
+
+    result = await FootballContextTool(cache=cache).execute(
+        {
+            "competition": "瑞典超",
+            "season": "2026",
+            "date": "2026-08-10",
+            "team_a": "IK Sirius",
+            "team_b": "IF Brommapojkarna",
+        },
+        context(),
+    )
+
+    assert result.is_error
+    assert result.metadata["errorCode"] == "football_context_not_ready"
+
+
+@pytest.mark.asyncio
+async def test_context_and_odds_resolve_team_aliases_for_the_same_fixture() -> None:
+    shared = context()
+    evidence_key = "dutcheredivisie|2026-2027|20260815|fcutrecht|azalkmaar"
+    shared.shared_state.publish_football_base(
+        evidence_key,
+        json.dumps(
+            {
+                "fixture": {
+                    "competition": "Dutch Eredivisie",
+                    "season": "2026-2027",
+                    "date": "2026-08-15",
+                    "requested_date": "2026-08-15",
+                    "home": "FC Utrecht",
+                    "away": "AZ Alkmaar",
+                },
+                "base_evidence_key": evidence_key,
+            }
+        ),
+    )
+
+    context_result = await FootballContextTool().execute(
+        {
+            "competition": "荷甲",
+            "season": "2026-27",
+            "date": "2026-08-15",
+            "team_a": "Utrecht",
+            "team_b": "AZ Alkmaar",
+        },
+        shared,
+    )
+    assert not context_result.is_error
+    assert context_result.metadata["baseEvidenceKey"] == evidence_key
+
+    odds = FootballOddsTool(
+        odds_source=StaticOdds(
+            SourceResult(
+                "the_odds_api",
+                "success",
+                [
+                    {
+                        "home_team": "Utrecht",
+                        "away_team": "AZ Alkmaar",
+                        "commence_time": "2026-08-15T16:45:00Z",
+                    }
+                ],
+            )
+        ),
+        cache=FootballEvidenceCache(),
+    )
+    odds_result = await odds.execute(
+        {
+            "competition": "荷甲",
+            "country": "Netherlands",
+            "season": "2026-27",
+            "date": "2026-08-15",
+            "team_a": "Utrecht",
+            "team_b": "AZ Alkmaar",
+        },
+        shared,
+    )
+    payload = json.loads(odds_result.content)
+    assert not odds_result.is_error
+    assert payload["base_evidence_key"] == evidence_key
+    assert payload["source"]["status"] == "success"
+    assert len(payload["odds"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_odds_match_uses_actual_date_when_request_date_is_adjacent() -> None:
+    shared = context()
+    evidence_key = "spanishlaliga|2026-2027|20260816|deportivoalaves|getafe"
+    shared.shared_state.publish_football_base(
+        evidence_key,
+        json.dumps(
+            {
+                "fixture": {
+                    "competition": "Spanish LALIGA",
+                    "season": "2026-2027",
+                    "date": "2026-08-15",
+                    "requested_date": "2026-08-16",
+                    "home": "Deportivo Alavés",
+                    "away": "Getafe",
+                },
+                "base_evidence_key": evidence_key,
+            }
+        ),
+    )
+    odds = FootballOddsTool(
+        odds_source=StaticOdds(
+            SourceResult(
+                "the_odds_api",
+                "success",
+                [
+                    {
+                        "home_team": "Deportivo Alaves",
+                        "away_team": "Getafe",
+                        "commence_time": "2026-08-15T19:00:00Z",
+                    }
+                ],
+            )
+        ),
+        cache=FootballEvidenceCache(),
+    )
+
+    result = await odds.execute(
+        {
+            "competition": "西甲",
+            "country": "Spain",
+            "season": "2026-27",
+            "date": "2026-08-16",
+            "team_a": "Deportivo Alavés",
+            "team_b": "Getafe",
+        },
+        shared,
+    )
+
+    payload = json.loads(result.content)
+    assert not result.is_error
+    assert payload["source"]["status"] == "success"
+    assert len(payload["odds"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_season_alias_and_full_schedule_fallback_confirm_adjacent_source_date() -> None:
+    event = {
+        "idEvent": "2506172",
+        "strLeague": "Spanish La Liga",
+        "strSeason": "2026-2027",
+        "strEvent": "Sevilla vs Rayo Vallecano",
+        "strHomeTeam": "Sevilla",
+        "strAwayTeam": "Rayo Vallecano",
+        "dateEvent": "2026-08-15",
+        "strTime": "19:30:00",
+        "strVenue": "Estadio Ramón Sánchez Pizjuán",
+        "intRound": "1",
+    }
+    fetcher = FixtureFetcher(
+        {
+            "search_all_leagues.php": {
+                "countries": [
+                    {
+                        "idLeague": "4335",
+                        "strLeague": "Spanish La Liga",
+                        "strLeagueAlternate": "La Liga",
+                        "strCountry": "Spain",
+                    }
+                ]
+            },
+            "eventsday.php": {"events": []},
+            "eventsseason.php": {"events": [event]},
+            "lookuptable.php": {"table": []},
+            "scoreboard": {"leagues": [{"slug": "esp.1"}], "events": []},
+        }
+    )
+    tool = FootballDataTool(fetcher, espn_fetcher=fetcher, role_mode="data")
+
+    result = await tool.execute(
+        {
+            "action": "base_evidence",
+            "competition": "西甲",
+            "country": "Spain",
+            "season": "2026-27",
+            "date": "2026-08-16",
+            "team_a": "Sevilla",
+            "team_b": "Rayo Vallecano",
+        },
+        context(),
+    )
+
+    payload = json.loads(result.content)
+    assert not result.is_error
+    assert payload["fixture"]["event_id"] == "2506172"
+    assert payload["fixture"]["date"] == "2026-08-15"
+    assert payload["fixture"]["requested_date"] == "2026-08-16"
+    assert payload["fixture"]["date_alignment"] == "adjacent_source_date"
+    assert "source_date_adjacent_to_requested_date" in payload["warnings"]
+    assert any("eventsseason.php?id=4335&s=2026-2027" in url for url in fetcher.urls)
+
+
+@pytest.mark.asyncio
+async def test_spanish_provider_team_aliases_match_chinese_fixture_request() -> None:
+    event = {
+        "idEvent": "2506200",
+        "strLeague": "Spanish La Liga",
+        "strSeason": "2026-2027",
+        "strEvent": "RCD Espanyol vs Levante UD",
+        "strHomeTeam": "RCD Espanyol",
+        "strAwayTeam": "Levante UD",
+        "idHomeTeam": "100",
+        "idAwayTeam": "101",
+        "dateEvent": "2026-08-16",
+        "strTime": "23:00:00",
+        "strVenue": "RCDE Stadium",
+        "intRound": "1",
+    }
+    fetcher = FixtureFetcher(
+        {
+            "search_all_leagues.php": {
+                "countries": [
+                    {
+                        "idLeague": "4335",
+                        "strLeague": "Spanish La Liga",
+                        "strLeagueAlternate": "La Liga",
+                        "strCountry": "Spain",
+                    }
+                ]
+            },
+            "eventsday.php": {"events": []},
+            "eventsseason.php": {"events": [event]},
+            "lookuptable.php": {"table": []},
+            "scoreboard": {"leagues": [{"slug": "esp.1"}], "events": []},
+        }
+    )
+    tool = FootballDataTool(fetcher, espn_fetcher=fetcher, role_mode="data")
+
+    result = await tool.execute(
+        {
+            "action": "base_evidence",
+            "competition": "西甲",
+            "country": "Spain",
+            "season": "2026-27",
+            "date": "2026-08-16",
+            "team_a": "西班牙人",
+            "team_b": "莱万特",
+        },
+        context(),
+    )
+
+    payload = json.loads(result.content)
+    assert not result.is_error
+    assert payload["fixture"]["event_id"] == "2506200"
+    assert payload["fixture"]["home"] == "RCD Espanyol"
+    assert payload["fixture"]["away"] == "Levante UD"
+    assert payload["fixture"]["home_team_id"] == "100"
+    assert payload["fixture"]["away_team_id"] == "101"
+    assert payload["fixture"]["home_canonical_id"] == "espanyol"
+    assert payload["fixture"]["away_canonical_id"] == "levante"
+
+
+@pytest.mark.asyncio
+async def test_new_season_historical_context_separates_friendlies_and_prior_division() -> None:
+    event = {
+        "idEvent": "2506201",
+        "strLeague": "Spanish La Liga",
+        "strSeason": "2026-2027",
+        "strEvent": "Racing de Santander vs Villarreal",
+        "strHomeTeam": "Racing de Santander",
+        "strAwayTeam": "Villarreal",
+        "idHomeTeam": "133726",
+        "idAwayTeam": "133740",
+        "dateEvent": "2026-08-16",
+        "strTime": "15:00:00",
+        "strVenue": "Campos de Sport de El Sardinero",
+        "intRound": "1",
+    }
+    fetcher = HistoricalFixtureFetcher(
+        {
+            "search_all_leagues.php": {
+                "countries": [
+                    {
+                        "idLeague": "4335",
+                        "strLeague": "Spanish La Liga",
+                        "strLeagueAlternate": "La Liga",
+                        "strCountry": "Spain",
+                    }
+                ]
+            },
+            "eventsday.php": {"events": [event]},
+            "eventsseason.php?id=4335&s=2026-2027": {"events": [event]},
+            "lookuptable.php": {"table": []},
+            "eventslast.php": {
+                "results": [
+                    {
+                        **event,
+                        "idEvent": "2527472",
+                        "strLeague": "Club Friendlies",
+                        "strSeason": "2026",
+                        "strEvent": "Racing de Santander vs Deportivo Alavés",
+                        "strHomeTeam": "Racing de Santander",
+                        "strAwayTeam": "Deportivo Alavés",
+                        "idAwayTeam": "134221",
+                        "dateEvent": "2026-08-07",
+                        "intHomeScore": "1",
+                        "intAwayScore": "1",
+                        "strStatus": "PEN",
+                    }
+                ]
+            },
+            "lookupevent.php": {"events": []},
+            "scoreboard": {"leagues": [{"slug": "esp.1"}], "events": []},
+        }
+    )
+    tool = FootballDataTool(fetcher, espn_fetcher=fetcher, role_mode="data")
+
+    result = await tool.execute(
+        {
+            "action": "base_evidence",
+            "competition": "西甲",
+            "country": "Spain",
+            "season": "2026-27",
+            "date": "2026-08-16",
+            "team_a": "桑坦德竞技",
+            "team_b": "比利亚雷亚尔",
+        },
+        context(),
+    )
+
+    payload = json.loads(result.content)
+    assert not result.is_error
+    racing = payload["historical_context"]["teams"][0]
+    assert racing["competition_boundary"] == "source_supported_prior_division"
+    assert racing["prior_division_matches"][0]["competition"] == "Spanish La Liga 2"
+    assert racing["preseason_friendlies"][0]["competition"] == "Club Friendlies"
+    assert any(
+        "preseason_friendlies are separate weak context" in rule
+        for rule in payload["historical_context"]["interpretation_rules"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_primary_and_espn_success_preserve_primary_fixture_identity() -> None:
     result, _fetcher = await run_evidence()
     payload = json.loads(result.content)
@@ -219,6 +840,9 @@ async def test_primary_and_espn_success_preserve_primary_fixture_identity() -> N
     assert payload["fixture"]["event_id"] == "21001"
     assert payload["details"]["source_event_id"] == "401842783"
     assert payload["fixture"]["venue"] == "Studenternas IP"
+    assert payload["form"][0]["scope"] == "cross_competition_may_cross_season"
+    assert payload["head_to_head"]
+    assert payload["previous_match_details"][0]["details"]["lineups"]["home"]
     assert {item["status"] for item in payload["sources"]} == {"success"}
 
 
@@ -317,6 +941,30 @@ async def test_odds_failure_does_not_call_sporttery_for_non_ev_roles() -> None:
     assert not result.is_error
     assert payload["odds"] == {"status": "unavailable"}
     assert "odds_unavailable" in payload["warnings"]
+    assert not any("getMatchCalculatorV1" in url for url in fetcher.urls)
+
+
+@pytest.mark.asyncio
+async def test_odds_success_without_requested_fixture_is_no_match() -> None:
+    result, fetcher = await run_evidence(
+        odds=SourceResult(
+            "the_odds_api",
+            "success",
+            [
+                {
+                    "home_team": "A different home",
+                    "away_team": "A different away",
+                    "commence_time": "2026-08-10T17:00:00Z",
+                }
+            ],
+        )
+    )
+    payload = json.loads(result.content)
+
+    assert not result.is_error
+    assert payload["odds"] == {"status": "no_match"}
+    source = next(item for item in payload["sources"] if item["source"] == "the_odds_api")
+    assert source["status"] == "no_match"
     assert not any("getMatchCalculatorV1" in url for url in fetcher.urls)
 
 

@@ -75,12 +75,16 @@ class SkillScriptTool:
             **self._catalog.trusted_environment(skill),
         }
         if skill.name == "match-data-toolkit":
+            workspace = self._catalog.skills_root.parent / "workspaces" / context.agent_id
+            football_ledger = workspace / "football" / "ledger.json"
+            worldcup_ledger = workspace / "worldcup" / "ledger.json"
+            # Keep the legacy World Cup script pointed at its own ledger when
+            # both ledgers are present. A new general football Agent has no
+            # worldcup ledger yet, so it defaults to the football ledger.
+            if football_ledger.exists() or not worldcup_ledger.exists():
+                environment["FOOTBALL_LEDGER"] = str(football_ledger)
             environment["WC_LEDGER"] = str(
-                self._catalog.skills_root.parent
-                / "workspaces"
-                / context.agent_id
-                / "worldcup"
-                / "ledger.json"
+                worldcup_ledger
             )
         process = await asyncio.create_subprocess_exec(
             str(interpreter),

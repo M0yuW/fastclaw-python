@@ -149,6 +149,8 @@ async def test_general_football_team_creation_persists_role_prompts(tmp_path: Pa
         assert coordinator.config["maxFailedToolRounds"] == 1
         assert coordinator.config["scopeGuard"] == "football"
         assert "season or edition" in coordinator.config["soul"]
+        assert "final prediction-direction section" in coordinator.config["soul"]
+        assert "1X2 must be exactly home win, draw, or away win" in coordinator.config["soul"]
         assert data_analyst is not None
         assert data_analyst.config["model"] == "deepseek-v4-flash"
         assert data_analyst.config["allowedTools"] == ["football_data", "football_context"]

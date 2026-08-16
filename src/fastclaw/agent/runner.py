@@ -98,6 +98,7 @@ class AgentRunner:
         seq = 0
         round_index = 0
         failed_tool_rounds = 0
+        ledger_write_succeeded = False
         provider_stream: ProviderStream | None = None
         current_stage = "session_load"
         started_at = asyncio.get_running_loop().time()
@@ -120,13 +121,16 @@ class AgentRunner:
                 context.user_id, context.agent_id, context.session_id
             )
             history = self._history(stored)
-            if request.system_prompt and not any(
-                item.role is MessageRole.SYSTEM for item in history
-            ):
-                history.insert(
-                    0,
-                    ChatMessage(role=MessageRole.SYSTEM, content=request.system_prompt),
+            if request.system_prompt:
+                runtime_system = ChatMessage(
+                    role=MessageRole.SYSTEM,
+                    content=request.system_prompt,
                 )
+                # The persisted system message belongs to the previous runtime
+                # configuration. Replace it on every continuation so config and
+                # team-policy changes are effective without creating a new session.
+                history = [item for item in history if item.role is not MessageRole.SYSTEM]
+                history.insert(0, runtime_system)
             history.append(ChatMessage(role=MessageRole.USER, content=request.message))
             history = list(normalize_messages(tuple(history)))
             clarification = self._scope_clarification(request.scope_guard, history)
@@ -249,6 +253,13 @@ class AgentRunner:
                             message_metadata = dict(result.metadata)
                             if result.is_error:
                                 message_metadata["isError"] = True
+                            if (
+                                call.function.name == "football_ledger"
+                                and not result.is_error
+                                and result.metadata.get("status")
+                                in {"appended", "updated", "settled"}
+                            ):
+                                ledger_write_succeeded = True
                             history.append(
                                 ChatMessage(
                                     role=MessageRole.TOOL,
@@ -273,10 +284,17 @@ class AgentRunner:
                             request.max_failed_tool_rounds
                             and failed_tool_rounds >= request.max_failed_tool_rounds
                         ):
+                            failures = [
+                                (call.function.name, result.content)
+                                for call, result in zip(
+                                    assistant.tool_calls, batch_results, strict=True
+                                )
+                                if result.is_error
+                            ]
                             final = ChatMessage(
                                 role=MessageRole.ASSISTANT,
-                                content=request.failed_tool_message,
-                                metadata={"evidenceGate": "all_tools_failed"},
+                                content=self._failed_tool_message(request, failures),
+                                metadata=self._failed_tool_metadata(failures),
                             )
                             history.append(final)
                             await self._persistence.save(
@@ -284,7 +302,7 @@ class AgentRunner:
                             )
                             yield event(
                                 AgentEventType.CONTENT,
-                                content=request.failed_tool_message,
+                                content=final.content,
                                 message=final,
                             )
                             yield event(AgentEventType.DONE, message=final)
@@ -292,6 +310,7 @@ class AgentRunner:
                         continue
 
                     round_results: list[bool] = []
+                    round_failures: list[tuple[str, str]] = []
                     for call, (arguments, parse_error) in zip(
                         assistant.tool_calls, parsed_calls, strict=True
                     ):
@@ -319,7 +338,15 @@ class AgentRunner:
                             result_metadata = result.metadata
                         if parse_error:
                             direct_return = False
+                        if (
+                            call.function.name == "football_ledger"
+                            and not is_error
+                            and result_metadata.get("status") in {"appended", "updated", "settled"}
+                        ):
+                            ledger_write_succeeded = True
                         round_results.append(is_error)
+                        if is_error:
+                            round_failures.append((call.function.name, result_content))
                         message_metadata = dict(result_metadata)
                         if is_error:
                             message_metadata["isError"] = True
@@ -340,6 +367,18 @@ class AgentRunner:
                             is_error=is_error,
                         )
                         if direct_return and not is_error:
+                            ledger_report_is_intermediate = (
+                                call.function.name == "football_ledger"
+                                and result_metadata.get("status") == "report"
+                                and self._expects_football_workflow(request.message)
+                                and (
+                                    not ledger_write_succeeded
+                                    if not self._is_ledger_review(request.message)
+                                    else not context.shared_state.football_settlement_attempted
+                                )
+                            )
+                            if ledger_report_is_intermediate:
+                                continue
                             final = ChatMessage(
                                 role=MessageRole.ASSISTANT,
                                 content=result_content,
@@ -366,8 +405,8 @@ class AgentRunner:
                     ):
                         final = ChatMessage(
                             role=MessageRole.ASSISTANT,
-                            content=request.failed_tool_message,
-                            metadata={"evidenceGate": "all_tools_failed"},
+                            content=self._failed_tool_message(request, round_failures),
+                            metadata=self._failed_tool_metadata(round_failures),
                         )
                         history.append(final)
                         await self._persistence.save(
@@ -375,7 +414,7 @@ class AgentRunner:
                         )
                         yield event(
                             AgentEventType.CONTENT,
-                            content=request.failed_tool_message,
+                            content=final.content,
                             message=final,
                         )
                         yield event(AgentEventType.DONE, message=final)
@@ -407,6 +446,103 @@ class AgentRunner:
                 await provider_stream.aclose()
 
     @staticmethod
+    def _failed_tool_message(
+        request: AgentRunRequest, failures: list[tuple[str, str]]
+    ) -> str:
+        """Keep fail-closed behavior without misclassifying operational failures."""
+
+        if not failures:
+            return request.failed_tool_message
+        evidence_tools = {
+            "football_context",
+            "football_data",
+            "football_odds",
+            "spawn_subagent",
+        }
+        failure_text = " ".join(str(content) for _name, content in failures)
+        operational_failure = bool(
+            re.search(
+                r"429|403|5\d\d|timeout|timed out|超时|限流|rate.?limit|"
+                r"request failed|request did not complete|must confirm|not published|"
+                r"tool '.*' failed",
+                failure_text,
+                re.IGNORECASE,
+            )
+        )
+        if all(name in evidence_tools for name, _content in failures) and not operational_failure:
+            prefix = request.failed_tool_message
+        else:
+            prefix = "本轮未完成\uFF1A工具执行失败\uFF1B这不等同于数据源全部缺失。"
+        details: list[str] = []
+        for name, content in failures:
+            detail = re.sub(r"\s+", " ", str(content)).strip()
+            if len(detail) > 500:
+                detail = f"{detail[:497]}..."
+            details.append(f"- {name}: {detail or '未提供错误详情'}")
+        return f"{prefix}\n\n具体工具错误\uFF1A\n" + "\n".join(details)
+
+    @staticmethod
+    def _failed_tool_metadata(failures: list[tuple[str, str]]) -> dict[str, str]:
+        evidence_tools = {
+            "football_context",
+            "football_data",
+            "football_odds",
+            "spawn_subagent",
+        }
+        failure_text = " ".join(str(content) for _name, content in failures)
+        operational_failure = bool(
+            re.search(
+                r"429|403|5\d\d|timeout|timed out|超时|限流|rate.?limit|"
+                r"request failed|request did not complete|must confirm|not published|"
+                r"tool '.*' failed",
+                failure_text,
+                re.IGNORECASE,
+            )
+        )
+        if (
+            failures
+            and all(name in evidence_tools for name, _content in failures)
+            and not operational_failure
+        ):
+            return {"evidenceGate": "all_tools_failed"}
+        if failures and all(name in evidence_tools for name, _content in failures):
+            return {"toolFailure": "operational_or_partial_failure"}
+        return {"toolFailure": "all_tools_failed"}
+
+    @staticmethod
+    def _expects_football_workflow(message: str) -> bool:
+        """Keep an initial ledger check from short-circuiting a prediction turn."""
+
+        text = message.casefold()
+        workflow_terms = (
+            "预测",
+            "分析",
+            "重新",
+            "修正",
+            "核实",
+            "predict",
+            "analy",
+            "re-predict",
+            "revisit",
+            "复盘",
+            "结算",
+            "赛果",
+            "review",
+            "settle",
+        )
+        ledger_terms = ("账本", "台账", "入账", "ledger")
+        return any(term in text for term in workflow_terms) and any(
+            term in text for term in ledger_terms
+        )
+
+    @staticmethod
+    def _is_ledger_review(message: str) -> bool:
+        text = message.casefold()
+        return any(term in text for term in ("复盘", "结算", "赛果", "review", "settle")) and any(
+            term in text for term in ("账本", "台账", "ledger")
+        )
+
+    @staticmethod
     def _history(stored: SessionRecord | None) -> list[ChatMessage]:
         if stored is None:
             return []
@@ -426,11 +562,31 @@ class AgentRunner:
     def _scope_clarification(scope_guard: str, history: list[ChatMessage]) -> str:
         if scope_guard != "football":
             return ""
-        user_text = " ".join(
+        user_messages = [
             str(message.content or "")
             for message in history
             if message.role is MessageRole.USER and isinstance(message.content, str)
+        ]
+        user_text = " ".join(
+            user_messages
         )
+        # Ledger review/report is already scoped to the current Agent's
+        # persisted ledger.  Requiring a new fixture here prevents the
+        # coordinator from calling football_ledger(report), unlike the Go
+        # World Cup flow where ledger inspection is a first-class operation.
+        if user_messages and re.search(r"账本|台账|ledger", user_messages[-1], re.IGNORECASE):
+            return ""
+        latest_user_message = user_messages[-1] if user_messages else ""
+        continuation = bool(
+            re.search(
+                r"继续|接着|按上面|刚才|之前|这个会话|同样|再来|重试|\bcontinue\b",
+                latest_user_message,
+                re.IGNORECASE,
+            )
+        )
+        workflow_text = " ".join(user_messages) if continuation else latest_user_message
+        if not AgentRunner._is_explicit_prediction_request(workflow_text):
+            return ""
         has_match = bool(
             re.search(r"vs\.?|versus|\bv\.\b|对阵|对战|迎战", user_text, re.IGNORECASE)
         )
@@ -461,6 +617,26 @@ class AgentRunner:
         if not missing:
             return ""
         return "请先补充" + "、".join(missing) + "。范围确认后我再调用专家并生成预测。"
+
+    @staticmethod
+    def _is_explicit_prediction_request(message: str) -> bool:
+        """Only gate scope for an explicit prediction workflow.
+
+        A football coordinator also handles ordinary football and runtime
+        conversation. Generic words such as "分析", "继续", or "比赛" must
+        not turn those messages into a prediction request.
+        """
+
+        return bool(
+            re.search(
+                r"预测|预判|推演|胜负|胜平负|1x2|大小球|让球|推荐|投注|下注|"
+                r"赔率(?:分析)?|赛前分析|比赛预测|对阵分析|预测方向|"
+                r"\bpredict(?:ion)?\b|\bforecast\b|\bbetting\b|\bodds\b|"
+                r"\bev\b|expected\s+value",
+                message,
+                re.IGNORECASE,
+            )
+        )
 
     @staticmethod
     def _clean_title(value: str, limit: int = 100) -> str:

@@ -28,7 +28,10 @@ env:
 - `python3 scripts/odds_data.py --competition "瑞典超" --regions eu --markets h2h,totals --odds-format decimal`
 - `python3 scripts/odds_data.py --competition "FIFA World Cup" --commence-from 2026-06-01T00:00:00Z --commence-to 2026-08-01T00:00:00Z`
 - `python3 scripts/sporttery_data.py --match "IK Sirius" "IF Brommapojkarna"`
+- `python3 scripts/ledger_report.py --pending`
 
 `odds_data.py` 先查询实时 sports catalog，再确认受审 `sport_key`。`ODDS_API_KEY` 只从环境变量读取，不进入输出、日志、数据库或异常。`sporttery_data.py` 仅限 EV 分析师使用；其他角色不得以任何方式回退到体彩或猜测市场数据。
+
+`ledger_report.py` 读取 Runtime 注入的 `FOOTBALL_LEDGER`，按固定模板输出统计摘要和 Markdown 表格；它不是账本 JSON 导出器。客户可见结果必须使用该表格格式，不提供 ledger JSON 下载。
 
 旧的 `match_data.py` 世界杯命令继续保留兼容性；新生产流程应优先调用 Runtime 的 `football_data(action=evidence)`。

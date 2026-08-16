@@ -2,10 +2,62 @@
 
 from __future__ import annotations
 
+import json
+import re
+import unicodedata
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from typing import Any
+
+from fastclaw.football_identity import football_team_identity, football_teams_match
+
+__all__ = ("football_team_identity", "football_teams_match")
+
+
+def _normalize_identifier(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return re.sub(r"[^\w]+", "", normalized)
+
+
+def _fixture_matches(
+    content: str,
+    *,
+    competition: str,
+    season: str,
+    date: str,
+    team_a: str,
+    team_b: str,
+) -> bool:
+    try:
+        payload: Any = json.loads(content)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    fixture = payload.get("fixture") if isinstance(payload, dict) else None
+    if not isinstance(fixture, dict):
+        return False
+    fixture_competition = str(fixture.get("competition") or "")
+    fixture_season = str(fixture.get("season") or "")
+    fixture_date = str(fixture.get("requested_date") or fixture.get("date") or "")
+    return (
+        _normalize_identifier(fixture_competition)
+        == _normalize_identifier(competition)
+        and fixture_season == season
+        and _normalize_identifier(fixture_date) == _normalize_identifier(date)
+        and football_teams_match(
+            str(fixture.get("home") or ""),
+            team_a,
+            left_provider="thesportsdb",
+            left_provider_id=fixture.get("home_team_id"),
+        )
+        and football_teams_match(
+            str(fixture.get("away") or ""),
+            team_b,
+            left_provider="thesportsdb",
+            left_provider_id=fixture.get("away_team_id"),
+        )
+    )
 
 
 @dataclass(slots=True)
@@ -14,16 +66,38 @@ class SharedExecutionState:
 
     football_base_evidence: dict[str, str] = field(default_factory=dict)
     ev_requested: bool = False
+    football_settlement_attempted: bool = False
+    football_settlement_review: bool = False
+    football_settlement_results: list[str] = field(default_factory=list)
+    football_settlement_errors: list[str] = field(default_factory=list)
 
     def publish_football_base(self, key: str, content: str) -> None:
         self.football_base_evidence[key] = content
 
     def football_base(self, key: str) -> str | None:
-        content = self.football_base_evidence.get(key)
-        if content is not None:
-            return content
-        if len(self.football_base_evidence) == 1:
-            return next(iter(self.football_base_evidence.values()))
+        return self.football_base_evidence.get(key)
+
+    def football_base_for_fixture(
+        self,
+        *,
+        competition: str,
+        season: str,
+        date: str,
+        team_a: str,
+        team_b: str,
+    ) -> tuple[str, str] | None:
+        """Resolve shared evidence by the confirmed fixture, not raw aliases."""
+
+        for key, content in self.football_base_evidence.items():
+            if _fixture_matches(
+                content,
+                competition=competition,
+                season=season,
+                date=date,
+                team_a=team_a,
+                team_b=team_b,
+            ):
+                return key, content
         return None
 
     def has_football_base(self) -> bool:

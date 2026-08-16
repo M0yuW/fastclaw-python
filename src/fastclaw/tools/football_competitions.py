@@ -17,6 +17,10 @@ class FootballCompetition:
     espn_slug: str
     odds_sport_key: str
     aliases: tuple[str, ...]
+    provider_country: str | None = None
+    # Reviewed provider league IDs used only for prior-division context. They
+    # are runtime-owned and never exposed as model-supplied identifiers.
+    historical_league_ids: tuple[tuple[str, str], ...] = ()
 
     def public_mapping(self) -> dict[str, str]:
         return {
@@ -69,7 +73,15 @@ FOOTBALL_COMPETITIONS: tuple[FootballCompetition, ...] = (
         "Spain",
         "esp.1",
         "soccer_spain_la_liga",
-        ("La Liga", "LALIGA", "西甲", "西班牙甲级联赛"),
+        (
+            "La Liga",
+            "LALIGA",
+            "西甲",
+            "西甲 La Liga",
+            "西班牙甲级联赛",
+            "西班牙 La Liga",
+        ),
+        historical_league_ids=(("Spanish La Liga 2", "4400"),),
     ),
     FootballCompetition(
         "german-bundesliga",
@@ -101,7 +113,8 @@ FOOTBALL_COMPETITIONS: tuple[FootballCompetition, ...] = (
         "Netherlands",
         "ned.1",
         "soccer_netherlands_eredivisie",
-        ("Eredivisie", "荷甲", "荷兰甲级联赛"),
+        ("Eredivisie", "荷甲", "荷甲 Eredivisie", "荷兰甲级联赛"),
+        "The Netherlands",
     ),
     FootballCompetition(
         "portuguese-primeira-liga",
@@ -159,6 +172,25 @@ def normalize_competition_name(value: str) -> str:
 
     normalized = unicodedata.normalize("NFKC", value).casefold()
     return re.sub(r"[^\w]+", "", normalized)
+
+
+def canonical_competition_identity(value: str, *, country: str = "") -> str:
+    """Return the stable identity used by caches, ledgers, and provider joins.
+
+    Human-facing names are deliberately not used as keys.  A reviewed alias such
+    as ``西甲`` or ``La Liga`` resolves to the same competition key; unknown
+    values still get a deterministic normalized fallback so old ledgers remain
+    readable without silently being assigned to a different competition.
+    """
+
+    resolved = resolve_football_competition(value, country=country)
+    # Keep the provider-independent key compact because this value is also
+    # embedded in legacy cache keys (for example ``spanishlaliga|...``).
+    return (
+        normalize_competition_name(resolved.key)
+        if resolved is not None
+        else normalize_competition_name(value)
+    )
 
 
 def resolve_football_competition(value: str, *, country: str = "") -> FootballCompetition | None:

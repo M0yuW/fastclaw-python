@@ -105,7 +105,7 @@ def fetch_odds(
         return _status(
             "unavailable",
             error_code="odds_key_missing",
-            safe_reason="The Odds API is not configured; query current Sporttery fixtures",
+            safe_reason="The Odds API is not configured",
         )
     try:
         catalog, catalog_quota = _request("sports", {}, api_key)
@@ -151,7 +151,7 @@ def fetch_odds(
         return _status(
             "unavailable",
             error_code="odds_request_failed",
-            safe_reason="The Odds API request did not complete; query current Sporttery fixtures",
+            safe_reason="The Odds API request did not complete",
         )
     except (json.JSONDecodeError, UnicodeDecodeError):
         return _status(

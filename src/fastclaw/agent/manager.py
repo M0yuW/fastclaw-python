@@ -49,9 +49,15 @@ from fastclaw.tools import (
     ReadFileTool,
     SkillScriptTool,
     ToolRegistry,
+    ToolResult,
     WebFetchTool,
     WorldCupLedgerTool,
     WriteFileTool,
+)
+from fastclaw.tools.football_shared import (
+    football_event_key,
+    football_evidence_is_current,
+    get_football_evidence_cache,
 )
 
 _STANDARD_PROVIDERS: dict[str, tuple[str, str]] = {
@@ -505,6 +511,7 @@ class AgentRuntimeManager:
             call_path=(agent_id,),
             shared_state=SharedExecutionState(ev_requested=_explicit_ev_request(message)),
         )
+        await self._restore_persisted_football_base(context)
         request = self._request(profile, selection.model, message)
 
         async def producer(emit: Callable[[AgentEvent], None]) -> TaskResult:
@@ -537,6 +544,66 @@ class AgentRuntimeManager:
             model=selection.model,
             producer=producer,
         )
+
+    async def _restore_persisted_football_base(self, context: ExecutionContext) -> None:
+        """Rehydrate confirmed football bundles after a process restart.
+
+        The in-process cache protects a live continuation, while the child data
+        Agent's tool result is also persisted in its Session. Restore only
+        successful, machine-readable ``football_data`` results for this exact
+        user/session; prose reports are deliberately ignored.
+        """
+
+        cache = get_football_evidence_cache()
+        async with UnitOfWork(self.database) as unit:
+            store = unit.require_store()
+            agents = await store.list_agents(context.user_id)
+            stored_sessions = [
+                stored
+                for agent in agents
+                if (stored := await store.get_session(
+                    context.user_id, agent.id, context.session_id
+                ))
+                is not None
+            ]
+
+        for stored in stored_sessions:
+            for message in stored.messages:
+                if message.get("role") != "tool" or message.get("name") != "football_data":
+                    continue
+                content = message.get("content")
+                if not isinstance(content, str):
+                    continue
+                if not football_evidence_is_current(content):
+                    # Old sessions may contain a valid fixture bundle but lack
+                    # the explicit prior-season/tier history contract. Do not
+                    # silently reuse it; continuation must refresh the data
+                    # analyst bundle before specialists run.
+                    continue
+                try:
+                    payload = json.loads(content)
+                except json.JSONDecodeError:
+                    continue
+                fixture = payload.get("fixture") if isinstance(payload, dict) else None
+                if not isinstance(fixture, dict):
+                    continue
+                competition = str(fixture.get("competition") or "").strip()
+                season = str(fixture.get("season") or "").strip()
+                date = str(
+                    fixture.get("requested_date") or fixture.get("date") or ""
+                ).strip()
+                team_a = str(fixture.get("home") or "").strip()
+                team_b = str(fixture.get("away") or "").strip()
+                if not all((competition, season, date, team_a, team_b)):
+                    continue
+                key = football_event_key(competition, season, date, team_a, team_b)
+                result = ToolResult(
+                    content=content,
+                    metadata={"persistedSession": True, "sourceAgentId": stored.agent_id},
+                )
+                context.shared_state.publish_football_base(key.value, content)
+                await cache.put("base", key, result)
+                await cache.put_session_base(context.session_id, key, result)
 
     async def chat(self, **values: str) -> ChatMessage:
         stream = await self.stream(**values)
@@ -760,19 +827,58 @@ class AgentRuntimeManager:
         profile = self._profiles[agent_id]
         target_role = str(profile.agent.config.get("teamRole") or "").casefold()
         if target_role == "ev-analyst" and not context.shared_state.ev_requested:
-            raise AgentRunError(
-                "EV analyst is only available when the user explicitly requests odds or EV analysis"
+            return (
+                "EV analysis skipped: the user did not explicitly request odds or "
+                "expected-value analysis. No EV provider or market-data request was made."
             )
         selection = await self.provider_selection(profile)
         shared_evidence = context.shared_state.render_football_base()
-        if shared_evidence and "## Shared football base evidence" not in task:
+        settlement_task = False
+        if target_role == "data-analyst":
+            if re.search(
+                r"复盘|结算|赛果|实际结果|核对(?:已结束)?比赛|核对.*赛果|"
+                r"settle(?:ment)?\s+ledger|finished\s+matches",
+                task,
+                re.IGNORECASE,
+            ):
+                settlement_task = True
+                context.shared_state.football_settlement_review = True
+                task = (
+                    f"{task}\n\n## Runtime settlement-review requirement\n"
+                    "This is a ledger settlement review, not a new prediction. Read the "
+                    "pending ledger rows supplied by the coordinator, group them by reviewed "
+                    "competition and season, and call football_data with action=results and "
+                    "the exact YYYY-MM-DD date for each group. Match rows by date and "
+                    "home/away identity. Return only "
+                    "machine-readable verified results with final score, result, source, and "
+                    "status; distinguish not_finished, no_match, and unavailable. Return a "
+                    "verified_matches list for every row whose status is FT/final and whose "
+                    "score is numeric. Partial success is valid: do not retry another action "
+                    "or erase verified rows because a different competition failed. Never use "
+                    "Sporttery, odds, or memory."
+                )
+            else:
+                task = (
+                    f"{task}\n\n## Runtime evidence-publication requirement\n"
+                    "This is a fresh data delegation. Do not treat a previous report, pasted "
+                    "prose, or event ID as a new confirmation. For every requested fixture, "
+                    "call football_data with action=base_evidence now. Do not report success "
+                    "until the tool calls succeed and publish machine-readable shared evidence. "
+                    "Do not call football_odds or Sporttery."
+                )
+        elif shared_evidence and "## Shared football base evidence" not in task:
             task = (
                 f"{task}\n\n## Shared football base evidence\n"
                 "The data analyst already confirmed this fixture. Reuse this evidence; "
                 "do not re-query TheSportsDB or replace the confirmed fixture.\n"
                 f"{shared_evidence}"
             )
-        request = self._request(profile, selection.model, task)
+        request = self._request(
+            profile,
+            selection.model,
+            task,
+            allowed_tools=frozenset({"football_data"}) if settlement_task else None,
+        )
         return await self._run(profile, selection, request, context, lambda event: None)
 
     async def _run(
@@ -982,12 +1088,14 @@ class AgentRuntimeManager:
                 if data_member is not None:
                     effective_config["teamDataAgentId"] = data_member.agent_id
             break
+        role_key = str(effective_config.get("teamRole") or "")
         competition_team_tools = {"football_data", "football_odds", "football_context"}
         is_competition_team = (
             isinstance(configured_allowed_tools, list)
             and bool(competition_team_tools.intersection(configured_allowed_tools))
+        ) or (
+            role_key == "coordinator" and effective_config.get("scopeGuard") == "football"
         )
-        role_key = str(effective_config.get("teamRole") or "")
         if is_competition_team and role_key in {
             "data-analyst",
             "odds-analyst",
@@ -1011,12 +1119,49 @@ class AgentRuntimeManager:
         if is_competition_team and role_key == "coordinator":
             prompt_parts.append(
                 "## Football evidence order\n\n"
-                "Delegate the data-analyst first and wait for its base_evidence result. "
+                "Treat this as a general football conversation by default. Answer ordinary "
+                "football, system, source, and workflow questions directly and do not assume "
+                "that every message requests a prediction. Only for an explicit prediction, "
+                "pre-match analysis, 1X2, totals, odds, EV, or prediction-ledger request, "
+                "delegate the data-analyst first and wait for its base_evidence result. "
                 "Only after that result succeeds may you delegate tactics, odds, history, "
                 "or risk. Those specialists receive the shared evidence and must not repeat "
-                "the primary football-data lookup. EV is optional and must only be delegated "
+                "the primary football-data lookup. For a normal prediction, odds analysis is "
+                "mandatory after base evidence; only an explicit user request to exclude odds "
+                "may record odds_not_requested. EV is optional and must only be delegated "
                 "when the original user explicitly requests odds, market prices, betting, "
                 "Sporttery, EV, expected value, or sensitivity."
+            )
+            prompt_parts.append(
+                "## Football prediction output contract\n\n"
+                "Apply this contract only when the user explicitly requests a prediction or "
+                "prediction-ledger operation. For ordinary football conversation, answer the "
+                "actual question and do not ask for fixture scope or produce a prediction. "
+                "After reconciling all specialist reports, the final user-facing answer must "
+                "contain a clearly labeled final prediction-direction section with one row "
+                "for every requested match. Each row must include a valid 1X2 lean (home win, "
+                "draw, away win, or no clear edge), confidence (high, medium, or low), the "
+                "evidence basis, and invalidation conditions. Missing data lowers confidence; "
+                "it does not justify omitting a supported low-confidence lean. Use no clear "
+                "edge only when no valid directional evidence exists, and explain why. Never "
+                "confuse markets: 1X2 is exactly home win, draw, or away win; 1X, X2, and 12 "
+                "are double-chance markets and must be labeled separately; Under/Over is a "
+                "totals market. Never relabel a double-chance or totals lean as 1X2. Never "
+                "invent facts, prices, lineups, or predictions from memory. This is analysis, "
+                "not stake advice. Record each supported 1X2 prediction with football_ledger "
+                "after reconciliation; for append, put competition, season, date, match, "
+                "our_pred, and our_confidence inside the entry object. When the user asks to "
+                "correct an existing prediction, use football_ledger operation=update with "
+                "the same competition, date, and match key and only the changed fields; do "
+                "not append a second row. Use settle only to fill actual_result or actual_score. "
+                "If append reports existing_requires_update, call update before responding. "
+                "view the ledger, call football_ledger with operation=report and show its "
+                "fixed Markdown table directly; never export or offer the ledger JSON to the "
+                "customer. If the user only asks to review or 复盘 the ledger without a named "
+                "fixture, call report first and do not request fixture scope. For 复盘, then "
+                "delegate the data analyst to query competition results, settle only verified "
+                "finished matches, and call report again; leave future, unfinished, unmatched, "
+                "or unavailable matches pending."
             )
         system_prompt = "\n\n".join(prompt_parts).replace(
             str(self.config.legacy_data_root), str(self.config.data_root)
@@ -1076,7 +1221,13 @@ class AgentRuntimeManager:
         return {"finance-tools": config}, {"finance-tools": environment}, enabled
 
     @staticmethod
-    def _request(profile: AgentRuntimeProfile, model: str, message: str) -> AgentRunRequest:
+    def _request(
+        profile: AgentRuntimeProfile,
+        model: str,
+        message: str,
+        *,
+        allowed_tools: frozenset[str] | None = None,
+    ) -> AgentRunRequest:
         config = profile.agent.config
         configured_max_failed_tool_rounds = config.get("maxFailedToolRounds")
         if configured_max_failed_tool_rounds is None:
@@ -1097,7 +1248,7 @@ class AgentRuntimeManager:
             model=model,
             message=message,
             system_prompt=profile.system_prompt or str(config.get("soul") or ""),
-            allowed_tools=profile.allowed_tools,
+            allowed_tools=profile.allowed_tools if allowed_tools is None else allowed_tools,
             max_rounds=int(config.get("maxToolIterations") or 8),
             max_tokens=int(config.get("maxTokens") or 4096),
             temperature=float(

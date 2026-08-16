@@ -618,6 +618,13 @@ export async function stopChat(agentId: string, sessionId: string): Promise<{ ok
 export interface ToolResultMetadata {
   sandbox?: boolean;
   isError?: boolean;
+  status?: string;
+  errorCode?: string;
+  correlationId?: string;
+  entryKey?: string;
+  mergedRows?: number;
+  evidenceGate?: string;
+  toolFailure?: string;
 }
 
 export interface ChatStreamEvent {

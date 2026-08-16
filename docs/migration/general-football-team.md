@@ -24,8 +24,10 @@ Coordinator 在委派前必须确定：
 
 - 新增公开模板 `football-competition-analysis`；Teams 页面会通过模板 API 自动显示，无需
   前端硬编码。
-- 新增 `football_ledger`，以 `(competition, date, match)` 为唯一键；支持 append、settle、
-  按 competition/season 筛选 report，以及 `pending_only`。
+- 新增 `football_ledger`，以 `(competition, date, match)` 为唯一键；支持 append、update、
+  settle、按 competition/season 筛选 report，以及 `pending_only`。新预测使用 append；修正
+  已有预测使用 update，按唯一键原地修改，不新增重复行。若模型误把已有记录用 append 提交，
+  工具返回 `existing_requires_update` 并要求下一轮改用 update，不静默覆盖记录。
 - 账本固定在当前 coordinator 的
   `~/.fastclaw-python/workspaces/<agent_id>/football/ledger.json`，与世界杯
   `worldcup/ledger.json` 完全隔离。

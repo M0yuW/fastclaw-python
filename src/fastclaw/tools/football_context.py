@@ -6,14 +6,13 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-from fastclaw.execution import ExecutionContext
+from fastclaw.execution import ExecutionContext, football_teams_match
 from fastclaw.providers import ToolDefinition, ToolFunction
 from fastclaw.tools.base import ToolResult
 from fastclaw.tools.football_competitions import (
-    normalize_competition_name,
     resolve_football_competition,
 )
-from fastclaw.tools.football_evidence import OddsSource, SourceResult, TheOddsApiSource, utc_now
+from fastclaw.tools.football_evidence import OddsSource, SourceResult, TheOddsApiSource
 from fastclaw.tools.football_shared import (
     FootballEvidenceCache,
     football_event_key,
@@ -24,7 +23,8 @@ from fastclaw.tools.football_shared import (
 class FootballContextTool:
     """Read the base evidence published by the data Agent for this root run."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, cache: FootballEvidenceCache | None = None) -> None:
+        self._cache = cache or get_football_evidence_cache()
         self.definition = ToolDefinition(
             function=ToolFunction(
                 name="football_context",
@@ -47,15 +47,52 @@ class FootballContextTool:
         )
 
     async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
+        if context.shared_state.football_settlement_review:
+            result = ToolResult(
+                content=(
+                    "football_context is forbidden during settlement review; use "
+                    "football_data action=results"
+                ),
+                is_error=True,
+                metadata={"errorCode": "football_settlement_context_forbidden"},
+            )
+            context.shared_state.football_settlement_errors.append(result.content)
+            return result
+        competition_name = str(arguments.get("competition") or "")
+        trusted_competition = resolve_football_competition(competition_name)
         key = football_event_key(
-            str(arguments.get("competition") or ""),
+            trusted_competition.name if trusted_competition is not None else competition_name,
             str(arguments.get("season") or ""),
             str(arguments.get("date") or ""),
             str(arguments.get("team_a") or ""),
             str(arguments.get("team_b") or ""),
         )
-        content = context.shared_state.football_base(key.value)
-        if content is None:
+        resolved = context.shared_state.football_base_for_fixture(
+            competition=key.competition,
+            season=key.season,
+            date=key.date,
+            team_a=str(arguments.get("team_a") or ""),
+            team_b=str(arguments.get("team_b") or ""),
+        )
+        if resolved is None:
+            cached = await self._cache.find_fixture(
+                "base",
+                competition=key.competition,
+                season=key.season,
+                date=key.date,
+                team_a=str(arguments.get("team_a") or ""),
+                team_b=str(arguments.get("team_b") or ""),
+            )
+            if cached is not None:
+                cached_key, cached_result = cached
+                resolved = (cached_key.value, cached_result.content)
+                context.shared_state.publish_football_base(
+                    cached_key.value, cached_result.content
+                )
+                await self._cache.put_session_base(
+                    context.session_id, cached_key, cached_result
+                )
+        if resolved is None:
             return ToolResult(
                 content=json.dumps(
                     {"error": "base football evidence is not ready; ask the data analyst first"},
@@ -64,7 +101,11 @@ class FootballContextTool:
                 is_error=True,
                 metadata={"errorCode": "football_context_not_ready"},
             )
-        return ToolResult(content=content, metadata={"shared": True, "cacheHit": True})
+        resolved_key, content = resolved
+        return ToolResult(
+            content=content,
+            metadata={"shared": True, "cacheHit": True, "baseEvidenceKey": resolved_key},
+        )
 
 
 class FootballOddsTool:
@@ -119,6 +160,13 @@ class FootballOddsTool:
         )
 
     async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
+        if context.shared_state.football_settlement_review:
+            result = self._error(
+                "football_odds is forbidden during settlement review; use "
+                "football_data action=results"
+            )
+            context.shared_state.football_settlement_errors.append(result.content)
+            return result
         competition_name = str(arguments.get("competition") or "").strip()
         country = str(arguments.get("country") or "").strip()
         season = str(arguments.get("season") or "").strip()
@@ -126,17 +174,44 @@ class FootballOddsTool:
         team_a = str(arguments.get("team_a") or "").strip()
         team_b = str(arguments.get("team_b") or "").strip()
         if not all((competition_name, season, date, team_a, team_b)):
-            return self._error("football_odds requires competition, season, date, team_a, and team_b")
-        key = football_event_key(competition_name, season, date, team_a, team_b)
-        base_content = context.shared_state.football_base(key.value)
-        if base_content is None:
-            return self._error("football_context must confirm the fixture before football_odds")
-        cached = await self._cache.get("odds", key)
-        if cached is not None:
-            return cached
+            return self._error(
+                "football_odds requires competition, season, date, team_a, and team_b"
+            )
         competition = resolve_football_competition(competition_name, country=country)
         if competition is None:
             return self._error("competition is not in the trusted Runtime catalog")
+        key = football_event_key(competition.name, season, date, team_a, team_b)
+        resolved = context.shared_state.football_base_for_fixture(
+            competition=competition.name,
+            season=key.season,
+            date=key.date,
+            team_a=team_a,
+            team_b=team_b,
+        )
+        if resolved is None:
+            cached = await self._cache.find_fixture(
+                "base",
+                competition=competition.name,
+                season=key.season,
+                date=key.date,
+                team_a=team_a,
+                team_b=team_b,
+            )
+            if cached is not None:
+                cached_key, cached_result = cached
+                resolved = (cached_key.value, cached_result.content)
+                context.shared_state.publish_football_base(
+                    cached_key.value, cached_result.content
+                )
+                await self._cache.put_session_base(
+                    context.session_id, cached_key, cached_result
+                )
+        if resolved is None:
+            return self._error("football_context must confirm the fixture before football_odds")
+        base_key, base_content = resolved
+        cached = await self._cache.get("odds", key)
+        if cached is not None:
+            return cached
         try:
             base_payload = json.loads(base_content)
         except json.JSONDecodeError:
@@ -168,7 +243,7 @@ class FootballOddsTool:
         if source.status == "success" and not matched:
             source = SourceResult(
                 "the_odds_api",
-                "empty",
+                "no_match",
                 quota=source.quota,
                 safe_reason="No matching odds fixture was returned",
             )
@@ -176,9 +251,9 @@ class FootballOddsTool:
             content=json.dumps(
                 {
                     "fixture": fixture,
-                    "odds": matched if source.status == "success" else {"status": "unavailable"},
+                    "odds": matched if source.status == "success" else {"status": source.status},
                     "source": source.report(),
-                    "base_evidence_key": key.value,
+                    "base_evidence_key": base_key,
                     "as_of": datetime.now(UTC).isoformat(),
                 },
                 ensure_ascii=False,
@@ -194,20 +269,23 @@ class FootballOddsTool:
     ) -> list[dict[str, Any]]:
         if source.status != "success" or not isinstance(source.data, list):
             return []
-        wanted = {
-            normalize_competition_name(str(fixture.get("home") or "")),
-            normalize_competition_name(str(fixture.get("away") or "")),
-        }
+        wanted_home = str(fixture.get("home") or "")
+        wanted_away = str(fixture.get("away") or "")
         return [
             row
             for row in source.data
             if isinstance(row, dict)
-            and {
-                normalize_competition_name(str(row.get("home_team") or "")),
-                normalize_competition_name(str(row.get("away_team") or "")),
-            }
-            == wanted
-            and (not row.get("commence_time") or str(row.get("commence_time"))[:10] == date)
+            and football_teams_match(str(row.get("home_team") or ""), wanted_home)
+            and football_teams_match(str(row.get("away_team") or ""), wanted_away)
+            and (
+                not row.get("commence_time")
+                or str(row.get("commence_time"))[:10]
+                in {
+                    date,
+                    str(fixture.get("date") or ""),
+                    str(fixture.get("requested_date") or ""),
+                }
+            )
         ]
 
     @staticmethod

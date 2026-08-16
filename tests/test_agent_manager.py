@@ -102,6 +102,109 @@ def test_ev_dispatch_requires_explicit_market_intent() -> None:
     assert _explicit_ev_request("请补充赔率、EV 和 Sporttery 价格")
 
 
+@pytest.mark.asyncio
+async def test_ev_delegation_is_skipped_without_provider_call(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    ev_agent = AgentRecord(
+        id="ev-analyst",
+        user_id="user-1",
+        name="Football EV analyst",
+        config={"model": "fixture/specialist", "teamRole": "ev-analyst"},
+        created_at=now,
+        updated_at=now,
+    )
+    provider = CoordinatingProvider(ev_agent.id)
+    manager, runtime, database = await build_manager(
+        tmp_path / "ev-skip.db", provider, (ev_agent,)
+    )
+    try:
+        result = await manager._delegated_chat(
+            ev_agent.id,
+            "analyze odds",
+            ExecutionContext(
+                user_id="user-1",
+                agent_id="coordinator",
+                session_id="session-1",
+                root_execution_id="run-1",
+            ),
+        )
+
+        assert "EV analysis skipped" in result
+        assert provider.requests == []
+    finally:
+        await close_manager(manager, runtime, database)
+
+
+@pytest.mark.asyncio
+async def test_existing_football_coordinator_gets_prediction_contract(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    coordinator = AgentRecord(
+        id="football-coordinator",
+        user_id="user-1",
+        name="Football analysis coordinator",
+        config={
+            "model": "fixture/coordinator",
+            "teamRole": "coordinator",
+            "scopeGuard": "football",
+            "allowedTools": ["spawn_subagent", "football_ledger"],
+        },
+        created_at=now,
+        updated_at=now,
+    )
+    provider = CoordinatingProvider("")
+    manager, runtime, database = await build_manager(
+        tmp_path / "football-coordinator.db", provider, (coordinator,)
+    )
+    try:
+        profile = await manager.profile(coordinator.id, "user-1")
+
+        assert "Football prediction output contract" in profile.system_prompt
+        assert "one row for every requested match" in profile.system_prompt
+        assert "1X2 is exactly home win, draw, or away win" in profile.system_prompt
+    finally:
+        await close_manager(manager, runtime, database)
+
+
+@pytest.mark.asyncio
+async def test_settlement_data_delegation_exposes_results_tool_only(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    data_agent = AgentRecord(
+        id="data-analyst",
+        user_id="user-1",
+        name="Competition data analyst",
+        config={
+            "model": "fixture/specialist",
+            "teamRole": "data-analyst",
+            "allowedTools": ["football_data", "football_context"],
+        },
+        created_at=now,
+        updated_at=now,
+    )
+    provider = CoordinatingProvider(data_agent.id)
+    manager, runtime, database = await build_manager(
+        tmp_path / "settlement-tools.db", provider, (data_agent,)
+    )
+    execution = ExecutionContext(
+        user_id="user-1",
+        agent_id=data_agent.id,
+        session_id="session-1",
+        root_execution_id="run-1",
+    )
+    try:
+        result = await manager._delegated_chat(
+            data_agent.id,
+            "复盘账本并核对已结束比赛赛果",
+            execution,
+        )
+
+        assert result == "specialist answer"
+        request = provider.requests[-1]
+        assert {tool.function.name for tool in request.tools} == {"football_data"}
+        assert execution.shared_state.football_settlement_review is True
+    finally:
+        await close_manager(manager, runtime, database)
+
+
 def test_existing_football_specialists_fail_closed_when_config_lacks_policy() -> None:
     now = datetime.now(UTC)
     profile = AgentRuntimeProfile(

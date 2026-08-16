@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { Button } from "@/components/ui/button";
 import { getAgent, getChatHistory, getChatSessions, listAgentFiles, renameChatSession, sendChatStream, stopChat, uploadAgentFiles, getAuthToken, getSkills, type ChatHistoryMessage, type SkillInfo, type ToolResultMetadata } from "@/lib/api";
 import { createChatStreamBatcher, reduceChatStreamEvents, type StreamMessage } from "@/lib/chat-stream";
+import { formatToolSummary } from "@/lib/tool-summary";
 import { useAgentIdFromURL } from "@/hooks/use-agent-id";
 import { Bot, Send, Copy, Check, Pencil, Wrench, ChevronDown, ChevronRight, Download, X, File, FileText, Image as ImageIcon, FileCode, Film, Music, Puzzle, SlidersHorizontal, ShieldCheck, Paperclip, Square } from "lucide-react";
 import Image from "next/image";
@@ -1462,8 +1463,7 @@ function ToolCallGroup({ msg, surfacedSrcs, agentId, sessionId }: { msg: ChatMes
                     <span className="text-muted-foreground/50 font-mono truncate flex-1 text-left text-[11px]">
                       {(() => {
                         try {
-                          const args = JSON.parse(tc.arguments);
-                          return Object.values(args).join(", ");
+                          return formatToolSummary(tc.arguments, tc.name);
                         } catch {
                           return tc.arguments;
                         }
@@ -1491,9 +1491,25 @@ function ToolCallGroup({ msg, surfacedSrcs, agentId, sessionId }: { msg: ChatMes
                           <p className={`text-[10px] font-medium uppercase mb-1 ${tc.isError ? "text-red-500" : "text-muted-foreground"}`}>
                             {tc.isError ? "Error" : "Output"}
                           </p>
-                          <pre className={`text-xs font-mono rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-60 ${tc.isError ? "bg-red-500/10 text-red-700 dark:text-red-300" : "bg-muted/50"}`}>
-                            {tc.result.length > 2000 ? tc.result.slice(0, 2000) + "..." : tc.result}
-                          </pre>
+                          {tc.name === "football_ledger" ||
+                          tc.name === "ledger_report" ||
+                          tc.result.includes("| # | 赛事 |") ? (
+                            <div className="chat-markdown max-w-full overflow-x-auto rounded bg-muted/50 p-2 text-xs">
+                              <ReactMarkdown
+                                remarkPlugins={[remarkGfm]}
+                                components={chatMarkdownComponents}
+                                urlTransform={makeUrlTransform(agentId, sessionId)}
+                              >
+                                {tc.result.length > 12000
+                                  ? `${tc.result.slice(0, 12000)}...`
+                                  : tc.result}
+                              </ReactMarkdown>
+                            </div>
+                          ) : (
+                            <pre className={`text-xs font-mono rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-60 ${tc.isError ? "bg-red-500/10 text-red-700 dark:text-red-300" : "bg-muted/50"}`}>
+                              {tc.result.length > 2000 ? tc.result.slice(0, 2000) + "..." : tc.result}
+                            </pre>
+                          )}
                         </div>
                       ) : (
                         <p className="text-xs text-muted-foreground/60 italic">Executing...</p>

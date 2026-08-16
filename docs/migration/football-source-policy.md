@@ -9,8 +9,8 @@ league IDs, and Odds API sport keys are rejected when supplied by a caller.
 TheSportsDB resolves one reviewed competition and one fixture identity before supplemental
 sources run. The returned fixture is never overwritten by ESPN or odds data. ESPN identity
 mismatches are `rejected`; transport, readiness, and timeout failures are `unavailable`.
-The Odds API is confirmed against its live catalog and falls back to the current Sporttery
-feed. Supplemental failures produce partial success. If the primary fixture cannot be
+The Odds API is confirmed against its live catalog. It does not fall back to Sporttery;
+Sporttery is reserved for an explicit EV workflow. Supplemental failures produce partial success. If the primary fixture cannot be
 confirmed, the Tool fails closed with `football_primary_unavailable` and instructs callers
 not to infer facts.
 
@@ -28,8 +28,15 @@ bundled, but production agents should use the evidence action.
 | curl missing or cancelled | Fixed: structured readiness plus kill-and-reap behavior; runtime image installs curl. |
 | Odds script fixed to World Cup | Fixed: `--competition`, shared reviewed mapping, live catalog confirmation. |
 | Odds key or arbitrary sport key accepted from model | Fixed: key is environment-only and no sport-key argument exists. |
-| Odds failure blocked analysis | Fixed: Sporttery fallback, then explicit odds unavailable while primary evidence survives. |
+| Odds failure blocked analysis | Fixed: explicit Odds API status (`empty`, `unavailable`, or `rejected`) while primary evidence survives; no Sporttery fallback. |
+| Coordinator skipped odds analysis | Fixed: the coordinator prompt and team profile require odds analysis after `base_evidence` for normal predictions; only an explicit user exclusion records `odds_not_requested`. EV/Sporttery remains user-requested. |
 | Runtime and Skill mappings could drift | Fixed: one Skill catalog and an exact Runtime/Skill parity test. |
 
-No database migration is required. Deploy the wheel and restart the Gateway so the new Tool
-schema and bundled Skill replace the previous versions.
+## Open follow-ups
+
+The migration items above are implemented. Continue monitoring provider availability
+and quota status; those are external conditions rather than ledger or orchestration defects.
+
+No database migration is required for provider evidence. Football ledgers use a separate,
+backed-up canonicalization migration before duplicate rows are merged. Deploy the wheel and
+restart the Gateway so the new Tool schema and bundled Skill replace the previous versions.

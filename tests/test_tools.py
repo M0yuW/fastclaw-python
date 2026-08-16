@@ -358,7 +358,7 @@ async def test_worldcup_ledger_is_atomic_unique_and_reports_directly(tmp_path: P
     }
 
     appended = await tool.execute({"operation": "append", "entry": entry}, context())
-    with pytest.raises(ValueError, match="already contains"):
+    with pytest.raises(ValueError, match="ledger already contains this date and match"):
         await tool.execute({"operation": "append", "entry": entry}, context())
     settled = await tool.execute(
         {
@@ -394,18 +394,19 @@ async def test_football_ledger_scopes_entries_by_competition(tmp_path: Path) -> 
 
     await tool.execute({"operation": "append", "entry": premier_league}, context())
     await tool.execute({"operation": "append", "entry": fa_cup}, context())
-    with pytest.raises(ValueError, match="already contains"):
-        await tool.execute(
-            {
-                "operation": "append",
-                "entry": {
-                    **premier_league,
-                    "competition": " premier  league ",
-                    "match": "team a VS team b",
-                },
+    existing = await tool.execute(
+        {
+            "operation": "append",
+            "entry": {
+                **premier_league,
+                "competition": " premier  league ",
+                "match": "team a VS team b",
             },
-            context(),
-        )
+        },
+        context(),
+    )
+    assert existing.metadata["status"] == "existing_requires_update"
+    assert "operation=update" in existing.content
 
     await tool.execute(
         {
@@ -424,12 +425,259 @@ async def test_football_ledger_scopes_entries_by_competition(tmp_path: Path) -> 
     pending_report = await tool.execute({"operation": "report", "pending_only": True}, context())
 
     assert premier_report.direct_return is True
+    assert "## 全量预测数据 1 行" in premier_report.content
+    assert (
+        "| # | 赛事 | 赛季 | 日期 | 比赛 | 1X2预测 | 信心 | 比分 | "
+        "半全场 | 实际 | 比分 | 状态 |"
+    ) in premier_report.content
+    assert (
+        "| 1 | Premier League | 2026/27 | 08-15 | Team A vs Team B | Team A | mid |"
+        in premier_report.content
+    )
     assert "Premier League" in premier_report.content
     assert "FA Cup" not in premier_report.content
     assert "1-1" in premier_report.content
     assert "FA Cup" in pending_report.content
     assert "Premier League" not in pending_report.content
     assert (tmp_path / "workspaces" / "agent-1" / "football" / "ledger.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_football_ledger_updates_existing_prediction_in_place(tmp_path: Path) -> None:
+    tool = FootballLedgerTool(tmp_path)
+    entry = {
+        "competition": "荷甲 Eredivisie",
+        "season": "2026-27",
+        "date": "2026-08-15",
+        "match": "SBV精英 vs 埃因霍温",
+        "our_pred": "主胜 精英",
+        "our_confidence": "low",
+        "notes": "首轮样本",
+    }
+    await tool.execute({"operation": "append", "entry": entry}, context())
+
+    updated = await tool.execute(
+        {
+            "operation": "update",
+            "entry": {
+                "competition": " 荷甲  Eredivisie ",
+                "date": "2026-08-15",
+                "match": "SBV精英 VS 埃因霍温",
+                "our_pred": "客胜 埃因霍温",
+                "our_confidence": "medium",
+                "notes": "The Odds API: PSV客胜去水约65%",
+            },
+        },
+        context(),
+    )
+
+    assert updated.content == "prediction updated"
+    assert updated.metadata["status"] == "updated"
+    report = await tool.execute(
+        {"operation": "report", "competition": "荷甲 Eredivisie"}, context()
+    )
+    assert "客胜 埃因霍温" in report.content
+    assert "主胜 精英" not in report.content
+    assert "首轮样本" not in report.content
+
+
+def test_football_ledger_coalesces_competition_and_team_aliases() -> None:
+    rows = [
+        {
+            "competition": "西甲 La Liga",
+            "season": "2026-27",
+            "date": "2026-08-15",
+            "match": "Deportivo Alavés vs Getafe",
+            "our_pred": "主胜",
+            "our_confidence": "low",
+            "notes": "基础分析",
+        },
+        {
+            "competition": "西甲",
+            "season": "2026-27",
+            "date": "2026-08-15",
+            "match": "阿拉维斯 vs 赫塔费",
+            "our_pred": "无明确方向",
+            "our_confidence": "low",
+            "notes": "赔率无匹配",
+        },
+    ]
+
+    merged, count = FootballLedgerTool.coalesce_rows(rows)
+
+    assert count == 1
+    assert len(merged) == 1
+    assert merged[0]["competition"] == "西甲 La Liga"
+    assert merged[0]["our_pred"] == "无明确方向"
+    assert "旧预测: 主胜" in merged[0]["notes"]
+    assert "旧备注: 基础分析" in merged[0]["notes"]
+
+
+@pytest.mark.asyncio
+async def test_football_ledger_alias_append_requires_update(tmp_path: Path) -> None:
+    tool = FootballLedgerTool(tmp_path)
+    await tool.execute(
+        {
+            "operation": "append",
+            "entry": {
+                "competition": "西甲 La Liga",
+                "date": "2026-08-15",
+                "season": "2026-27",
+                "match": "Deportivo Alavés vs Getafe",
+                "our_pred": "主胜",
+                "our_confidence": "low",
+            },
+        },
+        context(),
+    )
+
+    duplicate = await tool.execute(
+        {
+            "operation": "append",
+            "entry": {
+                "competition": "西甲",
+                "date": "2026-08-15",
+                "season": "2026-27",
+                "match": "阿拉维斯 vs 赫塔费",
+                "our_pred": "客胜",
+                "our_confidence": "medium",
+            },
+        },
+        context(),
+    )
+
+    assert duplicate.metadata["status"] == "existing_requires_update"
+
+
+@pytest.mark.asyncio
+async def test_football_ledger_normalizes_model_append_aliases(tmp_path: Path) -> None:
+    tool = FootballLedgerTool(tmp_path)
+
+    result = await tool.execute(
+        {
+            "operation": "append",
+            "competition": "西甲 La Liga",
+            "season": "2026-27",
+            "date": "2026-08-15",
+            "match": "塞维利亚 vs 巴列卡诺",
+            "entry": {
+                "prediction": "塞维利亚不败(1X)",
+                "confidence": "low",
+                "basis": "market calibration",
+            },
+        },
+        context(),
+    )
+
+    assert result.content == "prediction appended"
+    rows = json.loads(
+        (tmp_path / "workspaces" / "agent-1" / "football" / "ledger.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert rows[0]["competition"] == "西甲 La Liga"
+    assert rows[0]["our_pred"] == "塞维利亚不败(1X)"
+    assert rows[0]["our_confidence"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_football_ledger_report_marks_pending_and_settled_rows(tmp_path: Path) -> None:
+    tool = FootballLedgerTool(tmp_path)
+    await tool.execute(
+        {
+            "operation": "append",
+            "entry": {
+                "competition": "荷甲",
+                "season": "2026-27",
+                "date": "2026-08-15",
+                "match": "球队 A vs 球队 B",
+                "our_pred": "球队 A",
+                "our_confidence": "medium",
+                "our_score_pred": "1-0",
+            },
+        },
+        context(),
+    )
+    await tool.execute(
+        {
+            "operation": "append",
+            "entry": {
+                "competition": "荷甲",
+                "season": "2026-27",
+                "date": "2026-08-16",
+                "match": "球队 C vs 球队 D",
+                "our_pred": "球队 D",
+                "our_confidence": "low",
+            },
+        },
+        context(),
+    )
+    await tool.execute(
+        {
+            "operation": "settle",
+            "competition": "荷甲",
+            "date": "2026-08-15",
+            "match": "球队 A vs 球队 B",
+            "actual_result": "球队 A",
+            "actual_score": "1-0",
+        },
+        context(),
+    )
+
+    report = await tool.execute({"operation": "report", "competition": "荷甲"}, context())
+
+    assert "统计: 总计 2 行; 已结算 1; 待结算 1; 命中 1; 未中 0; 命中率 100.0%。" in report.content
+    assert (
+        "| 1 | 荷甲 | 2026-27 | 08-15 | 球队 A vs 球队 B | 球队 A | medium | 1-0 | — | "
+        "球队 A | 1-0 | ✅ |"
+    ) in report.content
+    assert (
+        "| 2 | 荷甲 | 2026-27 | 08-16 | 球队 C vs 球队 D | 球队 D | low | — | — | — | "
+        "— | ⏳ |"
+    ) in report.content
+    assert not report.content.lstrip().startswith("[")
+    assert not report.content.lstrip().startswith("{")
+
+
+@pytest.mark.asyncio
+async def test_football_ledger_settle_accepts_short_dates_and_provider_aliases(
+    tmp_path: Path,
+) -> None:
+    tool = FootballLedgerTool(tmp_path)
+    await tool.execute(
+        {
+            "operation": "append",
+            "entry": {
+                "competition": "荷甲 Eredivisie",
+                "season": "2026-27",
+                "date": "2026-08-15",
+                "match": "威廉二世 vs 奈梅亨",
+                "our_pred": "客胜 奈梅亨",
+                "our_confidence": "medium",
+            },
+        },
+        context(),
+    )
+
+    settled = await tool.execute(
+        {
+            "operation": "settle",
+            "entry": {
+                "competition": "Dutch Eredivisie",
+                "date": "08-15",
+                "match": "Willem II vs NEC Nijmegen",
+                "actual_result": "客胜",
+                "actual_score": "1-4",
+            },
+        },
+        context(),
+    )
+
+    assert not settled.is_error
+    assert settled.metadata["status"] == "settled"
+    report = await tool.execute({"operation": "report"}, context())
+    assert "| 客胜 | 1-4 | ✅ |" in report.content
+    assert "命中 1; 未中 0; 命中率 100.0%" in report.content
 
 
 @pytest.mark.asyncio
@@ -457,6 +705,51 @@ async def test_tool_policy_and_web_scheme_are_enforced() -> None:
     assert denied.is_error
     assert bad_scheme.is_error
     assert fetched.content == "fixture"
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_retries_rate_limited_provider() -> None:
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(429, headers={"retry-after": "0"}, request=request)
+        return httpx.Response(200, text="fixture", request=request)
+
+    async def resolver(host: str, port: int) -> Sequence[str]:
+        del host, port
+        return ("93.184.216.34",)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await WebFetchTool(client, resolver=resolver, max_retries=1).execute(
+            {"url": "https://www.thesportsdb.com/data"}, context()
+        )
+
+    assert not result.is_error
+    assert result.content == "fixture"
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_exposes_rate_limit_after_bounded_retries() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, request=request)
+
+    async def resolver(host: str, port: int) -> Sequence[str]:
+        del host, port
+        return ("93.184.216.34",)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await WebFetchTool(client, resolver=resolver, max_retries=0).execute(
+            {"url": "https://www.thesportsdb.com/data"}, context()
+        )
+
+    assert result.is_error
+    assert result.metadata["errorCode"] == "web_http_429"
+    assert result.metadata["httpStatus"] == 429
+    assert result.metadata["retryable"] is True
 
 
 @pytest.mark.asyncio

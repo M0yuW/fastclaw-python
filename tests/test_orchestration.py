@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 from collections.abc import Awaitable, Callable
@@ -21,6 +22,8 @@ from fastclaw.orchestration import (
     TaskResult,
     WaitTicket,
 )
+from fastclaw.tools import ToolResult
+from fastclaw.tools.football_shared import FootballEvidenceCache, football_event_key
 
 
 def context(
@@ -108,6 +111,139 @@ async def test_spawn_subagent_ignores_model_supplied_identity() -> None:
 
 
 @pytest.mark.asyncio
+async def test_data_delegation_requires_published_base_evidence() -> None:
+    bus = InProcessMessageBus()
+
+    async def data_handler(task: str, child: ExecutionContext) -> str:
+        del task, child
+        return "prose report only"
+
+    bus.register(user_id="user-1", agent_id="data", handler=data_handler)
+    tool = SpawnSubagentTool(bus, data_agent_id="data", cache=FootballEvidenceCache())
+    try:
+        result = await tool.execute(
+            {"agent_id": "data", "task": "confirm the fixture"},
+            context(),
+        )
+
+        assert result.is_error
+        assert result.metadata["errorCode"] == "football_base_not_published"
+        assert "action=base_evidence" in result.content
+    finally:
+        await bus.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_settlement_data_delegation_bypasses_upcoming_fixture_gate() -> None:
+    bus = InProcessMessageBus()
+
+    async def data_handler(task: str, child: ExecutionContext) -> str:
+        del child
+        assert "赛果" in task
+        return '{"status":"success","rows":[]}'
+
+    bus.register(user_id="user-1", agent_id="data", handler=data_handler)
+    tool = SpawnSubagentTool(bus, data_agent_id="data", cache=FootballEvidenceCache())
+    execution = context()
+    try:
+        result = await tool.execute(
+            {"agent_id": "data", "task": "复盘账本并核对已结束比赛赛果"},
+            execution,
+        )
+
+        assert not result.is_error
+        assert execution.shared_state.football_settlement_attempted is True
+        assert execution.shared_state.football_settlement_review is True
+    finally:
+        await bus.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_settlement_delegation_preserves_verified_results_when_child_report_fails() -> None:
+    bus = InProcessMessageBus()
+
+    async def data_handler(task: str, child: ExecutionContext) -> str:
+        del task
+        child.shared_state.football_settlement_results.append(
+            json.dumps(
+                {
+                    "action": "results",
+                    "competition": "Dutch Eredivisie",
+                    "rows": [
+                        {
+                            "match": "Willem II vs NEC Nijmegen",
+                            "home": "Willem II",
+                            "away": "NEC Nijmegen",
+                            "date": "2026-08-15",
+                            "status": "FT",
+                            "home_score": "1",
+                            "away_score": "4",
+                        }
+                    ],
+                }
+            )
+        )
+        return "child later hit an unrelated provider error"
+
+    bus.register(user_id="user-1", agent_id="data", handler=data_handler)
+    tool = SpawnSubagentTool(bus, data_agent_id="data", cache=FootballEvidenceCache())
+    try:
+        result = await tool.execute(
+            {"agent_id": "data", "task": "复盘账本并核对已结束比赛赛果"},
+            context(),
+        )
+
+        payload = json.loads(result.content)
+        assert not result.is_error
+        assert payload["status"] == "verified"
+        assert payload["results"][0]["rows"][0]["status"] == "FT"
+        assert payload["verified_matches"][0]["actual_result"] == "客胜"
+        assert payload["verified_matches"][0]["actual_score"] == "1-4"
+    finally:
+        await bus.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_continued_session_rehydrates_base_before_specialist_gate() -> None:
+    bus = InProcessMessageBus()
+    cache = FootballEvidenceCache()
+
+    async def specialist_handler(task: str, child: ExecutionContext) -> str:
+        assert task == "fetch market odds"
+        assert child.shared_state.has_football_base()
+        return "odds attempted"
+
+    bus.register(user_id="user-1", agent_id="odds", handler=specialist_handler)
+    await cache.put_session_base(
+        "session-1",
+        football_event_key(
+            "Spanish La Liga",
+            "2026-2027",
+            "2026-08-15",
+            "Deportivo Alavés",
+            "Getafe",
+        ),
+        ToolResult(
+            content=(
+                '{"evidence_schema_version":2,"fixture":'
+                '{"competition":"Spanish La Liga"},"historical_context":{}}'
+            ),
+        ),
+    )
+    tool = SpawnSubagentTool(bus, data_agent_id="data", cache=cache)
+    try:
+        result = await tool.execute(
+            {"agent_id": "odds", "task": "fetch market odds"},
+            context(),
+        )
+
+        assert result.content == "odds attempted"
+        assert not result.is_error
+    finally:
+        await bus.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_delegation_emits_sanitized_stage_lifecycle(caplog: pytest.LogCaptureFixture) -> None:
     bus = InProcessMessageBus()
     received: list[ExecutionContext] = []
@@ -172,6 +308,49 @@ async def test_spawn_subagent_batch_runs_different_targets_in_parallel_and_keeps
         release.set()
         if not pending.done():
             pending.cancel()
+        await bus.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_spawn_subagent_batch_serializes_multiple_data_tasks_before_specialists() -> None:
+    bus = InProcessMessageBus(AsyncTaskQueue(max_concurrent=4))
+    order: list[str] = []
+
+    async def data_handler(task: str, child: ExecutionContext) -> str:
+        child.shared_state.publish_football_base(task, task)
+        order.append(task)
+        return task
+
+    async def specialist_handler(task: str, child: ExecutionContext) -> str:
+        assert child.shared_state.has_football_base()
+        order.append(task)
+        return task
+
+    bus.register(user_id="user-1", agent_id="data", handler=data_handler)
+    bus.register(user_id="user-1", agent_id="tactics", handler=specialist_handler)
+    bus.register(user_id="user-1", agent_id="history", handler=specialist_handler)
+    tool = SpawnSubagentTool(bus, data_agent_id="data")
+    try:
+        results = await tool.execute_many(
+            (
+                {"agent_id": "data", "task": "group-a"},
+                {"agent_id": "data", "task": "group-b"},
+                {"agent_id": "tactics", "task": "tactics"},
+                {"agent_id": "history", "task": "history"},
+            ),
+            context(),
+        )
+
+        assert [result.content for result in results] == [
+            "group-a",
+            "group-b",
+            "tactics",
+            "history",
+        ]
+        assert order[:2] == ["group-a", "group-b"]
+        assert set(order[2:]) == {"tactics", "history"}
+        assert all(not result.is_error for result in results)
+    finally:
         await bus.shutdown()
 
 

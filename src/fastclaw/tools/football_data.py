@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from datetime import date as CalendarDate
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlencode, urlsplit
 
-from fastclaw.execution import ExecutionContext
+from fastclaw.execution import ExecutionContext, football_teams_match
+from fastclaw.football_identity import (
+    DEFAULT_TEAM_IDENTITY_RESOLVER,
+    resolve_team_identity,
+)
 from fastclaw.providers import ToolDefinition, ToolFunction
 from fastclaw.tools.base import ToolResult
 from fastclaw.tools.football_competitions import (
@@ -25,9 +30,11 @@ from fastclaw.tools.football_evidence import (
     utc_now,
 )
 from fastclaw.tools.football_shared import (
+    FOOTBALL_EVIDENCE_SCHEMA_VERSION,
     FootballEvidenceCache,
     football_event_key,
     get_football_evidence_cache,
+    normalize_football_season,
 )
 
 _SPORTS_DB = "https://www.thesportsdb.com/api/v1/json/123"
@@ -35,6 +42,52 @@ _ESPN_SOCCER = "https://site.api.espn.com/apis/site/v2/sports/soccer"
 _SPORTTERY = (
     "https://webapi.sporttery.cn/gateway/uniform/football/getMatchCalculatorV1.qry?channel=c"
 )
+
+
+def _provider_team_names(match: dict[str, Any], side: str) -> tuple[str, ...]:
+    """Return every provider label before resolving a team identity.
+
+    Some feeds publish a Chinese display label and an English abbreviation for
+    the same club. Matching only the first label makes an English user query
+    fail even though the provider has supplied a usable equivalent name.
+    """
+
+    keys = (
+        ("homeTeamAllName", "homeTeamAbbName", "homeTeamAbbEnName")
+        if side == "home"
+        else ("awayTeamAllName", "awayTeamAbbName", "awayTeamAbbEnName")
+    )
+    return tuple(dict.fromkeys(str(match[key]).strip() for key in keys if match.get(key)))
+
+
+def _normalize_team_identity(value: str) -> str:
+    """Use the shared alias table for every provider/team join."""
+
+    return resolve_team_identity(value).canonical_id
+
+
+def _previous_season(value: str) -> str:
+    """Return the immediately preceding provider season label."""
+
+    normalized = normalize_football_season(value)
+    parts = normalized.split("-", 1)
+    if len(parts) == 2 and all(part.isdigit() for part in parts):
+        return f"{int(parts[0]) - 1:04d}-{int(parts[1]) - 1:04d}"
+    if normalized.isdigit() and len(normalized) == 4:
+        return str(int(normalized) - 1)
+    return ""
+
+
+def _is_friendlies_competition(value: str) -> bool:
+    normalized = normalize_competition_name(value)
+    return "friendly" in normalized or "friendlies" in normalized
+
+
+def _is_completed_event(event: dict[str, Any]) -> bool:
+    status = str(event.get("status") or "").casefold()
+    if status in {"ft", "aet", "pen", "finished", "complete"}:
+        return True
+    return event.get("home_score") is not None and event.get("away_score") is not None
 
 
 class _Fetcher(Protocol):
@@ -157,9 +210,12 @@ class FootballDataTool:
         )
         if role_mode == "data":
             description = (
-                "Fetch one cached base evidence bundle for the confirmed football fixture. "
-                "This data-only action uses TheSportsDB and ESPN supplements and never calls "
-                "The Odds API or Sporttery."
+                "Fetch one cached base evidence bundle for a new confirmed fixture, or query "
+                "competition results during a Runtime-managed ledger settlement review. This "
+                "data-only action uses TheSportsDB and ESPN supplements and never calls The "
+                "Odds API or Sporttery. The base bundle includes explicitly separated "
+                "historical_context for prior-season competitive matches, reviewed adjacent "
+                "division evidence, and preseason friendlies."
             )
         elif role_mode == "ev":
             description = (
@@ -182,6 +238,9 @@ class FootballDataTool:
             # Existing persisted prompts may still name the old action. Keep
             # it as a compatibility alias routed to the same data-only path.
             actions.append("evidence")
+            # Ledger review uses the same trusted competition/results endpoint,
+            # but must not be forced through the upcoming-fixture base gate.
+            actions.append("results")
         elif role_mode == "ev":
             actions = ["sporttery_match"]
         else:
@@ -236,8 +295,18 @@ class FootballDataTool:
         if forbidden.intersection(arguments):
             return self._error("provider URLs, credentials, and identifiers are Runtime-managed")
         action = str(arguments.get("action") or "")
-        if self._role_mode == "data" and action not in {"base_evidence", "evidence"}:
-            return self._error("data analyst may only request the shared base_evidence bundle")
+        if context.shared_state.football_settlement_review and self._role_mode == "data":
+            if action != "results":
+                result = self._error(
+                    "settlement review only permits football_data action=results; "
+                    "base_evidence and evidence are forbidden"
+                )
+                context.shared_state.football_settlement_errors.append(result.content)
+                return result
+        if self._role_mode == "data" and action not in {"base_evidence", "evidence", "results"}:
+            return self._error(
+                "data analyst may request base_evidence or competition results for ledger review"
+            )
         if self._role_mode == "ev" and not context.shared_state.ev_requested:
             return self._error("EV market lookup requires an explicit user request")
         if self._role_mode == "ev" and action != "sporttery_match":
@@ -251,7 +320,13 @@ class FootballDataTool:
         if action == "espn_summary":
             return await self._espn_summary(arguments, context)
         if action in {"schedule", "results", "standings"}:
-            return await self._competition_data(action, arguments, context)
+            result = await self._competition_data(action, arguments, context)
+            if action == "results":
+                if result.is_error:
+                    context.shared_state.football_settlement_errors.append(result.content)
+                else:
+                    context.shared_state.football_settlement_results.append(result.content)
+            return result
         if action == "form":
             return await self._form(arguments, context)
         if action == "h2h":
@@ -481,7 +556,7 @@ class FootballDataTool:
             return trusted_error
         assert competition is not None
         date = str(arguments.get("date") or "").strip()
-        season = str(arguments.get("season") or "").strip()
+        season = normalize_football_season(str(arguments.get("season") or ""))
         team_a = str(arguments.get("team_a") or "").strip()
         team_b = str(arguments.get("team_b") or "").strip()
         if not season or not team_a or not team_b:
@@ -496,9 +571,21 @@ class FootballDataTool:
         cache_key = football_event_key(competition.name, season, date, team_a, team_b)
         if not include_odds:
             cached = await self._cache.get("base", cache_key)
+            if cached is None:
+                cached_match = await self._cache.find_fixture(
+                    "base",
+                    competition=competition.name,
+                    season=season,
+                    date=date,
+                    team_a=team_a,
+                    team_b=team_b,
+                )
+                if cached_match is not None:
+                    _cached_key, cached = cached_match
             if cached is not None:
                 if not cached.is_error:
                     context.shared_state.publish_football_base(cache_key.value, cached.content)
+                    await self._cache.put_session_base(context.session_id, cache_key, cached)
                 return cached
 
         sources: list[SourceResult] = []
@@ -519,20 +606,45 @@ class FootballDataTool:
         fixture = self._select_primary_fixture(
             schedule.data, competition, season=season, date=date, team_a=team_a, team_b=team_b
         )
+        season_schedule: SourceResult | None = None
         if fixture is None:
             sources[-1] = SourceResult(
                 "thesportsdb:schedule",
                 "rejected",
-                error_code="primary_fixture_not_confirmed",
-                safe_reason="The primary source did not confirm one matching fixture identity",
+                error_code="primary_fixture_not_on_requested_date",
+                safe_reason="The day endpoint did not contain the requested fixture",
             )
-            return self._fail_closed(competition, sources, warnings)
+            season_schedule = await self._source_json(
+                f"{_SPORTS_DB}/eventsseason.php?{urlencode({'id': league_id, 's': season})}",
+                context,
+                source="thesportsdb:season_schedule",
+            )
+            sources.append(season_schedule)
+            if season_schedule.status == "success" and isinstance(season_schedule.data, dict):
+                fixture = self._select_primary_fixture(
+                    season_schedule.data,
+                    competition,
+                    season=season,
+                    date=date,
+                    team_a=team_a,
+                    team_b=team_b,
+                    allow_adjacent_date=True,
+                )
+                if fixture is not None and fixture.get("date_alignment") != "exact":
+                    warnings.append("source_date_adjacent_to_requested_date")
+            if fixture is None:
+                return self._fail_closed(competition, sources, warnings)
 
-        results_source = await self._source_json(
-            f"{_SPORTS_DB}/eventsseason.php?{urlencode({'id': league_id, 's': season})}",
-            context,
-            source="thesportsdb:results",
-        )
+        if season_schedule is not None and season_schedule.status == "success":
+            results_source = SourceResult(
+                "thesportsdb:results", "success", data=season_schedule.data
+            )
+        else:
+            results_source = await self._source_json(
+                f"{_SPORTS_DB}/eventsseason.php?{urlencode({'id': league_id, 's': season})}",
+                context,
+                source="thesportsdb:results",
+            )
         standings_source = await self._source_json(
             f"{_SPORTS_DB}/lookuptable.php?{urlencode({'l': league_id, 's': season})}",
             context,
@@ -549,17 +661,52 @@ class FootballDataTool:
         )
         sources.append(espn)
         self._warn_if_degraded(espn, warnings)
+        previous_match_details: list[dict[str, Any]] = []
+        if not form or not head_to_head:
+            fallback_sources, fallback_form, fallback_h2h, previous_match_details = (
+                await self._thesportsdb_historical_fallback(
+                    team_a,
+                    team_b,
+                    context,
+                    fixture=fixture,
+                )
+            )
+            sources.extend(fallback_sources)
+            if not form and fallback_form:
+                form = fallback_form
+                warnings.append("form_cross_season_fallback")
+            if not head_to_head and fallback_h2h:
+                head_to_head = fallback_h2h
+                warnings.append("h2h_thesportsdb_fallback")
+
+        historical_sources, historical_context = await self._historical_context(
+            competition,
+            league_id,
+            season=season,
+            team_a=team_a,
+            team_b=team_b,
+            fixture=fixture,
+            form=form,
+            head_to_head=head_to_head,
+            context=context,
+        )
+        sources.extend(historical_sources)
+        if any(source.status != "success" for source in historical_sources):
+            warnings.append("historical_context_degraded")
 
         if not include_odds:
             result = ToolResult(
                 content=json.dumps(
                     {
                         "fixture": fixture,
+                        "evidence_schema_version": FOOTBALL_EVIDENCE_SCHEMA_VERSION,
                         "results": results,
                         "standings": standings,
                         "details": details,
                         "form": form,
                         "head_to_head": head_to_head,
+                        "previous_match_details": previous_match_details,
+                        "historical_context": historical_context,
                         "odds": {"status": "not_requested"},
                         "sources": [source.report() for source in sources],
                         "warnings": list(dict.fromkeys(warnings)),
@@ -574,6 +721,7 @@ class FootballDataTool:
                 )
             )
             await self._cache.put("base", cache_key, result)
+            await self._cache.put_session_base(context.session_id, cache_key, result)
             context.shared_state.publish_football_base(cache_key.value, result.content)
             return result
 
@@ -600,7 +748,7 @@ class FootballDataTool:
         if odds_source.status == "success" and not odds:
             odds_source = SourceResult(
                 "the_odds_api",
-                "empty",
+                "no_match",
                 quota=odds_source.quota,
                 safe_reason="No matching odds fixture was returned",
             )
@@ -611,20 +759,23 @@ class FootballDataTool:
             if sporttery.status == "success":
                 odds = sporttery.data
             else:
-                odds = {"status": "unavailable"}
+                odds = {"status": sporttery.status}
                 warnings.append("odds_unavailable")
         elif odds_source.status != "success":
-            odds = {"status": "unavailable"}
+            odds = {"status": odds_source.status}
             warnings.append("odds_unavailable")
 
         degraded = any(source.status != "success" for source in sources)
         payload = {
+            "evidence_schema_version": FOOTBALL_EVIDENCE_SCHEMA_VERSION,
             "fixture": fixture,
             "results": results,
             "standings": standings,
             "details": details,
             "form": form,
             "head_to_head": head_to_head,
+            "previous_match_details": previous_match_details,
+            "historical_context": historical_context,
             "odds": odds,
             "sources": [source.report() for source in sources],
             "warnings": list(dict.fromkeys(warnings)),
@@ -633,12 +784,349 @@ class FootballDataTool:
         }
         return ToolResult(content=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
+    async def _historical_context(
+        self,
+        competition: FootballCompetition,
+        league_id: str,
+        *,
+        season: str,
+        team_a: str,
+        team_b: str,
+        fixture: dict[str, Any],
+        form: list[dict[str, Any]],
+        head_to_head: list[dict[str, Any]],
+        context: ExecutionContext,
+    ) -> tuple[list[SourceResult], dict[str, Any]]:
+        """Build explicit historical buckets for first-round analysis.
+
+        ``eventslast`` is intentionally not treated as a complete prior-season
+        form source: on a new-season opener it often returns only a preseason
+        friendly. Query the reviewed previous-season league schedule separately
+        and, for competitions with a reviewed adjacent tier, query that tier as
+        well. The result exposes promotion/relegation context only when the
+        provider actually returns matches for the requested team.
+        """
+
+        previous_season = _previous_season(season)
+        source_specs: list[tuple[str, str, str]] = [
+            ("same_competition", competition.name, league_id)
+        ]
+        source_specs.extend(
+            ("prior_division", name, provider_id)
+            for name, provider_id in competition.historical_league_ids
+            if provider_id != league_id
+        )
+        sources: list[SourceResult] = []
+        rows_by_scope: dict[str, list[dict[str, Any]]] = {}
+        if previous_season:
+            for scope, _provider_name, provider_id in source_specs:
+                source = await self._source_json(
+                    f"{_SPORTS_DB}/eventsseason.php?"
+                    + urlencode({"id": provider_id, "s": previous_season}),
+                    context,
+                    source=f"thesportsdb:historical_{scope}",
+                )
+                sources.append(source)
+                rows_by_scope[scope] = (
+                    self._provider_rows(source, "events", self._event_row)
+                    if source.status == "success" and isinstance(source.data, dict)
+                    else []
+                )
+
+        team_specs = (
+            (
+                team_a,
+                str(fixture.get("home") or team_a),
+                str(fixture.get("home_team_id") or ""),
+            ),
+            (
+                team_b,
+                str(fixture.get("away") or team_b),
+                str(fixture.get("away_team_id") or ""),
+            ),
+        )
+
+        def matches_team(
+            event: dict[str, Any], requested: str, provider_id: str
+        ) -> bool:
+            for side, side_id in (("home", "home_team_id"), ("away", "away_team_id")):
+                candidate_id = str(event.get(side_id) or "")
+                if provider_id and candidate_id and provider_id == candidate_id:
+                    return True
+                if football_teams_match(
+                    requested,
+                    str(event.get(side) or ""),
+                    right_provider="thesportsdb",
+                    right_provider_id=candidate_id,
+                ):
+                    return True
+            return False
+
+        teams: list[dict[str, Any]] = []
+        for requested, provider_name, provider_id in team_specs:
+            same_competition = [
+                event
+                for event in rows_by_scope.get("same_competition", [])
+                if matches_team(event, requested, provider_id) and _is_completed_event(event)
+            ][:10]
+            prior_division = [
+                event
+                for event in rows_by_scope.get("prior_division", [])
+                if matches_team(event, requested, provider_id) and _is_completed_event(event)
+            ][:10]
+            preseason_friendlies = [
+                match
+                for item in form
+                if football_teams_match(requested, str(item.get("team") or ""))
+                for match in item.get("matches") or []
+                if isinstance(match, dict) and _is_friendlies_competition(
+                    str(match.get("competition") or "")
+                )
+            ][:10]
+            if prior_division:
+                boundary_status = "source_supported_prior_division"
+                prior_competition = sorted(
+                    {
+                        str(event.get("competition") or "")
+                        for event in prior_division
+                        if event.get("competition")
+                    }
+                )
+            elif same_competition:
+                boundary_status = "source_supported_same_competition"
+                prior_competition = sorted(
+                    {
+                        str(event.get("competition") or "")
+                        for event in same_competition
+                        if event.get("competition")
+                    }
+                )
+            else:
+                boundary_status = "not_confirmed_by_available_schedule"
+                prior_competition = []
+            teams.append(
+                {
+                    "team": requested,
+                    "provider_name": provider_name,
+                    "provider_team_id": provider_id or None,
+                    "current_competition": competition.name,
+                    "prior_season": previous_season,
+                    "prior_competitions": prior_competition,
+                    "competition_boundary": boundary_status,
+                    "same_competition_prior_matches": same_competition,
+                    "prior_division_matches": prior_division,
+                    "preseason_friendlies": preseason_friendlies,
+                }
+            )
+
+        has_prior = any(
+            team["same_competition_prior_matches"] or team["prior_division_matches"]
+            for team in teams
+        )
+        has_friendlies = any(team["preseason_friendlies"] for team in teams)
+        if has_prior:
+            status = "success"
+        elif has_friendlies:
+            status = "partial"
+        else:
+            status = "empty"
+        return sources, {
+            "status": status,
+            "current_season": season,
+            "prior_season": previous_season,
+            "fixture": {
+                "competition": competition.name,
+                "home": str(fixture.get("home") or team_a),
+                "away": str(fixture.get("away") or team_b),
+            },
+            "head_to_head": head_to_head,
+            "teams": teams,
+            "coverage": "TheSportsDB free season schedules may be truncated",
+            "interpretation_rules": [
+                "prior_division_matches are the only source-backed "
+                "promotion/relegation boundary evidence",
+                "same_competition_prior_matches are prior-season competitive evidence",
+                "preseason_friendlies are separate weak context and are not current-season form",
+                "empty or unavailable historical data must not be converted into a "
+                "directional claim",
+            ],
+        }
+
+    async def _thesportsdb_historical_fallback(
+        self,
+        team_a: str,
+        team_b: str,
+        context: ExecutionContext,
+        *,
+        fixture: dict[str, Any] | None = None,
+    ) -> tuple[
+        list[SourceResult],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
+        """Provide cross-season form, H2H, and prior-event lineup evidence.
+
+        A new season has no current-season form. TheSportsDB's team event history
+        is therefore used as an explicitly labeled fallback, never as current-
+        season evidence. Event details are best-effort because the free endpoint
+        may omit lineup fields.
+        """
+
+        sources: list[SourceResult] = []
+        team_events: dict[str, list[dict[str, Any]]] = {}
+        form: list[dict[str, Any]] = []
+        requested_teams = (
+            (
+                team_a,
+                str((fixture or {}).get("home") or team_a),
+                str((fixture or {}).get("home_team_id") or ""),
+            ),
+            (
+                team_b,
+                str((fixture or {}).get("away") or team_b),
+                str((fixture or {}).get("away_team_id") or ""),
+            ),
+        )
+        for team, provider_name, provider_id in requested_teams:
+            team_query = provider_name or team
+            if provider_id:
+                team_id = provider_id
+                search = None
+            else:
+                search = await self._source_json(
+                    f"{_SPORTS_DB}/searchteams.php?{urlencode({'t': team_query})}",
+                    context,
+                    source="thesportsdb:team_search",
+                )
+                sources.append(search)
+                rows = search.data.get("teams") if isinstance(search.data, dict) else None
+                if search.status != "success" or not isinstance(rows, list) or not rows:
+                    if search.status == "success":
+                        search.status = "empty"
+                        search.safe_reason = "The source returned no matching team"
+                    team_events[team] = []
+                    form.append(
+                        {
+                            "team": team,
+                            "matches": [],
+                            "scope": "cross_competition_may_cross_season",
+                            "status": "unavailable",
+                        }
+                    )
+                    continue
+                first_team = rows[0] if isinstance(rows[0], dict) else {}
+                team_id = str(first_team.get("idTeam") or "")
+            if not team_id:
+                team_events[team] = []
+                form.append(
+                    {
+                        "team": team,
+                        "matches": [],
+                        "scope": "cross_competition_may_cross_season",
+                        "status": "unavailable",
+                    }
+                )
+                continue
+            recent = await self._source_json(
+                f"{_SPORTS_DB}/eventslast.php?{urlencode({'id': team_id})}",
+                context,
+                source="thesportsdb:eventslast",
+            )
+            sources.append(recent)
+            events = self._provider_rows(recent, "results", self._event_row)
+            team_events[team] = events[:8]
+            form.append(
+                {
+                    "team": team,
+                    "matches": events[:8],
+                    "scope": "cross_competition_may_cross_season",
+                    "status": "success" if events else "empty",
+                }
+            )
+
+        h2h = [
+            event
+            for event in team_events.get(team_a, [])
+            if _normalize_team_identity(str(event.get("home") or ""))
+            == _normalize_team_identity(team_b)
+            or _normalize_team_identity(str(event.get("away") or ""))
+            == _normalize_team_identity(team_b)
+        ][:10]
+
+        previous_match_details: list[dict[str, Any]] = []
+        detail_cache: dict[str, SourceResult] = {}
+        for team in (team_a, team_b):
+            previous = next(iter(team_events.get(team, [])), None)
+            if previous is None or not str(previous.get("event_id") or "").isdigit():
+                continue
+            event_id = str(previous["event_id"])
+            detail = detail_cache.get(event_id)
+            if detail is None:
+                detail = await self._source_json(
+                    f"{_SPORTS_DB}/lookupevent.php?{urlencode({'id': event_id})}",
+                    context,
+                    source="thesportsdb:event_details",
+                )
+                detail_cache[event_id] = detail
+                sources.append(detail)
+            parsed = self._event_detail(detail)
+            previous_match_details.append(
+                {
+                    "team": team,
+                    "match": previous,
+                    "details": parsed,
+                    "lineup_status": "available"
+                    if parsed.get("lineups")
+                    else "not_provided_by_source",
+                }
+            )
+        return sources, form, h2h, previous_match_details
+
+    @staticmethod
+    def _event_detail(source: SourceResult) -> dict[str, Any]:
+        if source.status != "success" or not isinstance(source.data, dict):
+            return {}
+        rows = source.data.get("events") or []
+        if not rows or not isinstance(rows[0], dict):
+            return {}
+        event = rows[0]
+        lineup_fields = (
+            "LineupGoalkeeper",
+            "LineupDefense",
+            "LineupMidfield",
+            "LineupForward",
+            "LineupSubstitutes",
+        )
+        lineups: dict[str, dict[str, str]] = {}
+        for side in ("Home", "Away"):
+            values = {
+                field.removeprefix("Lineup").lower(): str(event.get(f"str{side}{field}") or "")
+                for field in lineup_fields
+                if str(event.get(f"str{side}{field}") or "").strip()
+            }
+            if values:
+                lineups[side.casefold()] = values
+        return {
+            "event_id": event.get("idEvent"),
+            "match": event.get("strEvent"),
+            "date": event.get("dateEvent"),
+            "home": event.get("strHomeTeam"),
+            "away": event.get("strAwayTeam"),
+            "formations": {
+                "home": event.get("strHomeFormation"),
+                "away": event.get("strAwayFormation"),
+            },
+            "lineups": lineups,
+        }
+
     async def _resolve_tsdb_league(
         self, competition: FootballCompetition, context: ExecutionContext
     ) -> tuple[str, SourceResult]:
+        provider_country = competition.provider_country or competition.country
         data = await self._source_json(
             f"{_SPORTS_DB}/search_all_leagues.php?"
-            + urlencode({"s": "Soccer", "c": competition.country}),
+            + urlencode({"s": "Soccer", "c": provider_country}),
             context,
             source="thesportsdb:competition",
         )
@@ -663,7 +1151,8 @@ class FootballDataTool:
             country = normalize_competition_name(str(row.get("strCountry") or ""))
             if names.isdisjoint(expected_names):
                 continue
-            if country != normalize_competition_name(competition.country):
+            expected_country = normalize_competition_name(provider_country)
+            if country != expected_country:
                 continue
             league_id = str(row.get("idLeague") or "")
             if league_id.isdigit():
@@ -687,27 +1176,57 @@ class FootballDataTool:
         date: str,
         team_a: str,
         team_b: str,
+        allow_adjacent_date: bool = False,
     ) -> dict[str, Any] | None:
-        wanted_teams = {normalize_competition_name(team_a), normalize_competition_name(team_b)}
+        requested_date = CalendarDate.fromisoformat(date)
+        allowed_dates = {requested_date}
+        if allow_adjacent_date:
+            allowed_dates.update(
+                (requested_date - timedelta(days=1), requested_date + timedelta(days=1))
+            )
+        normalized_season = normalize_football_season(season)
         rows = []
         for row in data.get("events") or []:
             if not isinstance(row, dict):
                 continue
-            actual_teams = {
-                normalize_competition_name(str(row.get("strHomeTeam") or "")),
-                normalize_competition_name(str(row.get("strAwayTeam") or "")),
-            }
-            actual_season = str(row.get("strSeason") or "")
+            home_name = str(row.get("strHomeTeam") or "")
+            away_name = str(row.get("strAwayTeam") or "")
+            home_id = str(row.get("idHomeTeam") or "")
+            away_id = str(row.get("idAwayTeam") or "")
+            actual_season = normalize_football_season(str(row.get("strSeason") or ""))
             actual_league = normalize_competition_name(str(row.get("strLeague") or ""))
-            if actual_teams != wanted_teams or str(row.get("dateEvent") or "") != date:
+            try:
+                actual_date = CalendarDate.fromisoformat(str(row.get("dateEvent") or ""))
+            except ValueError:
                 continue
-            if actual_season and actual_season != season:
+            if (
+                not football_teams_match(
+                    team_a,
+                    home_name,
+                    right_provider="thesportsdb",
+                    right_provider_id=home_id,
+                )
+                or not football_teams_match(
+                    team_b,
+                    away_name,
+                    right_provider="thesportsdb",
+                    right_provider_id=away_id,
+                )
+                or actual_date not in allowed_dates
+            ):
+                continue
+            if actual_season and actual_season != normalized_season:
                 continue
             if actual_league != normalize_competition_name(competition.name):
                 continue
             if not str(row.get("idEvent") or "").isdigit():
                 continue
-            rows.append(cls._event_row(row))
+            fixture = cls._event_row(row)
+            fixture["requested_date"] = date
+            fixture["date_alignment"] = (
+                "exact" if actual_date == requested_date else "adjacent_source_date"
+            )
+            rows.append(fixture)
         return rows[0] if len(rows) == 1 else None
 
     async def _espn_evidence(
@@ -731,22 +1250,29 @@ class FootballDataTool:
         if self._espn_league_slug(schedule.data) != competition.espn_slug:
             return self._espn_rejected("espn_league_mismatch"), *empty
         candidates = []
-        wanted = {
-            normalize_competition_name(str(fixture.get("home") or "")),
-            normalize_competition_name(str(fixture.get("away") or "")),
-        }
+        wanted_home = str(fixture.get("home") or "")
+        wanted_away = str(fixture.get("away") or "")
         for raw in schedule.data.get("events") or []:
             if not isinstance(raw, dict):
                 continue
             row = self._espn_event_row(raw)
             teams = row.get("teams") or {}
-            actual = {
-                normalize_competition_name(str((teams.get(side) or {}).get("name") or ""))
-                for side in ("home", "away")
-            }
+            actual_home = str((teams.get("home") or {}).get("name") or "")
+            actual_away = str((teams.get("away") or {}).get("name") or "")
             event_id = str(row.get("event_id") or "")
             if (
-                actual == wanted
+                football_teams_match(
+                    wanted_home,
+                    actual_home,
+                    right_provider="espn",
+                    right_provider_id=(teams.get("home") or {}).get("id"),
+                )
+                and football_teams_match(
+                    wanted_away,
+                    actual_away,
+                    right_provider="espn",
+                    right_provider_id=(teams.get("away") or {}).get("id"),
+                )
                 and str(row.get("date_utc") or "")[:10] == date
                 and event_id.isdigit()
             ):
@@ -770,11 +1296,21 @@ class FootballDataTool:
             return self._espn_rejected("espn_unexpected_payload"), *empty
         event = events[0]
         teams = self._espn_competitors(event)
-        actual = {
-            normalize_competition_name(str((teams.get(side) or {}).get("name") or ""))
-            for side in ("home", "away")
-        }
-        if actual != wanted or str(event.get("date") or "")[:10] != date:
+        if (
+            not football_teams_match(
+                wanted_home,
+                str((teams.get("home") or {}).get("name") or ""),
+                right_provider="espn",
+                right_provider_id=(teams.get("home") or {}).get("id"),
+            )
+            or not football_teams_match(
+                wanted_away,
+                str((teams.get("away") or {}).get("name") or ""),
+                right_provider="espn",
+                right_provider_id=(teams.get("away") or {}).get("id"),
+            )
+            or str(event.get("date") or "")[:10] != date
+        ):
             return self._espn_rejected("espn_fixture_mismatch"), *empty
         game_info = summary.data.get("gameInfo") or {}
         details = {
@@ -798,7 +1334,6 @@ class FootballDataTool:
         )
         if source.status != "success" or not isinstance(source.data, dict):
             return source
-        needles = (normalize_competition_name(team_a), normalize_competition_name(team_b))
         matches = []
         for day in (source.data.get("value") or {}).get("matchInfoList") or []:
             if not isinstance(day, dict):
@@ -806,20 +1341,11 @@ class FootballDataTool:
             for match in day.get("subMatchList") or []:
                 if not isinstance(match, dict):
                     continue
-                haystack = normalize_competition_name(
-                    " ".join(
-                        str(match.get(key) or "")
-                        for key in (
-                            "homeTeamAllName",
-                            "homeTeamAbbName",
-                            "homeTeamAbbEnName",
-                            "awayTeamAllName",
-                            "awayTeamAbbName",
-                            "awayTeamAbbEnName",
-                        )
-                    )
-                )
-                if all(needle in haystack for needle in needles):
+                home_names = _provider_team_names(match, "home")
+                away_names = _provider_team_names(match, "away")
+                if any(football_teams_match(team_a, name) for name in home_names) and any(
+                    football_teams_match(team_b, name) for name in away_names
+                ):
                     matches.append(
                         {
                             "source": "sporttery",
@@ -868,18 +1394,27 @@ class FootballDataTool:
             )
         if fetched.is_error:
             raw_code = str(fetched.metadata.get("errorCode") or "")
+            provider = source.split(":", 1)[0]
             allowed = {
                 "espn_http_403",
                 "espn_curl_unavailable",
                 "espn_timeout",
                 "espn_response_too_large",
             }
-            code = raw_code if raw_code in allowed else f"{source.split(':', 1)[0]}_request_failed"
+            if raw_code == "web_http_429":
+                code = f"{provider}_rate_limited"
+                reason = "The source rate-limited this request after bounded retries"
+            elif raw_code.startswith("web_http_"):
+                code = f"{provider}_{raw_code.removeprefix('web_')}"
+                reason = "The source returned an unsuccessful HTTP status"
+            else:
+                code = raw_code if raw_code in allowed else f"{provider}_request_failed"
+                reason = "The source request did not complete"
             return SourceResult(
                 source,
                 "unavailable",
                 error_code=code,
-                safe_reason="The source request did not complete",
+                safe_reason=reason,
             )
         try:
             payload = json.loads(fetched.content)
@@ -925,19 +1460,16 @@ class FootballDataTool:
     ) -> list[dict[str, Any]]:
         if source.status != "success" or not isinstance(source.data, list):
             return []
-        wanted = {
-            normalize_competition_name(str(fixture.get("home") or "")),
-            normalize_competition_name(str(fixture.get("away") or "")),
-        }
         return [
             row
             for row in source.data
             if isinstance(row, dict)
-            and {
-                normalize_competition_name(str(row.get("home_team") or "")),
-                normalize_competition_name(str(row.get("away_team") or "")),
-            }
-            == wanted
+            and football_teams_match(
+                str(row.get("home_team") or ""), str(fixture.get("home") or "")
+            )
+            and football_teams_match(
+                str(row.get("away_team") or ""), str(fixture.get("away") or "")
+            )
             and (not row.get("commence_time") or str(row.get("commence_time"))[:10] == date)
         ]
 
@@ -993,6 +1525,7 @@ class FootballDataTool:
             "details": {},
             "form": [],
             "head_to_head": [],
+            "previous_match_details": [],
             "odds": {"status": "unavailable"},
             "sources": [source.report() for source in sources],
             "warnings": [*warnings, "primary_fixture_unavailable; do not infer facts"],
@@ -1085,6 +1618,30 @@ class FootballDataTool:
             season = str(arguments.get("season") or "").strip()
             if not season:
                 return self._error("results requires season")
+            date = str(arguments.get("date") or "").strip()
+            if date:
+                day_data, day_error = await self._get_json(
+                    f"{_SPORTS_DB}/eventsday.php?"
+                    f"{urlencode({'d': date, 'l': league_id})}",
+                    context,
+                )
+                day_rows = day_data.get("events") if day_error is None else None
+                if isinstance(day_rows, list) and day_rows:
+                    rows = [
+                        self._event_row(row)
+                        for row in day_rows[:limit]
+                        if isinstance(row, dict)
+                    ]
+                    return self._success(
+                        {
+                            "source": "thesportsdb:eventsday.php",
+                            "action": action,
+                            "league_id": league_id,
+                            "date": date,
+                            "count": len(rows),
+                            "rows": rows,
+                        }
+                    )
             path = "eventsseason.php?" + urlencode({"id": league_id, "s": season})
             key = "events"
         else:
@@ -1152,11 +1709,16 @@ class FootballDataTool:
         )
         if error is not None:
             return error
-        needle = team_b.casefold()
         rows = [
             self._event_row(row)
             for row in data.get("results") or []
-            if isinstance(row, dict) and needle in str(row.get("strEvent") or "").casefold()
+            if isinstance(row, dict)
+            and (
+                _normalize_team_identity(str(row.get("strHomeTeam") or ""))
+                == _normalize_team_identity(team_b)
+                or _normalize_team_identity(str(row.get("strAwayTeam") or ""))
+                == _normalize_team_identity(team_b)
+            )
         ]
         limit = self._limit(arguments, 10)
         return self._success(
@@ -1180,21 +1742,14 @@ class FootballDataTool:
         data, error = await self._get_json(_SPORTTERY, context)
         if error is not None:
             return error
-        needles = (team_a.casefold(), team_b.casefold())
         for day in (data.get("value") or {}).get("matchInfoList") or []:
             for match in day.get("subMatchList") or []:
-                haystack = " ".join(
-                    str(match.get(key) or "")
-                    for key in (
-                        "homeTeamAllName",
-                        "homeTeamAbbName",
-                        "homeTeamAbbEnName",
-                        "awayTeamAllName",
-                        "awayTeamAbbName",
-                        "awayTeamAbbEnName",
-                    )
-                ).casefold()
-                if not all(needle in haystack for needle in needles):
+                home_names = _provider_team_names(match, "home")
+                away_names = _provider_team_names(match, "away")
+                if not (
+                    any(football_teams_match(team_a, name) for name in home_names)
+                    and any(football_teams_match(team_b, name) for name in away_names)
+                ):
                     continue
                 return self._success(
                     {
@@ -1219,6 +1774,12 @@ class FootballDataTool:
         )
 
     async def _team_id(self, team: str, context: ExecutionContext) -> tuple[str, ToolResult | None]:
+        canonical_id = resolve_team_identity(team).canonical_id
+        known_id = DEFAULT_TEAM_IDENTITY_RESOLVER.provider_id(
+            canonical_id, provider="thesportsdb"
+        )
+        if known_id:
+            return known_id, None
         data, error = await self._get_json(
             f"{_SPORTS_DB}/searchteams.php?{urlencode({'t': team})}", context
         )
@@ -1254,13 +1815,27 @@ class FootballDataTool:
 
     @staticmethod
     def _event_row(row: dict[str, Any]) -> dict[str, Any]:
+        home = str(row.get("strHomeTeam") or "")
+        away = str(row.get("strAwayTeam") or "")
+        home_id = str(row.get("idHomeTeam") or "")
+        away_id = str(row.get("idAwayTeam") or "")
+        home_identity = resolve_team_identity(
+            home, provider="thesportsdb", provider_id=home_id
+        )
+        away_identity = resolve_team_identity(
+            away, provider="thesportsdb", provider_id=away_id
+        )
         return {
             "event_id": row.get("idEvent"),
             "competition": row.get("strLeague"),
             "season": row.get("strSeason"),
             "match": row.get("strEvent"),
-            "home": row.get("strHomeTeam"),
-            "away": row.get("strAwayTeam"),
+            "home": home,
+            "away": away,
+            "home_team_id": home_id or None,
+            "away_team_id": away_id or None,
+            "home_canonical_id": home_identity.canonical_id,
+            "away_canonical_id": away_identity.canonical_id,
             "home_score": row.get("intHomeScore"),
             "away_score": row.get("intAwayScore"),
             "date": row.get("dateEvent"),
