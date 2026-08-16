@@ -847,6 +847,55 @@ async def test_primary_and_espn_success_preserve_primary_fixture_identity() -> N
 
 
 @pytest.mark.asyncio
+async def test_h2h_search_finds_prior_season_match_when_recent_events_omit_opponent() -> None:
+    current = {
+        **PRIMARY_EVENT,
+        "idHomeTeam": "100",
+        "idAwayTeam": "101",
+        "strStatus": "NS",
+    }
+    recent = {
+        **current,
+        "idEvent": "21002",
+        "strAwayTeam": "A different opponent",
+        "idAwayTeam": "999",
+        "dateEvent": "2026-08-05",
+        "intHomeScore": "1",
+        "intAwayScore": "0",
+        "strStatus": "FT",
+    }
+    prior_h2h = {
+        **current,
+        "idEvent": "21003",
+        "strSeason": "2025",
+        "dateEvent": "2025-09-10",
+        "intHomeScore": "2",
+        "intAwayScore": "1",
+        "strStatus": "FT",
+    }
+    responses = fixture_responses()
+    responses.update(
+        {
+            "eventsday.php": {"events": [current]},
+            "eventsseason.php": {"events": [current]},
+            "eventslast.php": {"results": [recent]},
+            "searchevents.php": {"event": [prior_h2h]},
+        }
+    )
+
+    result, fetcher = await run_evidence(responses)
+    payload = json.loads(result.content)
+
+    assert not result.is_error
+    assert [event["event_id"] for event in payload["head_to_head"]] == ["21003"]
+    assert any("searchevents.php" in url and "s=2025" in url for url in fetcher.urls)
+    assert any(
+        source["source"] == "thesportsdb:h2h_search"
+        for source in payload["sources"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_world_cup_schedule_compatibility_uses_confirmed_primary_id() -> None:
     responses: dict[str, object] = {
         "search_all_leagues.php": {

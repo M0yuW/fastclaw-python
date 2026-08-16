@@ -1053,6 +1053,83 @@ class FootballDataTool:
             or _normalize_team_identity(str(event.get("away") or ""))
             == _normalize_team_identity(team_b)
         ][:10]
+        if not h2h:
+            # ``eventslast`` is a deliberately small recent-events feed and
+            # cannot establish H2H just because the opponent is absent from
+            # those latest rows. The free TheSportsDB API has no dedicated
+            # H2H endpoint, but its documented event search can find the
+            # exact fixture in the preceding season in both home/away orders.
+            prior_season = _previous_season(
+                str((fixture or {}).get("season") or "")
+            )
+            competition_name = normalize_competition_name(
+                str((fixture or {}).get("competition") or "")
+            )
+            home_provider = str(requested_teams[0][1] or team_a)
+            away_provider = str(requested_teams[1][1] or team_b)
+            team_ids = (str(requested_teams[0][2] or ""), str(requested_teams[1][2] or ""))
+
+            def side_matches(
+                event: dict[str, Any],
+                requested: str,
+                requested_id: str,
+                side: str,
+            ) -> bool:
+                candidate = str(event.get(side) or "")
+                candidate_id = str(event.get(f"{side}_team_id") or "")
+                return bool(
+                    requested_id
+                    and candidate_id
+                    and requested_id == candidate_id
+                ) or football_teams_match(
+                    requested,
+                    candidate,
+                    right_provider="thesportsdb",
+                    right_provider_id=candidate_id,
+                )
+
+            if prior_season and home_provider and away_provider:
+                searched: list[dict[str, Any]] = []
+                seen_event_ids: set[str] = set()
+                for search_home, search_away in (
+                    (home_provider, away_provider),
+                    (away_provider, home_provider),
+                ):
+                    source = await self._source_json(
+                        f"{_SPORTS_DB}/searchevents.php?"
+                        + urlencode(
+                            {
+                                "e": f"{search_home}_vs_{search_away}",
+                                "s": prior_season,
+                            }
+                        ),
+                        context,
+                        source="thesportsdb:h2h_search",
+                    )
+                    sources.append(source)
+                    for event in self._provider_rows(source, "event", self._event_row):
+                        if (
+                            str(event.get("season") or "") != prior_season
+                            or normalize_competition_name(
+                                str(event.get("competition") or "")
+                            )
+                            != competition_name
+                            or not _is_completed_event(event)
+                        ):
+                            continue
+                        has_home = side_matches(event, team_a, team_ids[0], "home")
+                        has_away = side_matches(event, team_b, team_ids[1], "away")
+                        reverse_home = side_matches(event, team_a, team_ids[0], "away")
+                        reverse_away = side_matches(event, team_b, team_ids[1], "home")
+                        if not ((has_home and has_away) or (reverse_home and reverse_away)):
+                            continue
+                        event_id = str(event.get("event_id") or "")
+                        if event_id and event_id in seen_event_ids:
+                            continue
+                        if event_id:
+                            seen_event_ids.add(event_id)
+                        searched.append(event)
+                h2h = searched[:10]
 
         previous_match_details: list[dict[str, Any]] = []
         detail_cache: dict[str, SourceResult] = {}
