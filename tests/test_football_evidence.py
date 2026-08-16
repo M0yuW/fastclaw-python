@@ -129,6 +129,7 @@ def test_team_identity_resolver_unifies_translations_prefixes_and_provider_ids()
     assert resolver.resolve("Levante UD").canonical_id == "levante"
     assert resolver.resolve("莱万特").canonical_id == "levante"
     assert resolver.resolve("Villarreal CF").canonical_id == "villarreal"
+    assert resolver.resolve("Real Racing Club de Santander").canonical_id == "racingsantander"
 
     primary = resolver.resolve("RCD Espanyol", provider="thesportsdb", provider_id="100")
     same_provider_id = resolver.resolve(
@@ -575,6 +576,61 @@ async def test_context_and_odds_resolve_team_aliases_for_the_same_fixture() -> N
     payload = json.loads(odds_result.content)
     assert not odds_result.is_error
     assert payload["base_evidence_key"] == evidence_key
+    assert payload["source"]["status"] == "success"
+    assert len(payload["odds"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_odds_match_accepts_real_racing_club_de_santander_alias() -> None:
+    shared = context()
+    evidence_key = "spanishlaliga|2026-2027|20260816|racingsantander|villarreal"
+    shared.shared_state.publish_football_base(
+        evidence_key,
+        json.dumps(
+            {
+                "fixture": {
+                    "competition": "Spanish LALIGA",
+                    "season": "2026-2027",
+                    "date": "2026-08-16",
+                    "requested_date": "2026-08-16",
+                    "home": "Racing de Santander",
+                    "away": "Villarreal",
+                },
+                "base_evidence_key": evidence_key,
+            }
+        ),
+    )
+    odds = FootballOddsTool(
+        odds_source=StaticOdds(
+            SourceResult(
+                "the_odds_api",
+                "success",
+                [
+                    {
+                        "home_team": "Real Racing Club de Santander",
+                        "away_team": "Villarreal",
+                        "commence_time": "2026-08-16T15:00:00Z",
+                    }
+                ],
+            )
+        ),
+        cache=FootballEvidenceCache(),
+    )
+
+    result = await odds.execute(
+        {
+            "competition": "西甲",
+            "country": "Spain",
+            "season": "2026-27",
+            "date": "2026-08-16",
+            "team_a": "桑坦德竞技",
+            "team_b": "比利亚雷亚尔",
+        },
+        shared,
+    )
+
+    payload = json.loads(result.content)
+    assert not result.is_error
     assert payload["source"]["status"] == "success"
     assert len(payload["odds"]) == 1
 

@@ -64,6 +64,8 @@ class TeamIdentityResolver:
         "桑坦德竞技": "racingsantander",
         "racingsantander": "racingsantander",
         "racingdesantander": "racingsantander",
+        "racingclubdesantander": "racingsantander",
+        "realracingclubdesantander": "racingsantander",
         "比利亚雷亚尔": "villarreal",
         "villarreal": "villarreal",
         "villarrealcf": "villarreal",
