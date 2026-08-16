@@ -235,9 +235,6 @@ class FootballDataTool:
         ]
         if role_mode == "data":
             actions = ["base_evidence"]
-            # Existing persisted prompts may still name the old action. Keep
-            # it as a compatibility alias routed to the same data-only path.
-            actions.append("evidence")
             # Ledger review uses the same trusted competition/results endpoint,
             # but must not be forced through the upcoming-fixture base gate.
             actions.append("results")
@@ -303,6 +300,23 @@ class FootballDataTool:
                 )
                 context.shared_state.football_settlement_errors.append(result.content)
                 return result
+        if self._role_mode == "data" and action == "evidence":
+            # Older persisted prompts may still attempt the full evidence action
+            # after base_evidence has already published the bundle. Do not let a
+            # redundant historical-date request overwrite a successful run.
+            if context.shared_state.has_football_base():
+                return ToolResult(
+                    content=(
+                        "base_evidence is already published; reuse its historical_context "
+                        "for H2H, prior-season, and preseason evidence. No second fixture "
+                        "lookup is needed."
+                    ),
+                    metadata={"status": "base_already_published"},
+                )
+            return self._error(
+                "data analyst must call football_data action=base_evidence; "
+                "do not use evidence for a separate H2H lookup"
+            )
         if self._role_mode == "data" and action not in {"base_evidence", "evidence", "results"}:
             return self._error(
                 "data analyst may request base_evidence or competition results for ledger review"
@@ -448,7 +462,7 @@ class FootballDataTool:
         competition = resolve_football_competition(query, country=country)
         if competition is None:
             return None, FootballDataTool._error(
-                "ESPN action requires a competition from the trusted runtime catalog"
+                "football_data requires a competition from the trusted runtime catalog"
             )
         return competition, None
 

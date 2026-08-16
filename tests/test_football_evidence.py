@@ -332,6 +332,45 @@ async def test_data_role_can_query_results_for_ledger_settlement_review() -> Non
 
 
 @pytest.mark.asyncio
+async def test_data_role_ignores_redundant_evidence_after_base_is_published() -> None:
+    fetcher = FixtureFetcher(fixture_responses())
+    execution = context()
+    execution.shared_state.publish_football_base(
+        "swedishallsvenskan|2026|2026-08-10|iksirius|ifbrommapojkarna",
+        json.dumps(
+            {
+                "evidence_schema_version": 3,
+                "fixture": {
+                    "competition": "Swedish Allsvenskan",
+                    "season": "2026",
+                    "date": "2026-08-10",
+                    "home": "IK Sirius",
+                    "away": "IF Brommapojkarna",
+                },
+                "historical_context": {},
+            }
+        ),
+    )
+    tool = FootballDataTool(fetcher, role_mode="data")
+
+    result = await tool.execute(
+        {
+            "action": "evidence",
+            "competition": "La Liga 2",
+            "season": "2025/26",
+            "date": "2025-08-16",
+            "team_a": "Racing Santander",
+            "team_b": "Villarreal",
+        },
+        execution,
+    )
+
+    assert not result.is_error
+    assert result.metadata["status"] == "base_already_published"
+    assert fetcher.urls == []
+
+
+@pytest.mark.asyncio
 async def test_settlement_review_forbids_base_evidence_context_and_odds() -> None:
     fetcher = FixtureFetcher(fixture_responses())
     execution = context()
