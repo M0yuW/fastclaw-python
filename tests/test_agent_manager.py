@@ -14,6 +14,7 @@ from fastclaw.agent.manager import (
     AgentRuntimeManager,
     AgentRuntimeProfile,
     _explicit_ev_request,
+    _explicit_sporttery_request,
 )
 from fastclaw.agent.models import AgentRunError
 from fastclaw.execution import ExecutionContext
@@ -97,9 +98,18 @@ class CoordinatingProvider:
         return ProviderStream(events())
 
 
-def test_ev_dispatch_requires_explicit_market_intent() -> None:
+def test_ev_dispatch_requires_explicit_ev_intent() -> None:
     assert not _explicit_ev_request("分析这两场比赛的基本面和战术")
+    assert not _explicit_ev_request("请补充赔率和 Sporttery 价格")
+    assert not _explicit_ev_request("分析盘口、市场价格和去水概率")
     assert _explicit_ev_request("请补充赔率、EV 和 Sporttery 价格")
+    assert _explicit_ev_request("请让EV专家做期望值分析")
+    assert _explicit_ev_request("获取ev建议")
+    assert _explicit_ev_request("获取EV建议")
+    assert not _explicit_ev_request("event data")
+    assert not _explicit_sporttery_request("请给普通独立赔率")
+    assert _explicit_sporttery_request("请补充 Sporttery 官方SP")
+    assert _explicit_sporttery_request("请读取竞彩赔率")
 
 
 @pytest.mark.asyncio
@@ -161,6 +171,59 @@ async def test_existing_football_coordinator_gets_prediction_contract(tmp_path: 
         assert "Football prediction output contract" in profile.system_prompt
         assert "one row for every requested match" in profile.system_prompt
         assert "1X2 is exactly home win, draw, or away win" in profile.system_prompt
+        assert "two required phases" in profile.system_prompt
+        assert "independent data-only 1X2 lean" in profile.system_prompt
+        assert "never tell the data analyst 'do not predict'" in profile.system_prompt
+        assert "never describe the whole batch as missing" in profile.system_prompt
+        assert "one exact full-time score prediction" in profile.system_prompt
+        assert "ht_score_pred, ft_score_pred" in profile.system_prompt
+    finally:
+        await close_manager(manager, runtime, database)
+
+
+@pytest.mark.asyncio
+async def test_prediction_data_delegation_requires_evidence_then_data_lean(tmp_path: Path) -> None:
+    now = datetime.now(UTC)
+    data_agent = AgentRecord(
+        id="data-analyst",
+        user_id="user-1",
+        name="Competition data analyst",
+        config={
+            "model": "fixture/specialist",
+            "teamRole": "data-analyst",
+            "allowedTools": ["football_data", "football_context"],
+        },
+        created_at=now,
+        updated_at=now,
+    )
+    provider = CoordinatingProvider(data_agent.id)
+    manager, runtime, database = await build_manager(
+        tmp_path / "data-two-phase.db", provider, (data_agent,)
+    )
+    execution = ExecutionContext(
+        user_id="user-1",
+        agent_id=data_agent.id,
+        session_id="session-1",
+        root_execution_id="run-1",
+    )
+    try:
+        result = await manager._delegated_chat(
+            data_agent.id,
+            "Analyze Home FC vs Away FC for a pre-match prediction",
+            execution,
+        )
+
+        assert result == "specialist answer"
+        request = provider.requests[-1]
+        user_message = next(
+            message for message in reversed(request.messages) if message.role is MessageRole.USER
+        )
+        assert isinstance(user_message.content, str)
+        assert "action=base_evidence" in user_message.content
+        assert "complete the second phase" in user_message.content
+        assert "independent data-only 1X2 judgment" in user_message.content
+        assert "report per-fixture status" in user_message.content
+        assert "Do not call football_odds or Sporttery" in user_message.content
     finally:
         await close_manager(manager, runtime, database)
 

@@ -6,10 +6,11 @@ from fastclaw.tools.football import FootballLedgerTool
 from fastclaw.tools.football_competitions import (
     FOOTBALL_COMPETITIONS,
     FootballCompetition,
+    canonical_competition_display,
     resolve_football_competition,
 )
 from fastclaw.tools.football_context import FootballContextTool, FootballOddsTool
-from fastclaw.tools.football_data import FootballDataTool
+from fastclaw.tools.football_data import FootballDataTool, SportteryPublicFetcher
 from fastclaw.tools.registry import ToolRegistry
 from fastclaw.tools.skill import SkillScriptTool
 from fastclaw.tools.workspace import ListDirTool, WriteFileTool
@@ -27,11 +28,13 @@ __all__ = [
     "ListDirTool",
     "ReadFileTool",
     "SkillScriptTool",
+    "SportteryPublicFetcher",
     "Tool",
     "ToolRegistry",
     "ToolResult",
     "WebFetchTool",
     "WorldCupLedgerTool",
     "WriteFileTool",
+    "canonical_competition_display",
     "resolve_football_competition",
 ]

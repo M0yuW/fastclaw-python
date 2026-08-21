@@ -38,15 +38,18 @@ def migrate(data_root: Path, *, dry_run: bool) -> list[dict[str, object]]:
         payload = json.loads(ledger.read_text(encoding="utf-8"))
         if not isinstance(payload, list) or not all(isinstance(row, dict) for row in payload):
             raise ValueError(f"invalid ledger: {ledger}")
-        merged, duplicate_count = FootballLedgerTool.coalesce_rows(payload)
+        merged, duplicate_count = FootballLedgerTool.normalize_rows(payload)
         report: dict[str, object] = {
             "ledger": str(ledger),
             "rowsBefore": len(payload),
             "rowsAfter": len(merged),
             "mergedRows": duplicate_count,
-            "changed": bool(duplicate_count),
+            "normalizedRows": sum(
+                1 for before, after in zip(payload, merged, strict=False) if before != after
+            ),
+            "changed": merged != payload,
         }
-        if duplicate_count and not dry_run:
+        if merged != payload and not dry_run:
             backup = _backup_path(ledger)
             shutil.copy2(ledger, backup)
             _write(ledger, merged)

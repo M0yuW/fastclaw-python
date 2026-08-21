@@ -147,6 +147,13 @@ def final_round() -> tuple[ProviderEvent, ...]:
     )
 
 
+def empty_length_round() -> tuple[ProviderEvent, ...]:
+    return (
+        ProviderEvent(type=ProviderEventType.THINKING_DELTA, content="repeated planning"),
+        ProviderEvent(type=ProviderEventType.DONE, finish_reason="length"),
+    )
+
+
 def batch_tool_round() -> tuple[ProviderEvent, ...]:
     return (
         ProviderEvent(
@@ -237,6 +244,68 @@ async def test_react_loop_calls_provider_once_per_round_and_persists_final_histo
         "assistant",
     ]
     assert saved.messages[1]["_raw"]["tool_calls"][0]["function"]["name"] == "echo"
+
+
+@pytest.mark.asyncio
+async def test_empty_length_response_retries_without_persisting_blank_assistant() -> None:
+    provider = ScriptedProvider([empty_length_round(), tool_round(), final_round()])
+    persistence = StubPersistence()
+    stream = AgentRunner(provider, ToolRegistry([EchoTool()]), persistence).stream(
+        AgentRunRequest(model="fixture", message="process a large batch"),
+        run_context(),
+    )
+
+    events = [event async for event in stream]
+
+    assert stream.result().content == "finished"
+    assert len(provider.requests) == 3
+    retry_user = [
+        message
+        for message in provider.requests[1].messages
+        if message.role is MessageRole.USER
+    ][-1]
+    assert "Immediately emit the next required tool call" in str(retry_user.content)
+    assert [event.type for event in events] == [
+        AgentEventType.TOOL_CALL,
+        AgentEventType.TOOL_RESULT,
+        AgentEventType.CONTENT_DELTA,
+        AgentEventType.CONTENT,
+        AgentEventType.DONE,
+    ]
+    saved = persistence.saved[0]
+    assert [message["role"] for message in saved.messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert all(message.get("thinking") != "repeated planning" for message in saved.messages)
+
+
+@pytest.mark.asyncio
+async def test_repeated_empty_length_response_returns_visible_failure() -> None:
+    provider = ScriptedProvider([empty_length_round(), empty_length_round()])
+    persistence = StubPersistence()
+    stream = AgentRunner(provider, ToolRegistry(), persistence).stream(
+        AgentRunRequest(model="fixture", message="process a large batch"),
+        run_context(),
+    )
+
+    events = [event async for event in stream]
+
+    result = stream.result()
+    assert "本轮未完成：模型输出达到长度上限" in result.content  # noqa: RUF001
+    assert len(provider.requests) == 2
+    assert [event.type for event in events] == [
+        AgentEventType.CONTENT,
+        AgentEventType.DONE,
+    ]
+    assert persistence.saved[0].messages[-1]["content"] == result.content
+    assert persistence.saved[0].messages[-1]["metadata"] == {
+        "providerFailure": "output_incomplete",
+        "finishReason": "length",
+        "recoveryAttempted": True,
+    }
 
 
 @pytest.mark.asyncio
@@ -353,6 +422,20 @@ class BlockingProvider(ScriptedProvider):
         return ProviderStream(source())
 
 
+class ReadTimeoutProvider(ScriptedProvider):
+    def __init__(self) -> None:
+        super().__init__([])
+
+    def stream(self, request: ChatRequest) -> ProviderStream:
+        self.requests.append(request)
+
+        async def source() -> AsyncIterator[ProviderEvent]:
+            raise httpx.ReadTimeout("fixture provider was slow")
+            yield  # pragma: no cover
+
+        return ProviderStream(source())
+
+
 @pytest.mark.asyncio
 async def test_stop_closes_provider_stream_and_does_not_persist_partial_assistant() -> None:
     provider = BlockingProvider()
@@ -369,6 +452,23 @@ async def test_stop_closes_provider_stream_and_does_not_persist_partial_assistan
     await stream.aclose()
 
     assert provider.closed
+    assert persistence.saved == []
+
+
+@pytest.mark.asyncio
+async def test_provider_read_timeout_returns_safe_visible_error() -> None:
+    provider = ReadTimeoutProvider()
+    persistence = StubPersistence()
+    stream = AgentRunner(provider, ToolRegistry(), persistence).stream(
+        AgentRunRequest(model="fixture", message="large request"),
+        run_context(),
+    )
+
+    events = [event async for event in stream]
+
+    error = next(event for event in events if event.type is AgentEventType.ERROR)
+    assert "模型服务读取超时" in error.error
+    assert "ReadTimeout" not in error.error
     assert persistence.saved == []
 
 

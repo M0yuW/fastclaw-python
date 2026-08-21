@@ -18,17 +18,30 @@ class FootballCompetition:
     odds_sport_key: str
     aliases: tuple[str, ...]
     provider_country: str | None = None
+    # Some UEFA competitions use a separate ESPN league for qualifying rounds.
+    # Keep it runtime-owned so models cannot substitute arbitrary provider slugs.
+    espn_qualifying_slug: str = ""
+    # Reviewed alternate Odds API competitions, such as a separately routed
+    # qualifying tournament. The primary key remains first for stable callers.
+    odds_alternate_sport_keys: tuple[str, ...] = ()
     # Reviewed provider league IDs used only for prior-division context. They
     # are runtime-owned and never exposed as model-supplied identifiers.
     historical_league_ids: tuple[tuple[str, str], ...] = ()
 
+    @property
+    def odds_sport_keys(self) -> tuple[str, ...]:
+        return (self.odds_sport_key, *self.odds_alternate_sport_keys)
+
     def public_mapping(self) -> dict[str, str]:
-        return {
+        mapping = {
             "key": self.key,
             "competition": self.name,
             "country": self.country,
             "espn_slug": self.espn_slug,
         }
+        if self.espn_qualifying_slug:
+            mapping["espn_qualifying_slug"] = self.espn_qualifying_slug
+        return mapping
 
 
 # ESPN slugs were mechanically checked against the public soccer scoreboard endpoint on
@@ -49,7 +62,24 @@ FOOTBALL_COMPETITIONS: tuple[FootballCompetition, ...] = (
         "Europe",
         "uefa.champions",
         "soccer_uefa_champs_league",
-        ("Champions League", "UCL", "欧冠", "欧洲冠军联赛"),
+        (
+            "Champions League",
+            "UCL",
+            "UEFA Champions League Qualification",
+            "UEFA Champions League Qualifying",
+            "Champions League Qualification",
+            "Champions League Qualifying",
+            "UCL Qualification",
+            "UCL Qualifying",
+            "欧冠",
+            "欧洲冠军联赛",
+            "欧冠资格赛",
+            "欧冠附加赛",
+            "欧洲冠军联赛资格赛",
+            "欧洲冠军联赛附加赛",
+        ),
+        espn_qualifying_slug="uefa.champions_qual",
+        odds_alternate_sport_keys=("soccer_uefa_champs_league_qualification",),
     ),
     FootballCompetition(
         "uefa-europa-league",
@@ -57,7 +87,25 @@ FOOTBALL_COMPETITIONS: tuple[FootballCompetition, ...] = (
         "Europe",
         "uefa.europa",
         "soccer_uefa_europa_league",
-        ("Europa League", "UEL", "欧联", "欧联杯", "欧洲联赛"),
+        (
+            "Europa League",
+            "UEL",
+            "UEFA Europa League Qualification",
+            "UEFA Europa League Qualifying",
+            "Europa League Qualification",
+            "Europa League Qualifying",
+            "UEL Qualification",
+            "UEL Qualifying",
+            "欧罗巴",
+            "欧联",
+            "欧联杯",
+            "欧洲联赛",
+            "欧罗巴资格赛",
+            "欧罗巴附加赛",
+            "欧联资格赛",
+            "欧联附加赛",
+        ),
+        espn_qualifying_slug="uefa.europa_qual",
     ),
     FootballCompetition(
         "english-premier-league",
@@ -166,6 +214,22 @@ _COUNTRY_ALIASES = {
     "美国": "United States",
 }
 
+_COMPETITION_DISPLAY_NAMES = {
+    "fifa-world-cup": "世界杯",
+    "uefa-champions-league": "欧冠",
+    "uefa-europa-league": "欧罗巴",
+    "english-premier-league": "英超",
+    "spanish-laliga": "西甲",
+    "german-bundesliga": "德甲",
+    "italian-serie-a": "意甲",
+    "french-ligue-1": "法甲",
+    "dutch-eredivisie": "荷甲",
+    "portuguese-primeira-liga": "葡超",
+    "swedish-allsvenskan": "瑞典超",
+    "norwegian-eliteserien": "挪超",
+    "major-league-soccer": "美职联",
+}
+
 
 def normalize_competition_name(value: str) -> str:
     """Normalize a human competition label without interpreting provider IDs."""
@@ -193,20 +257,56 @@ def canonical_competition_identity(value: str, *, country: str = "") -> str:
     )
 
 
+def canonical_competition_display(value: str) -> str:
+    """Return one stable Chinese label for customer-facing ledger output."""
+
+    text = " ".join(str(value or "").split())
+    resolved = resolve_football_competition(text)
+    if resolved is None:
+        return text
+    return _COMPETITION_DISPLAY_NAMES.get(resolved.key, resolved.name)
+
+
 def resolve_football_competition(value: str, *, country: str = "") -> FootballCompetition | None:
-    """Resolve a reviewed alias; never treat an arbitrary provider slug as trusted."""
+    """Resolve a reviewed alias, using country only to disambiguate duplicate labels.
+
+    Models sometimes attach a participating club's country to an international
+    competition. A unique reviewed competition label is authoritative and must
+    not be rejected by that advisory hint.
+    """
 
     needle = normalize_competition_name(value)
     trusted_country = _COUNTRY_ALIASES.get(country.strip(), country)
     wanted_country = normalize_competition_name(trusted_country)
     if not needle:
         return None
-    matches = []
+    matches: list[FootballCompetition] = []
     for competition in FOOTBALL_COMPETITIONS:
         labels = (competition.key, competition.name, *competition.aliases)
         if needle not in {normalize_competition_name(label) for label in labels}:
             continue
-        if wanted_country and wanted_country != normalize_competition_name(competition.country):
-            continue
         matches.append(competition)
+    if not matches:
+        # Coordinators and historical ledgers often retain a bilingual display
+        # label such as "UEFA Europa League 欧联资格赛". It is not an exact alias,
+        # but it contains reviewed aliases that uniquely identify one catalog
+        # competition. Only accept a unique embedded match; ambiguous composite
+        # labels still fail closed.
+        for competition in FOOTBALL_COMPETITIONS:
+            labels = (competition.key, competition.name, *competition.aliases)
+            normalized_labels = {
+                normalize_competition_name(label)
+                for label in labels
+                if len(normalize_competition_name(label)) >= 4
+            }
+            if any(label in needle for label in normalized_labels):
+                matches.append(competition)
+    if wanted_country:
+        country_matches = [
+            competition
+            for competition in matches
+            if wanted_country == normalize_competition_name(competition.country)
+        ]
+        if len(country_matches) == 1:
+            return country_matches[0]
     return matches[0] if len(matches) == 1 else None

@@ -17,7 +17,10 @@ from fastclaw.execution import ExecutionContext, football_team_identity
 from fastclaw.football_identity import resolve_team_identity
 from fastclaw.providers import ToolDefinition, ToolFunction
 from fastclaw.tools.base import ToolResult
-from fastclaw.tools.football_competitions import canonical_competition_identity
+from fastclaw.tools.football_competitions import (
+    canonical_competition_display,
+    canonical_competition_identity,
+)
 
 _LOCKS: defaultdict[Path, asyncio.Lock] = defaultdict(asyncio.Lock)
 
@@ -61,10 +64,24 @@ class FootballLedgerTool:
                                 "away_canonical_id": {"type": "string"},
                                 "our_pred": {"type": "string"},
                                 "our_confidence": {"type": "string"},
-                                "our_score_pred": {"type": "string"},
-                                "ht_ft_pred": {"type": "string"},
-                                "ht_score_pred": {"type": "string"},
-                                "ft_score_pred": {"type": "string"},
+                                "our_score_pred": {
+                                    "type": "string",
+                                    "description": "Exact full-time score, for example 2-0",
+                                },
+                                "ht_ft_pred": {
+                                    "type": "string",
+                                    "description": "Half-time/full-time outcome, for example 平/胜",
+                                },
+                                "ht_score_pred": {
+                                    "type": "string",
+                                    "description": "Exact half-time score, for example 0-0",
+                                },
+                                "ft_score_pred": {
+                                    "type": "string",
+                                    "description": (
+                                        "Exact full-time score; must equal our_score_pred"
+                                    ),
+                                },
                                 "baselines": {"type": "object"},
                                 "ev_review": {"type": "object"},
                                 "actual_result": {"type": "string"},
@@ -116,8 +133,19 @@ class FootballLedgerTool:
                 key = self._entry_key(entry)
                 selected = [row for row in rows if self._same_fixture(row, entry)]
                 if len(selected) != 1:
-                    raise ValueError(
-                        "update must identify exactly one existing competition, date, and match"
+                    return ToolResult(
+                        content=(
+                            "football_ledger update rejected: the competition, date, and match "
+                            "did not identify exactly one existing row. This is a deterministic "
+                            "key mismatch; do not retry unchanged. Call operation=report and "
+                            "reuse the stored competition and match labels."
+                        ),
+                        is_error=True,
+                        metadata={
+                            "status": "update_key_mismatch",
+                            "errorCode": "ledger_update_key_mismatch",
+                            "entryKey": "|".join(key),
+                        },
                     )
                 changes = {
                     field: value
@@ -126,6 +154,9 @@ class FootballLedgerTool:
                 }
                 if not changes:
                     raise ValueError("update requires at least one field to change")
+                updated = dict(selected[0])
+                updated.update(changes)
+                self._validate_entry(updated)
                 selected[0].update(changes)
                 await anyio.to_thread.run_sync(self._write, ledger, rows)
                 return ToolResult(
@@ -193,8 +224,8 @@ class FootballLedgerTool:
             raise ValueError("invalid Agent workspace")
         return workspace / "football" / "ledger.json"
 
-    @staticmethod
-    def _normalize_entry(arguments: dict[str, Any]) -> dict[str, Any]:
+    @classmethod
+    def _normalize_entry(cls, arguments: dict[str, Any]) -> dict[str, Any]:
         """Accept the canonical nested shape and common model-emitted aliases."""
 
         raw_entry = arguments.get("entry")
@@ -225,6 +256,10 @@ class FootballLedgerTool:
             value = entry.get("confidence")
             if isinstance(value, str) and value.strip():
                 entry["our_confidence"] = value
+        if isinstance(entry.get("competition"), str) and entry["competition"].strip():
+            entry["competition"] = canonical_competition_display(entry["competition"])
+        if isinstance(entry.get("ht_ft_pred"), str) and entry["ht_ft_pred"].strip():
+            entry["ht_ft_pred"] = cls._canonical_htft_display(entry["ht_ft_pred"])
         return entry
 
     @classmethod
@@ -258,27 +293,33 @@ class FootballLedgerTool:
         non-unique instead of updating an arbitrary row.
         """
 
-        left_home, left_away = cls._split_match(left.get("match"))
-        right_home, right_away = cls._split_match(right.get("match"))
-        left_home_id = str(
-            left.get("home_canonical_id") or resolve_team_identity(left_home).canonical_id
-        )
-        left_away_id = str(
-            left.get("away_canonical_id") or resolve_team_identity(left_away).canonical_id
-        )
-        right_home_id = str(
-            right.get("home_canonical_id") or resolve_team_identity(right_home).canonical_id
-        )
-        right_away_id = str(
-            right.get("away_canonical_id") or resolve_team_identity(right_away).canonical_id
-        )
         return (
             cls._competition_key(left.get("competition"))
             == cls._competition_key(right.get("competition"))
-            and left_home_id == right_home_id
-            and left_away_id == right_away_id
+            and bool(
+                cls._team_identity_candidates(left, home=True)
+                & cls._team_identity_candidates(right, home=True)
+            )
+            and bool(
+                cls._team_identity_candidates(left, home=False)
+                & cls._team_identity_candidates(right, home=False)
+            )
             and cls._dates_match(left.get("date"), right.get("date"))
         )
+
+    @classmethod
+    def _team_identity_candidates(cls, entry: dict[str, Any], *, home: bool) -> set[str]:
+        home_name, away_name = cls._split_match(entry.get("match"))
+        team_name = home_name if home else away_name
+        field = "home_canonical_id" if home else "away_canonical_id"
+        candidates: set[str] = set()
+        explicit = str(entry.get(field) or "").strip().casefold()
+        if explicit:
+            candidates.add(explicit)
+        if team_name:
+            candidates.add(resolve_team_identity(team_name).canonical_id.casefold())
+            candidates.add(football_team_identity(team_name).casefold())
+        return {candidate for candidate in candidates if candidate}
 
     @staticmethod
     def _dates_match(left: Any, right: Any) -> bool:
@@ -373,6 +414,25 @@ class FootballLedgerTool:
                 current["notes"] = f"{existing_notes}\n{suffix}".strip()
         return merged, merged_count
 
+    @classmethod
+    def normalize_rows(cls, rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+        """Normalize customer-facing labels before deduplicating a ledger."""
+
+        normalized: list[dict[str, Any]] = []
+        for source in rows:
+            row = dict(source)
+            if isinstance(row.get("competition"), str):
+                row["competition"] = canonical_competition_display(row["competition"])
+            if isinstance(row.get("ht_ft_pred"), str) and row["ht_ft_pred"].strip():
+                try:
+                    row["ht_ft_pred"] = cls._canonical_htft_display(row["ht_ft_pred"])
+                except ValueError:
+                    # Preserve an invalid legacy value for manual review rather
+                    # than making the migration destructive.
+                    pass
+            normalized.append(row)
+        return cls.coalesce_rows(normalized)
+
     @staticmethod
     def _key_part(value: Any) -> str:
         return " ".join(str(value or "").split()).casefold()
@@ -382,6 +442,89 @@ class FootballLedgerTool:
         FootballLedgerTool._validate_identity(entry)
         if not isinstance(entry.get("our_pred"), str) or not entry["our_pred"].strip():
             raise ValueError("entry requires non-empty our_pred")
+        FootballLedgerTool._validate_prediction_consistency(entry)
+
+    @staticmethod
+    def _score_outcome(value: Any, *, field: str) -> tuple[str, tuple[int, int]] | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        matched = re.fullmatch(r"(\d+)\s*[-:]\s*(\d+)", text)
+        if matched is None:
+            raise ValueError(f"{field} must be an exact score such as 2-0")
+        home, away = int(matched.group(1)), int(matched.group(2))
+        outcome = "主胜" if home > away else "客胜" if home < away else "平"
+        return outcome, (home, away)
+
+    @staticmethod
+    def _htft_outcomes(value: Any) -> tuple[str, str] | None:
+        text = " ".join(str(value or "").split()).casefold()
+        if not text:
+            return None
+        parts = re.split(r"\s*(?:/|→|>)\s*", text)
+        if len(parts) != 2:
+            raise ValueError("ht_ft_pred must contain half-time/full-time outcomes such as 平/胜")
+        aliases = {
+            "胜": "主胜",
+            "主胜": "主胜",
+            "主": "主胜",
+            "home": "主胜",
+            "home win": "主胜",
+            "平": "平",
+            "平局": "平",
+            "draw": "平",
+            "负": "客胜",
+            "客胜": "客胜",
+            "客": "客胜",
+            "away": "客胜",
+            "away win": "客胜",
+        }
+        try:
+            return aliases[parts[0]], aliases[parts[1]]
+        except KeyError as exc:
+            raise ValueError(
+                "ht_ft_pred outcomes must be home win/draw/away win or 胜/平/负"
+            ) from exc
+
+    @classmethod
+    def _canonical_htft_display(cls, value: Any) -> str:
+        """Normalize half/full-time shorthand to the fixed 胜/平/负 display form."""
+
+        parsed = cls._htft_outcomes(value)
+        if parsed is None:
+            return ""
+        labels = {"主胜": "胜", "平": "平", "客胜": "负"}
+        return "/".join(labels[item] for item in parsed)
+
+    @staticmethod
+    def _validate_prediction_consistency(entry: dict[str, Any]) -> None:
+        score = FootballLedgerTool._score_outcome(
+            entry.get("our_score_pred"), field="our_score_pred"
+        )
+        full_score = FootballLedgerTool._score_outcome(
+            entry.get("ft_score_pred"), field="ft_score_pred"
+        )
+        half_score = FootballLedgerTool._score_outcome(
+            entry.get("ht_score_pred"), field="ht_score_pred"
+        )
+        if score and full_score and score[1] != full_score[1]:
+            raise ValueError("ft_score_pred must equal our_score_pred")
+        resolved_full = full_score or score
+        prediction = FootballLedgerTool._prediction_outcome(entry.get("our_pred"))
+        if resolved_full and prediction in {"主胜", "平", "客胜"}:
+            if resolved_full[0] != prediction:
+                raise ValueError("full-time score outcome must equal our_pred 1X2 direction")
+        if half_score and resolved_full:
+            if (
+                half_score[1][0] > resolved_full[1][0]
+                or half_score[1][1] > resolved_full[1][1]
+            ):
+                raise ValueError("full-time goals cannot be below half-time goals")
+        htft = FootballLedgerTool._htft_outcomes(entry.get("ht_ft_pred"))
+        if htft and half_score and htft[0] != half_score[0]:
+            raise ValueError("ht_ft_pred half-time outcome must equal ht_score_pred")
+        if htft and resolved_full and htft[1] != resolved_full[0]:
+            raise ValueError("ht_ft_pred full-time outcome must equal full-time score")
 
     @staticmethod
     def _validate_identity(entry: dict[str, Any]) -> None:
@@ -456,7 +599,7 @@ class FootballLedgerTool:
         for index, row in enumerate(rows, 1):
             values = (
                 index,
-                row.get("competition", ""),
+                canonical_competition_display(row.get("competition", "")),
                 row.get("season", ""),
                 FootballLedgerTool._short_date(row.get("date")),
                 row.get("match", ""),
@@ -511,7 +654,7 @@ class FootballLedgerTool:
 
     @staticmethod
     def _htft_cell(row: dict[str, Any]) -> str:
-        half_full = row.get("ht_ft_pred", "")
+        half_full = FootballLedgerTool._canonical_htft_display(row.get("ht_ft_pred", ""))
         half_score = row.get("ht_score_pred", "")
         full_score = row.get("ft_score_pred", "")
         if half_full:

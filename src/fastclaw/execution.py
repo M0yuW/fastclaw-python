@@ -65,7 +65,9 @@ class SharedExecutionState:
     """Small mutable state shared by one root run and its delegated Agents."""
 
     football_base_evidence: dict[str, str] = field(default_factory=dict)
+    football_negative_evidence: list[str] = field(default_factory=list)
     ev_requested: bool = False
+    sporttery_requested: bool = False
     football_settlement_attempted: bool = False
     football_settlement_review: bool = False
     football_settlement_results: list[str] = field(default_factory=list)
@@ -102,6 +104,12 @@ class SharedExecutionState:
 
     def has_football_base(self) -> bool:
         return bool(self.football_base_evidence)
+
+    def publish_football_negative(self, content: str) -> None:
+        self.football_negative_evidence.append(content)
+
+    def has_football_negative(self) -> bool:
+        return bool(self.football_negative_evidence)
 
     def render_football_base(self) -> str:
         if not self.football_base_evidence:

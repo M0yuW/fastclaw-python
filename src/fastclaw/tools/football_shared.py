@@ -14,9 +14,10 @@ from fastclaw.tools.football_competitions import (
     normalize_competition_name,
 )
 
-# Version 3 adds an explicit prior-season H2H search result to the base bundle.
-# Sessions created under version 2 must refresh instead of reusing an empty H2H.
-FOOTBALL_EVIDENCE_SCHEMA_VERSION = 3
+# Version 4 adds ESPN qualifying stage/leg, current ``lastFiveGames`` form, and
+# supplemental market evidence. Older persisted bundles must refresh instead
+# of reusing the schedule-only qualifying payload.
+FOOTBALL_EVIDENCE_SCHEMA_VERSION = 4
 
 
 def football_evidence_is_current(content: str) -> bool:

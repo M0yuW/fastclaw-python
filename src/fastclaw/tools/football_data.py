@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import UTC, datetime, timedelta
 from datetime import date as CalendarDate
 from pathlib import Path
@@ -184,6 +185,95 @@ class EspnPublicFetcher:
         return ToolResult(content=stdout.decode("utf-8", errors="replace"))
 
 
+class SportteryPublicFetcher:
+    """Fetch the fixed Sporttery calculator endpoint with trusted system curl.
+
+    The provider currently rejects the Runtime's generic HTTPX client with a
+    non-standard HTTP 567 response while accepting curl and the reviewed Go
+    toolkit transport.  Keep this compatibility path limited to the one fixed
+    public endpoint instead of weakening the generic WebFetch policy.
+    """
+
+    _executables: tuple[Path, ...] = (Path("/usr/bin/curl"), Path("/bin/curl"))
+
+    async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
+        del context
+        url = str(arguments.get("url") or "")
+        if url != _SPORTTERY:
+            return ToolResult(
+                content="Sporttery URL is outside the fixed calculator endpoint",
+                is_error=True,
+                metadata={"errorCode": "sporttery_url_rejected"},
+            )
+        executable = next((path for path in self._executables if path.is_file()), None)
+        if executable is None:
+            return ToolResult(
+                content="Sporttery source is not ready",
+                is_error=True,
+                metadata={"errorCode": "sporttery_curl_unavailable", "ready": False},
+            )
+        process = await asyncio.create_subprocess_exec(
+            str(executable),
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "20",
+            "--max-filesize",
+            "2000000",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--max-redirs",
+            "0",
+            "--header",
+            "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X) sporttery-ev/1.0",
+            "--header",
+            "Referer: https://m.sporttery.cn/mjc/jsq/zqspf/",
+            "--header",
+            "Accept: application/json,text/plain,*/*",
+            url,
+            env={"PATH": "/usr/bin:/bin"},
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _stderr = await asyncio.wait_for(process.communicate(), timeout=25)
+        except TimeoutError:
+            if process.returncode is None:
+                process.kill()
+                await asyncio.shield(process.wait())
+            return ToolResult(
+                content="Sporttery source timed out",
+                is_error=True,
+                metadata={"errorCode": "sporttery_timeout"},
+            )
+        except asyncio.CancelledError:
+            if process.returncode is None:
+                process.kill()
+                await asyncio.shield(process.wait())
+            raise
+        except BaseException:
+            if process.returncode is None:
+                process.kill()
+                await asyncio.shield(process.wait())
+            raise
+        if process.returncode != 0:
+            return ToolResult(
+                content="Sporttery request failed",
+                is_error=True,
+                metadata={"errorCode": "sporttery_request_failed"},
+            )
+        if len(stdout) > 2_000_000:
+            return ToolResult(
+                content="Sporttery response exceeded the safety limit",
+                is_error=True,
+                metadata={"errorCode": "sporttery_response_too_large"},
+            )
+        return ToolResult(content=stdout.decode("utf-8", errors="replace"))
+
+
 class FootballDataTool:
     """Resolve competitions and fetch fixtures without a World Cup hard-code."""
 
@@ -192,6 +282,7 @@ class FootballDataTool:
         fetcher: _Fetcher,
         *,
         espn_fetcher: _Fetcher | None = None,
+        sporttery_fetcher: _Fetcher | None = None,
         odds_source: OddsSource | None = None,
         allow_sporttery: bool = False,
         role_mode: str = "full",
@@ -199,10 +290,17 @@ class FootballDataTool:
     ) -> None:
         self._fetcher = fetcher
         self._espn_fetcher = espn_fetcher or EspnPublicFetcher()
+        self._sporttery_fetcher = sporttery_fetcher or fetcher
         self._odds_source = odds_source or TheOddsApiSource.from_environment()
         self._allow_sporttery = allow_sporttery
         self._role_mode = role_mode
         self._cache = cache or get_football_evidence_cache()
+        # One prediction run often asks for several fixtures from the same
+        # competition and date. Share provider outcomes inside that root
+        # execution so parallel tool calls do not burst the same schedule
+        # endpoint and trigger avoidable rate limits.
+        self._source_cache: dict[tuple[str, int, str], SourceResult] = {}
+        self._source_locks: dict[tuple[str, int, str], asyncio.Lock] = {}
         description = (
             "Resolve a football competition and fetch dated fixtures, results, standings, "
             "team form, head-to-head, or an evidence bundle. Provider identifiers and URLs "
@@ -219,8 +317,13 @@ class FootballDataTool:
             )
         elif role_mode == "ev":
             description = (
-                "Fetch official Sporttery prices only when the user explicitly requests EV or "
-                "market analysis for the confirmed fixture."
+                "Fetch official Sporttery prices only inside explicitly requested EV analysis "
+                "for the confirmed fixture."
+            )
+        elif role_mode == "odds":
+            description = (
+                "Fetch official Sporttery prices only when the original user explicitly names "
+                "Sporttery, official SP, 竞彩, or 体彩 for the confirmed fixture."
             )
         actions = [
             "competition_resolve",
@@ -256,7 +359,13 @@ class FootballDataTool:
                             "enum": actions,
                         },
                         "competition": {"type": "string"},
-                        "country": {"type": "string"},
+                        "country": {
+                            "type": "string",
+                            "description": (
+                                "Optional competition country or region; omit for international "
+                                "competitions and never use a participating team's country"
+                            ),
+                        },
                         "event_id": {"type": "string"},
                         "date": {"type": "string"},
                         "season": {"type": "string"},
@@ -322,9 +431,13 @@ class FootballDataTool:
                 "data analyst may request base_evidence or competition results for ledger review"
             )
         if self._role_mode == "ev" and not context.shared_state.ev_requested:
-            return self._error("EV market lookup requires an explicit user request")
+            return self._error("EV market lookup requires an explicit user request for EV")
         if self._role_mode == "ev" and action != "sporttery_match":
             return self._error("EV analyst may only request Sporttery market prices")
+        if self._role_mode == "odds" and not context.shared_state.sporttery_requested:
+            return self._error("Sporttery lookup requires an explicit Sporttery request")
+        if self._role_mode == "odds" and action != "sporttery_match":
+            return self._error("odds analyst may only use football_data for Sporttery prices")
         if action == "competition_resolve":
             return self._competition_resolve(arguments)
         if action == "competition_search":
@@ -347,7 +460,9 @@ class FootballDataTool:
             return await self._h2h(arguments, context)
         if action == "sporttery_match":
             if not self._allow_sporttery:
-                return self._error("sporttery_match is restricted to the EV analyst role")
+                return self._error(
+                    "sporttery_match is restricted to the odds and EV analyst roles"
+                )
             return await self._sporttery_match(arguments, context)
         if action == "base_evidence":
             return await self._evidence(arguments, context, include_odds=False)
@@ -360,7 +475,7 @@ class FootballDataTool:
         if not query:
             return self._error("competition_resolve requires competition")
         country = str(arguments.get("country") or "").strip()
-        competition = resolve_football_competition(query, country=country)
+        competition = self._resolve_tool_competition(query, country=country)
         if competition is None:
             return self._error(
                 "competition is not in the trusted runtime catalog; ask for a supported "
@@ -454,12 +569,28 @@ class FootballDataTool:
         )
 
     @staticmethod
+    def _resolve_tool_competition(
+        query: str, *, country: str = ""
+    ) -> FootballCompetition | None:
+        """Resolve a reviewed competition while treating model country as advisory.
+
+        Agents sometimes supply a participating club's country rather than the
+        competition's region. A unique reviewed name is still authoritative;
+        the country hint is only needed to disambiguate duplicate names.
+        """
+
+        competition = resolve_football_competition(query, country=country)
+        if competition is None and country:
+            competition = resolve_football_competition(query)
+        return competition
+
+    @staticmethod
     def _trusted_competition(
         arguments: dict[str, Any],
     ) -> tuple[FootballCompetition | None, ToolResult | None]:
         query = str(arguments.get("competition") or "").strip()
         country = str(arguments.get("country") or "").strip()
-        competition = resolve_football_competition(query, country=country)
+        competition = FootballDataTool._resolve_tool_competition(query, country=country)
         if competition is None:
             return None, FootballDataTool._error(
                 "football_data requires a competition from the trusted runtime catalog"
@@ -500,6 +631,17 @@ class FootballDataTool:
     def _espn_event_row(event: dict[str, Any]) -> dict[str, Any]:
         competition = (event.get("competitions") or [{}])[0]
         teams = FootballDataTool._espn_competitors(competition)
+        season = event.get("season") or {}
+        notes = competition.get("notes") or []
+        leg = next(
+            (
+                str(note.get("headline") or note.get("text") or "").strip()
+                for note in notes
+                if isinstance(note, dict)
+                and str(note.get("headline") or note.get("text") or "").strip()
+            ),
+            "",
+        )
         return {
             "event_id": event.get("id"),
             "match": event.get("name"),
@@ -507,12 +649,20 @@ class FootballDataTool:
             "status": ((event.get("status") or {}).get("type") or {}).get("description"),
             "venue": (competition.get("venue") or {}).get("fullName"),
             "teams": teams,
+            "stage": season.get("name") or season.get("slug"),
+            "leg": leg or None,
         }
 
     @staticmethod
     def _espn_form(data: dict[str, Any]) -> list[dict[str, Any]]:
         rows = []
-        for item in (data.get("boxscore") or {}).get("form") or []:
+        # ESPN moved pre-match soccer form from ``boxscore.form`` to the
+        # top-level ``lastFiveGames`` collection. Accept both reviewed shapes
+        # so a provider schema transition cannot silently erase team form.
+        form_items = (data.get("boxscore") or {}).get("form") or data.get(
+            "lastFiveGames"
+        ) or []
+        for item in form_items:
             if not isinstance(item, dict):
                 continue
             rows.append(
@@ -536,15 +686,60 @@ class FootballDataTool:
 
     @staticmethod
     def _espn_odds(data: dict[str, Any]) -> list[dict[str, Any]]:
-        return [
-            {
-                "provider": (item.get("provider") or {}).get("name"),
-                "details": item.get("details"),
-                "over_under": item.get("overUnder"),
-            }
-            for item in (data.get("odds") or [])[:5]
-            if isinstance(item, dict)
-        ]
+        header_event = ((data.get("header") or {}).get("competitions") or [{}])[0]
+        teams = FootballDataTool._espn_competitors(header_event)
+
+        def american_to_decimal(value: Any) -> float | None:
+            try:
+                odds = float(value)
+            except (TypeError, ValueError):
+                return None
+            if odds == 0:
+                return None
+            return round(1 + odds / 100, 3) if odds > 0 else round(1 + 100 / abs(odds), 3)
+
+        rows: list[dict[str, Any]] = []
+        for item in (data.get("odds") or data.get("pickcenter") or [])[:5]:
+            if not isinstance(item, dict):
+                continue
+            moneyline = item.get("moneyline") or {}
+            home_american = (item.get("homeTeamOdds") or {}).get("moneyLine")
+            draw_american = (item.get("drawOdds") or {}).get("moneyLine")
+            away_american = (item.get("awayTeamOdds") or {}).get("moneyLine")
+            if home_american is None:
+                home_american = ((moneyline.get("home") or {}).get("close") or {}).get(
+                    "odds"
+                )
+            if draw_american is None:
+                draw_american = ((moneyline.get("draw") or {}).get("close") or {}).get(
+                    "odds"
+                )
+            if away_american is None:
+                away_american = ((moneyline.get("away") or {}).get("close") or {}).get(
+                    "odds"
+                )
+            rows.append(
+                {
+                    "provider": (item.get("provider") or {}).get("name"),
+                    "details": item.get("details"),
+                    "commence_time": header_event.get("date"),
+                    "home_team": (teams.get("home") or {}).get("name"),
+                    "away_team": (teams.get("away") or {}).get("name"),
+                    "american_odds": {
+                        "home": home_american,
+                        "draw": draw_american,
+                        "away": away_american,
+                    },
+                    "decimal_odds": {
+                        "home": american_to_decimal(home_american),
+                        "draw": american_to_decimal(draw_american),
+                        "away": american_to_decimal(away_american),
+                    },
+                    "over_under": item.get("overUnder"),
+                    "source": "espn:summary:odds",
+                }
+            )
+        return rows
 
     @staticmethod
     def _espn_head_to_head(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -574,16 +769,21 @@ class FootballDataTool:
         team_a = str(arguments.get("team_a") or "").strip()
         team_b = str(arguments.get("team_b") or "").strip()
         if not season or not team_a or not team_b:
-            return self._error("evidence requires competition, date, season, team_a, and team_b")
-        try:
-            datetime.strptime(date, "%Y-%m-%d")
-        except ValueError:
-            return self._error("evidence requires date in YYYY-MM-DD format")
+            return self._error("evidence requires competition, season, team_a, and team_b")
+        if date:
+            try:
+                datetime.strptime(date, "%Y-%m-%d")
+            except ValueError:
+                return self._error("evidence date must use YYYY-MM-DD format when provided")
         options_error = self._validate_evidence_options(arguments)
         if options_error is not None:
             return options_error
-        cache_key = football_event_key(competition.name, season, date, team_a, team_b)
-        if not include_odds:
+        cache_key = (
+            football_event_key(competition.name, season, date, team_a, team_b)
+            if date
+            else None
+        )
+        if not include_odds and cache_key is not None:
             cached = await self._cache.get("base", cache_key)
             if cached is None:
                 cached_match = await self._cache.find_fixture(
@@ -606,28 +806,90 @@ class FootballDataTool:
         warnings: list[str] = []
         league_id, league_source = await self._resolve_tsdb_league(competition, context)
         sources.append(league_source)
-        if not league_id:
-            return self._fail_closed(competition, sources, warnings)
-
-        schedule = await self._source_json(
-            f"{_SPORTS_DB}/eventsday.php?{urlencode({'d': date, 'l': league_id})}",
-            context,
-            source="thesportsdb:schedule",
-        )
-        sources.append(schedule)
-        if schedule.status != "success" or not isinstance(schedule.data, dict):
-            return self._fail_closed(competition, sources, warnings)
-        fixture = self._select_primary_fixture(
-            schedule.data, competition, season=season, date=date, team_a=team_a, team_b=team_b
-        )
         season_schedule: SourceResult | None = None
-        if fixture is None:
-            sources[-1] = SourceResult(
-                "thesportsdb:schedule",
-                "rejected",
-                error_code="primary_fixture_not_on_requested_date",
-                safe_reason="The day endpoint did not contain the requested fixture",
+        fixture: dict[str, Any] | None = None
+        if not league_id:
+            if competition.espn_qualifying_slug:
+                fallback_fixture, fallback_source, fallback_match = (
+                    await self._espn_qualifying_fixture(
+                        competition,
+                        season=season,
+                        date=date,
+                        team_a=team_a,
+                        team_b=team_b,
+                        context=context,
+                    )
+                )
+                fallback_label = "espn_qualifying"
+            else:
+                fallback_fixture, fallback_source, fallback_match = (
+                    await self._espn_primary_fixture(
+                        competition,
+                        season=season,
+                        date=date,
+                        team_a=team_a,
+                        team_b=team_b,
+                        context=context,
+                    )
+                )
+                fallback_label = "espn_primary"
+            sources.append(fallback_source)
+            if fallback_fixture is None:
+                if fallback_match == "no_match":
+                    result = self._fixture_no_match(
+                        competition,
+                        season=season,
+                        date=date,
+                        team_a=team_a,
+                        team_b=team_b,
+                        sources=sources,
+                        warnings=warnings,
+                    )
+                    context.shared_state.publish_football_negative(result.content)
+                    return result
+                return self._fail_closed(competition, sources, warnings)
+            fixture = fallback_fixture
+            if not date:
+                date = str(fixture.get("date") or "")
+                warnings.append(f"requested_date_discovered_from_{fallback_label}")
+            elif fixture.get("date_alignment") != "exact":
+                warnings.append("source_date_adjacent_to_requested_date")
+            warnings.extend(
+                (
+                    f"primary_fixture_confirmed_by_{fallback_label}",
+                    "thesportsdb_competition_unavailable",
+                )
             )
+
+        if fixture is None and date:
+            schedule = await self._source_json(
+                f"{_SPORTS_DB}/eventsday.php?{urlencode({'d': date, 'l': league_id})}",
+                context,
+                source="thesportsdb:schedule",
+            )
+            sources.append(schedule)
+            if (
+                schedule.status != "success"
+                or not isinstance(schedule.data, dict)
+            ) and not competition.espn_qualifying_slug:
+                return self._fail_closed(competition, sources, warnings)
+            if schedule.status == "success" and isinstance(schedule.data, dict):
+                fixture = self._select_primary_fixture(
+                    schedule.data,
+                    competition,
+                    season=season,
+                    date=date,
+                    team_a=team_a,
+                    team_b=team_b,
+                )
+            if fixture is None:
+                sources[-1] = SourceResult(
+                    "thesportsdb:schedule",
+                    "rejected",
+                    error_code="primary_fixture_not_on_requested_date",
+                    safe_reason="The day endpoint did not contain the requested fixture",
+                )
+        if fixture is None and league_id:
             season_schedule = await self._source_json(
                 f"{_SPORTS_DB}/eventsseason.php?{urlencode({'id': league_id, 's': season})}",
                 context,
@@ -642,16 +904,77 @@ class FootballDataTool:
                     date=date,
                     team_a=team_a,
                     team_b=team_b,
-                    allow_adjacent_date=True,
+                    allow_adjacent_date=bool(date),
                 )
-                if fixture is not None and fixture.get("date_alignment") != "exact":
-                    warnings.append("source_date_adjacent_to_requested_date")
+                if fixture is not None:
+                    if not date:
+                        date = str(fixture.get("date") or "")
+                        warnings.append("requested_date_discovered_from_season_schedule")
+                    elif fixture.get("date_alignment") != "exact":
+                        warnings.append("source_date_adjacent_to_requested_date")
+            if fixture is None and competition.espn_qualifying_slug:
+                qualifier_fixture, qualifier_source, qualifier_match = (
+                    await self._espn_qualifying_fixture(
+                        competition,
+                        season=season,
+                        date=date,
+                        team_a=team_a,
+                        team_b=team_b,
+                        context=context,
+                    )
+                )
+                sources.append(qualifier_source)
+                if qualifier_fixture is not None:
+                    fixture = qualifier_fixture
+                    if not date:
+                        date = str(fixture.get("date") or "")
+                        warnings.append("requested_date_discovered_from_espn_qualifying")
+                    elif fixture.get("date_alignment") != "exact":
+                        warnings.append("source_date_adjacent_to_requested_date")
+                    warnings.append("primary_fixture_confirmed_by_espn_qualifying")
+                elif qualifier_match == "ambiguous":
+                    return self._fail_closed(competition, sources, warnings)
+                elif qualifier_match == "unavailable":
+                    return self._fail_closed(competition, sources, warnings)
             if fixture is None:
+                if season_schedule.status == "success" and isinstance(
+                    season_schedule.data, dict
+                ):
+                    result = self._fixture_no_match(
+                        competition,
+                        season=season,
+                        date=date,
+                        team_a=team_a,
+                        team_b=team_b,
+                        sources=sources,
+                        warnings=warnings,
+                    )
+                    context.shared_state.publish_football_negative(result.content)
+                    return result
                 return self._fail_closed(competition, sources, warnings)
+        cache_key = football_event_key(competition.name, season, date, team_a, team_b)
 
-        if season_schedule is not None and season_schedule.status == "success":
+        if not league_id:
+            results_source = SourceResult(
+                "thesportsdb:results",
+                "unavailable",
+                error_code=league_source.error_code or "thesportsdb_competition_unavailable",
+                safe_reason="Competition results are unavailable because league resolution failed",
+            )
+            standings_source = SourceResult(
+                "thesportsdb:standings",
+                "unavailable",
+                error_code=league_source.error_code or "thesportsdb_competition_unavailable",
+                safe_reason="Standings are unavailable because league resolution failed",
+            )
+        elif season_schedule is not None and season_schedule.status == "success":
             results_source = SourceResult(
                 "thesportsdb:results", "success", data=season_schedule.data
+            )
+            standings_source = await self._source_json(
+                f"{_SPORTS_DB}/lookuptable.php?{urlencode({'l': league_id, 's': season})}",
+                context,
+                source="thesportsdb:standings",
             )
         else:
             results_source = await self._source_json(
@@ -659,24 +982,29 @@ class FootballDataTool:
                 context,
                 source="thesportsdb:results",
             )
-        standings_source = await self._source_json(
-            f"{_SPORTS_DB}/lookuptable.php?{urlencode({'l': league_id, 's': season})}",
-            context,
-            source="thesportsdb:standings",
-        )
+            standings_source = await self._source_json(
+                f"{_SPORTS_DB}/lookuptable.php?{urlencode({'l': league_id, 's': season})}",
+                context,
+                source="thesportsdb:standings",
+            )
         sources.extend((results_source, standings_source))
         results = self._provider_rows(results_source, "events", self._event_row)
         standings = self._provider_rows(standings_source, "table", self._standing_row)
         self._warn_if_degraded(results_source, warnings)
         self._warn_if_degraded(standings_source, warnings)
 
+        # A user may supply the local Sporttery calendar date while ESPN stores
+        # the same kickoff under the previous UTC date. Once the fixture is
+        # confirmed, use its provider date for supplemental schedule/summary
+        # validation instead of reusing the adjacent requested date.
+        fixture_date = str(fixture.get("date") or date)
         espn, details, form, head_to_head = await self._espn_evidence(
-            competition, fixture, date=date, context=context
+            competition, fixture, date=fixture_date, context=context
         )
         sources.append(espn)
         self._warn_if_degraded(espn, warnings)
         previous_match_details: list[dict[str, Any]] = []
-        if not form or not head_to_head:
+        if league_id and (not form or not head_to_head):
             fallback_sources, fallback_form, fallback_h2h, previous_match_details = (
                 await self._thesportsdb_historical_fallback(
                     team_a,
@@ -693,17 +1021,46 @@ class FootballDataTool:
                 head_to_head = fallback_h2h
                 warnings.append("h2h_thesportsdb_fallback")
 
-        historical_sources, historical_context = await self._historical_context(
-            competition,
-            league_id,
-            season=season,
-            team_a=team_a,
-            team_b=team_b,
-            fixture=fixture,
-            form=form,
-            head_to_head=head_to_head,
-            context=context,
-        )
+        if league_id:
+            historical_sources, historical_context = await self._historical_context(
+                competition,
+                league_id,
+                season=season,
+                team_a=team_a,
+                team_b=team_b,
+                fixture=fixture,
+                form=form,
+                head_to_head=head_to_head,
+                context=context,
+            )
+        else:
+            historical_sources = [
+                SourceResult(
+                    "thesportsdb:historical_context",
+                    "unavailable",
+                    error_code=league_source.error_code
+                    or "thesportsdb_competition_unavailable",
+                    safe_reason=(
+                        "Historical context is unavailable because league resolution failed"
+                    ),
+                )
+            ]
+            historical_context = {
+                "status": "unavailable",
+                "current_season": season,
+                "prior_season": _previous_season(season),
+                "fixture": {
+                    "competition": competition.name,
+                    "home": str(fixture.get("home") or team_a),
+                    "away": str(fixture.get("away") or team_b),
+                },
+                "head_to_head": head_to_head,
+                "teams": [],
+                "coverage": "TheSportsDB competition identity was unavailable",
+                "interpretation_rules": [
+                    "unavailable historical data must not be converted into a directional claim"
+                ],
+            }
         sources.extend(historical_sources)
         if any(source.status != "success" for source in historical_sources):
             warnings.append("historical_context_degraded")
@@ -1269,9 +1626,9 @@ class FootballDataTool:
         team_b: str,
         allow_adjacent_date: bool = False,
     ) -> dict[str, Any] | None:
-        requested_date = CalendarDate.fromisoformat(date)
-        allowed_dates = {requested_date}
-        if allow_adjacent_date:
+        requested_date = CalendarDate.fromisoformat(date) if date else None
+        allowed_dates = {requested_date} if requested_date is not None else set()
+        if allow_adjacent_date and requested_date is not None:
             allowed_dates.update(
                 (requested_date - timedelta(days=1), requested_date + timedelta(days=1))
             )
@@ -1303,7 +1660,7 @@ class FootballDataTool:
                     right_provider="thesportsdb",
                     right_provider_id=away_id,
                 )
-                or actual_date not in allowed_dates
+                or (allowed_dates and actual_date not in allowed_dates)
             ):
                 continue
             if actual_season and actual_season != normalized_season:
@@ -1313,12 +1670,297 @@ class FootballDataTool:
             if not str(row.get("idEvent") or "").isdigit():
                 continue
             fixture = cls._event_row(row)
-            fixture["requested_date"] = date
+            fixture["requested_date"] = date or actual_date.isoformat()
             fixture["date_alignment"] = (
-                "exact" if actual_date == requested_date else "adjacent_source_date"
+                "discovered_from_season_schedule"
+                if requested_date is None
+                else "exact"
+                if actual_date == requested_date
+                else "adjacent_source_date"
             )
             rows.append(fixture)
         return rows[0] if len(rows) == 1 else None
+
+    async def _espn_qualifying_fixture(
+        self,
+        competition: FootballCompetition,
+        *,
+        season: str,
+        date: str,
+        team_a: str,
+        team_b: str,
+        context: ExecutionContext,
+    ) -> tuple[dict[str, Any] | None, SourceResult, str]:
+        """Find a fixture in a reviewed, competition-specific qualifying feed."""
+
+        slug = competition.espn_qualifying_slug
+        if not slug:
+            return (
+                None,
+                SourceResult("espn:qualifying_schedule", "unavailable"),
+                "unavailable",
+            )
+        if date:
+            requested = CalendarDate.fromisoformat(date)
+            start = requested - timedelta(days=1)
+            end = requested + timedelta(days=1)
+        else:
+            try:
+                start_year = int(normalize_football_season(season)[:4])
+            except ValueError:
+                return (
+                    None,
+                    SourceResult(
+                        "espn:qualifying_schedule",
+                        "rejected",
+                        error_code="qualifying_season_invalid",
+                    ),
+                    "unavailable",
+                )
+            start = CalendarDate(start_year, 6, 1)
+            end = CalendarDate(start_year, 9, 15)
+        date_scope = f"{start:%Y%m%d}-{end:%Y%m%d}"
+        schedule = await self._source_json(
+            f"{_ESPN_SOCCER}/{slug}/scoreboard?"
+            + urlencode({"dates": date_scope, "limit": 100}),
+            context,
+            source="espn:qualifying_schedule",
+            fetcher=self._espn_fetcher,
+        )
+        if schedule.status != "success" or not isinstance(schedule.data, dict):
+            return None, schedule, "unavailable"
+        if self._espn_league_slug(schedule.data) != slug:
+            return (
+                None,
+                SourceResult(
+                    "espn:qualifying_schedule",
+                    "rejected",
+                    error_code="espn_qualifying_league_mismatch",
+                    safe_reason="ESPN qualifying data did not match the reviewed mapping",
+                ),
+                "unavailable",
+            )
+
+        candidates = self._select_espn_qualifying_fixtures(
+            schedule.data,
+            competition,
+            season=season,
+            date=date,
+            team_a=team_a,
+            team_b=team_b,
+            espn_slug=slug,
+        )
+        if len(candidates) == 1:
+            return (
+                candidates[0],
+                SourceResult("espn:qualifying_schedule", "success"),
+                "confirmed",
+            )
+        if not candidates:
+            return (
+                None,
+                SourceResult(
+                    "espn:qualifying_schedule",
+                    "no_match",
+                    error_code="qualifying_fixture_not_found",
+                    safe_reason=(
+                        "The reviewed qualifying feed did not contain the requested fixture"
+                    ),
+                ),
+                "no_match",
+            )
+        return (
+            None,
+            SourceResult(
+                "espn:qualifying_schedule",
+                "rejected",
+                error_code="qualifying_fixture_ambiguous",
+                safe_reason="The reviewed qualifying feed returned multiple matching fixtures",
+            ),
+            "ambiguous",
+        )
+
+    async def _espn_primary_fixture(
+        self,
+        competition: FootballCompetition,
+        *,
+        season: str,
+        date: str,
+        team_a: str,
+        team_b: str,
+        context: ExecutionContext,
+    ) -> tuple[dict[str, Any] | None, SourceResult, str]:
+        """Confirm a domestic or main-stage fixture from its reviewed ESPN feed.
+
+        TheSportsDB may temporarily omit a reviewed league from its country
+        catalog. That provider failure must not suppress a fixture that ESPN
+        confirms under the Runtime-owned competition slug.
+        """
+
+        if not date:
+            return (
+                None,
+                SourceResult(
+                    "espn:primary_schedule",
+                    "unavailable",
+                    error_code="espn_primary_date_required",
+                    safe_reason="A date is required for the bounded ESPN fixture fallback",
+                ),
+                "unavailable",
+            )
+        requested = CalendarDate.fromisoformat(date)
+        date_scope = (
+            f"{requested - timedelta(days=1):%Y%m%d}-"
+            f"{requested + timedelta(days=1):%Y%m%d}"
+        )
+        slug = competition.espn_slug
+        schedule = await self._source_json(
+            f"{_ESPN_SOCCER}/{slug}/scoreboard?"
+            + urlencode({"dates": date_scope, "limit": 100}),
+            context,
+            source="espn:primary_schedule",
+            fetcher=self._espn_fetcher,
+        )
+        if schedule.status != "success" or not isinstance(schedule.data, dict):
+            return None, schedule, "unavailable"
+        if self._espn_league_slug(schedule.data) != slug:
+            return (
+                None,
+                SourceResult(
+                    "espn:primary_schedule",
+                    "rejected",
+                    error_code="espn_primary_league_mismatch",
+                    safe_reason="ESPN data did not match the reviewed competition mapping",
+                ),
+                "unavailable",
+            )
+        candidates = self._select_espn_qualifying_fixtures(
+            schedule.data,
+            competition,
+            season=season,
+            date=date,
+            team_a=team_a,
+            team_b=team_b,
+            espn_slug=slug,
+        )
+        if len(candidates) == 1:
+            return candidates[0], SourceResult("espn:primary_schedule", "success"), "confirmed"
+        if not candidates:
+            return (
+                None,
+                SourceResult(
+                    "espn:primary_schedule",
+                    "no_match",
+                    error_code="espn_primary_fixture_not_found",
+                    safe_reason="The reviewed ESPN feed did not contain the requested fixture",
+                ),
+                "no_match",
+            )
+        return (
+            None,
+            SourceResult(
+                "espn:primary_schedule",
+                "rejected",
+                error_code="espn_primary_fixture_ambiguous",
+                safe_reason="The reviewed ESPN feed returned multiple matching fixtures",
+            ),
+            "ambiguous",
+        )
+
+    @classmethod
+    def _select_espn_qualifying_fixtures(
+        cls,
+        data: dict[str, Any],
+        competition: FootballCompetition,
+        *,
+        season: str,
+        date: str,
+        team_a: str,
+        team_b: str,
+        espn_slug: str,
+    ) -> list[dict[str, Any]]:
+        requested_date = CalendarDate.fromisoformat(date) if date else None
+        allowed_dates = set()
+        if requested_date is not None:
+            allowed_dates = {
+                requested_date - timedelta(days=1),
+                requested_date,
+                requested_date + timedelta(days=1),
+            }
+        rows: list[dict[str, Any]] = []
+        for raw in data.get("events") or []:
+            if not isinstance(raw, dict):
+                continue
+            row = cls._espn_event_row(raw)
+            teams = row.get("teams") or {}
+            home = teams.get("home") or {}
+            away = teams.get("away") or {}
+            event_id = str(row.get("event_id") or "")
+            try:
+                actual_datetime = datetime.fromisoformat(
+                    str(row.get("date_utc") or "").replace("Z", "+00:00")
+                )
+            except ValueError:
+                continue
+            actual_date = actual_datetime.date()
+            if (
+                not event_id.isdigit()
+                or (allowed_dates and actual_date not in allowed_dates)
+                or not football_teams_match(
+                    team_a,
+                    str(home.get("name") or ""),
+                    right_provider="espn",
+                    right_provider_id=home.get("id"),
+                )
+                or not football_teams_match(
+                    team_b,
+                    str(away.get("name") or ""),
+                    right_provider="espn",
+                    right_provider_id=away.get("id"),
+                )
+            ):
+                continue
+            home_name = str(home.get("name") or "")
+            away_name = str(away.get("name") or "")
+            home_identity = resolve_team_identity(
+                home_name, provider="espn", provider_id=str(home.get("id") or "")
+            )
+            away_identity = resolve_team_identity(
+                away_name, provider="espn", provider_id=str(away.get("id") or "")
+            )
+            rows.append(
+                {
+                    "event_id": event_id,
+                    "competition": competition.name,
+                    "season": normalize_football_season(season),
+                    "match": f"{home_name} vs {away_name}",
+                    "home": home_name,
+                    "away": away_name,
+                    "home_team_id": str(home.get("id") or "") or None,
+                    "away_team_id": str(away.get("id") or "") or None,
+                    "home_canonical_id": home_identity.canonical_id,
+                    "away_canonical_id": away_identity.canonical_id,
+                    "home_score": home.get("score"),
+                    "away_score": away.get("score"),
+                    "date": actual_date.isoformat(),
+                    "time_utc": actual_datetime.astimezone(UTC).strftime("%H:%M:%S"),
+                    "round": row.get("stage"),
+                    "stage": row.get("stage"),
+                    "leg": row.get("leg"),
+                    "venue": row.get("venue"),
+                    "status": row.get("status"),
+                    "requested_date": date or actual_date.isoformat(),
+                    "date_alignment": (
+                        "discovered_from_espn_qualifying"
+                        if requested_date is None
+                        else "exact"
+                        if actual_date == requested_date
+                        else "adjacent_source_date"
+                    ),
+                    "espn_slug": espn_slug,
+                }
+            )
+        return rows
 
     async def _espn_evidence(
         self,
@@ -1329,8 +1971,9 @@ class FootballDataTool:
         context: ExecutionContext,
     ) -> tuple[SourceResult, dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
         empty: tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]] = ({}, [], [])
+        espn_slug = str(fixture.get("espn_slug") or competition.espn_slug)
         schedule = await self._source_json(
-            f"{_ESPN_SOCCER}/{competition.espn_slug}/scoreboard?"
+            f"{_ESPN_SOCCER}/{espn_slug}/scoreboard?"
             + urlencode({"dates": date.replace("-", "")}),
             context,
             source="espn",
@@ -1338,7 +1981,7 @@ class FootballDataTool:
         )
         if schedule.status != "success" or not isinstance(schedule.data, dict):
             return schedule, *empty
-        if self._espn_league_slug(schedule.data) != competition.espn_slug:
+        if self._espn_league_slug(schedule.data) != espn_slug:
             return self._espn_rejected("espn_league_mismatch"), *empty
         candidates = []
         wanted_home = str(fixture.get("home") or "")
@@ -1371,7 +2014,7 @@ class FootballDataTool:
         if len(candidates) != 1:
             return self._espn_rejected("espn_fixture_mismatch"), *empty
         summary = await self._source_json(
-            f"{_ESPN_SOCCER}/{competition.espn_slug}/summary?"
+            f"{_ESPN_SOCCER}/{espn_slug}/summary?"
             + urlencode({"event": candidates[0]}),
             context,
             source="espn",
@@ -1379,7 +2022,7 @@ class FootballDataTool:
         )
         if summary.status != "success" or not isinstance(summary.data, dict):
             return summary, *empty
-        if self._espn_league_slug(summary.data) != competition.espn_slug:
+        if self._espn_league_slug(summary.data) != espn_slug:
             return self._espn_rejected("espn_league_mismatch"), *empty
         header = summary.data.get("header") or {}
         events = header.get("competitions") or []
@@ -1404,11 +2047,62 @@ class FootballDataTool:
         ):
             return self._espn_rejected("espn_fixture_mismatch"), *empty
         game_info = summary.data.get("gameInfo") or {}
+        header_season = header.get("season") or {}
+        notes = event.get("notes") or []
+        leg = next(
+            (
+                str(note.get("headline") or note.get("text") or "").strip()
+                for note in notes
+                if isinstance(note, dict)
+                and str(note.get("headline") or note.get("text") or "").strip()
+            ),
+            "",
+        )
+        stage = str(
+            header_season.get("name")
+            or header_season.get("slug")
+            or fixture.get("stage")
+            or ""
+        ).strip()
+        if stage:
+            fixture["stage"] = stage
+            if not fixture.get("round"):
+                fixture["round"] = stage
+        if leg:
+            fixture["leg"] = leg
+        news_payload = summary.data.get("news") or []
+        news_items = (
+            news_payload.get("articles") or []
+            if isinstance(news_payload, dict)
+            else news_payload
+            if isinstance(news_payload, list)
+            else []
+        )
         details = {
             "source_event_id": candidates[0],
             "venue": (game_info.get("venue") or {}).get("fullName"),
             "attendance": game_info.get("attendance"),
             "status": ((event.get("status") or {}).get("type") or {}).get("description"),
+            "stage": stage or None,
+            "leg": leg or fixture.get("leg"),
+            "espn_odds": self._espn_odds(summary.data),
+            "roster_teams": [
+                (roster.get("team") or {}).get("displayName")
+                for roster in (summary.data.get("rosters") or [])
+                if isinstance(roster, dict)
+                and (roster.get("team") or {}).get("displayName")
+            ],
+            "news": [
+                {
+                    "headline": item.get("headline"),
+                    "published": item.get("published"),
+                    "link": (
+                        ((item.get("links") or {}).get("web") or {}).get("href")
+                    ),
+                }
+                for item in news_items[:3]
+                if isinstance(item, dict)
+            ],
         }
         return (
             SourceResult("espn", "success"),
@@ -1421,10 +2115,20 @@ class FootballDataTool:
         self, team_a: str, team_b: str, context: ExecutionContext
     ) -> SourceResult:
         source = await self._source_json(
-            _SPORTTERY, context, source="sporttery:getMatchCalculatorV1"
+            _SPORTTERY,
+            context,
+            source="sporttery:getMatchCalculatorV1",
+            fetcher=self._sporttery_fetcher,
         )
         if source.status != "success" or not isinstance(source.data, dict):
             return source
+        if source.data.get("errorCode") not in (0, "0", None):
+            return SourceResult(
+                "sporttery:getMatchCalculatorV1",
+                "rejected",
+                error_code="sporttery_business_rejected",
+                safe_reason="Sporttery rejected the calculator request",
+            )
         matches = []
         for day in (source.data.get("value") or {}).get("matchInfoList") or []:
             if not isinstance(day, dict):
@@ -1453,7 +2157,7 @@ class FootballDataTool:
         if len(matches) != 1:
             return SourceResult(
                 "sporttery:getMatchCalculatorV1",
-                "empty",
+                "no_match",
                 error_code="sporttery_fixture_not_found",
                 safe_reason="No matching currently offered Sporttery fixture was found",
             )
@@ -1467,8 +2171,43 @@ class FootballDataTool:
         source: str,
         fetcher: _Fetcher | None = None,
     ) -> SourceResult:
+        selected_fetcher = fetcher or self._fetcher
+        cache_key = (context.root_execution_id, id(selected_fetcher), url)
+        cached = self._source_cache.get(cache_key)
+        if cached is not None:
+            return self._relabeled_source(cached, source)
+        lock = self._source_locks.setdefault(cache_key, asyncio.Lock())
+        async with lock:
+            cached = self._source_cache.get(cache_key)
+            if cached is not None:
+                return self._relabeled_source(cached, source)
+            result = await self._fetch_source_json(
+                selected_fetcher,
+                url,
+                context,
+                source=source,
+            )
+            # The underlying Web fetcher already performs bounded retries.
+            # Reuse failures too within this root run so three parallel
+            # fixtures do not turn one provider 429 into three retry storms;
+            # each fixture can immediately proceed to its reviewed fallback.
+            self._source_cache[cache_key] = result
+            while len(self._source_cache) > 256:
+                oldest = next(iter(self._source_cache))
+                self._source_cache.pop(oldest, None)
+                self._source_locks.pop(oldest, None)
+            return result
+
+    async def _fetch_source_json(
+        self,
+        fetcher: _Fetcher,
+        url: str,
+        context: ExecutionContext,
+        *,
+        source: str,
+    ) -> SourceResult:
         try:
-            fetched = await (fetcher or self._fetcher).execute({"url": url}, context)
+            fetched = await fetcher.execute({"url": url}, context)
         except TimeoutError:
             return SourceResult(
                 source,
@@ -1524,6 +2263,18 @@ class FootballDataTool:
                 safe_reason="The source response structure was not recognized",
             )
         return SourceResult(source, "success", payload)
+
+    @staticmethod
+    def _relabeled_source(result: SourceResult, source: str) -> SourceResult:
+        return SourceResult(
+            source=source,
+            status=result.status,
+            data=result.data,
+            as_of=result.as_of,
+            error_code=result.error_code,
+            safe_reason=result.safe_reason,
+            quota=result.quota,
+        )
 
     @staticmethod
     def _provider_rows(
@@ -1630,6 +2381,37 @@ class FootballDataTool:
             metadata={"errorCode": "football_primary_unavailable"},
         )
 
+    @staticmethod
+    def _fixture_no_match(
+        competition: FootballCompetition,
+        *,
+        season: str,
+        date: str,
+        team_a: str,
+        team_b: str,
+        sources: list[SourceResult],
+        warnings: list[str],
+    ) -> ToolResult:
+        payload = {
+            "status": "no_match",
+            "fixture": None,
+            "requested": {
+                "competition": competition.name,
+                "season": season,
+                "date": date or None,
+                "home": team_a,
+                "away": team_b,
+            },
+            "sources": [source.report() for source in sources],
+            "warnings": [*warnings, "requested_fixture_not_confirmed_in_season_schedule"],
+            "completeness": "unavailable",
+            "as_of": utc_now(),
+        }
+        return ToolResult(
+            content=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            metadata={"status": "no_match", "evidenceGate": "fixture_unconfirmed"},
+        )
+
     async def _competition_search(
         self, arguments: dict[str, Any], context: ExecutionContext
     ) -> ToolResult:
@@ -1687,6 +2469,13 @@ class FootballDataTool:
         assert competition is not None
         league_id, source = await self._resolve_tsdb_league(competition, context)
         if not league_id:
+            if action == "results":
+                return await self._espn_results(
+                    competition,
+                    arguments=arguments,
+                    context=context,
+                    primary_source=source,
+                )
             return ToolResult(
                 content=json.dumps(
                     {
@@ -1750,6 +2539,18 @@ class FootballDataTool:
             for row in raw_rows[:limit]
             if isinstance(row, dict)
         ]
+        if action == "results" and not rows:
+            return await self._espn_results(
+                competition,
+                arguments=arguments,
+                context=context,
+                primary_source=SourceResult(
+                    f"thesportsdb:{path.split('?', 1)[0]}",
+                    "no_match",
+                    error_code="results_empty",
+                    safe_reason="The primary results source returned no rows",
+                ),
+            )
         return self._success(
             {
                 "source": f"thesportsdb:{path.split('?', 1)[0]}",
@@ -1759,6 +2560,217 @@ class FootballDataTool:
                 "rows": rows,
             }
         )
+
+    async def _espn_results(
+        self,
+        competition: FootballCompetition,
+        *,
+        arguments: dict[str, Any],
+        context: ExecutionContext,
+        primary_source: SourceResult,
+    ) -> ToolResult:
+        """Fetch dated results from reviewed ESPN feeds after a TSDB miss.
+
+        Qualification feeds are Runtime-owned mappings. Models cannot provide a
+        slug, and a plain competition label checks the main feed before the
+        qualification feed. Explicit qualifying labels reverse that order.
+        """
+
+        date = str(arguments.get("date") or "").strip()
+        season = str(arguments.get("season") or "").strip()
+        if not season:
+            return self._error("results requires season")
+        try:
+            requested_date = CalendarDate.fromisoformat(date)
+        except ValueError:
+            return self._error("results requires date in YYYY-MM-DD format")
+
+        query = str(arguments.get("competition") or "")
+        qualifying_requested = bool(
+            re.search(
+                r"qualif|play.?off|资格赛|附加赛",
+                query,
+                re.IGNORECASE,
+            )
+        )
+        feed_candidates: list[tuple[str, str]] = []
+        if qualifying_requested and competition.espn_qualifying_slug:
+            feed_candidates.append((competition.espn_qualifying_slug, "qualifying"))
+        feed_candidates.append((competition.espn_slug, "primary"))
+        if not qualifying_requested and competition.espn_qualifying_slug:
+            feed_candidates.append((competition.espn_qualifying_slug, "qualifying"))
+
+        unique_feeds: list[tuple[str, str]] = []
+        seen_slugs: set[str] = set()
+        for slug, kind in feed_candidates:
+            if slug and slug not in seen_slugs:
+                seen_slugs.add(slug)
+                unique_feeds.append((slug, kind))
+
+        sources = [primary_source.report()]
+        successful_feed = False
+        for slug, kind in unique_feeds:
+            source_name = f"espn:{kind}_results"
+            schedule = await self._source_json(
+                f"{_ESPN_SOCCER}/{slug}/scoreboard?"
+                + urlencode({"dates": f"{requested_date:%Y%m%d}", "limit": 100}),
+                context,
+                source=source_name,
+                fetcher=self._espn_fetcher,
+            )
+            sources.append(schedule.report())
+            if schedule.status != "success" or not isinstance(schedule.data, dict):
+                continue
+            if self._espn_league_slug(schedule.data) != slug:
+                sources.append(
+                    SourceResult(
+                        source_name,
+                        "rejected",
+                        error_code="espn_results_league_mismatch",
+                        safe_reason=(
+                            "ESPN results did not match the reviewed competition mapping"
+                        ),
+                    ).report()
+                )
+                continue
+            successful_feed = True
+            rows = self._espn_result_rows(
+                schedule.data,
+                competition,
+                season=season,
+                date=date,
+                espn_slug=slug,
+            )
+            if rows:
+                return self._success(
+                    {
+                        "source": source_name,
+                        "action": "results",
+                        "date": date,
+                        "count": len(rows),
+                        "rows": rows,
+                        "sources": sources,
+                        "fallback": "thesportsdb_to_espn",
+                    }
+                )
+            if qualifying_requested and kind == "qualifying":
+                break
+
+        if successful_feed:
+            result = self._success(
+                {
+                    "source": "espn:results",
+                    "action": "results",
+                    "status": "no_match",
+                    "date": date,
+                    "count": 0,
+                    "rows": [],
+                    "sources": sources,
+                    "fallback": "thesportsdb_to_espn",
+                }
+            )
+            return result.model_copy(
+                update={"metadata": {"status": "no_match", "errorCode": "results_no_match"}}
+            )
+
+        return ToolResult(
+            content=json.dumps(
+                {
+                    "error": "competition results unavailable from reviewed sources",
+                    "action": "results",
+                    "date": date,
+                    "sources": sources,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            is_error=True,
+            metadata={"errorCode": "football_results_unavailable"},
+        )
+
+    @classmethod
+    def _espn_result_rows(
+        cls,
+        data: dict[str, Any],
+        competition: FootballCompetition,
+        *,
+        season: str,
+        date: str,
+        espn_slug: str,
+    ) -> list[dict[str, Any]]:
+        requested_date = CalendarDate.fromisoformat(date)
+        rows: list[dict[str, Any]] = []
+        for raw in data.get("events") or []:
+            if not isinstance(raw, dict):
+                continue
+            event = cls._espn_event_row(raw)
+            try:
+                actual_datetime = datetime.fromisoformat(
+                    str(event.get("date_utc") or "").replace("Z", "+00:00")
+                )
+            except ValueError:
+                continue
+            if actual_datetime.date() != requested_date:
+                continue
+            teams = event.get("teams") or {}
+            home = teams.get("home") or {}
+            away = teams.get("away") or {}
+            home_name = str(home.get("name") or "").strip()
+            away_name = str(away.get("name") or "").strip()
+            event_id = str(event.get("event_id") or "")
+            if not event_id.isdigit() or not home_name or not away_name:
+                continue
+            home_identity = resolve_team_identity(
+                home_name,
+                provider="espn",
+                provider_id=str(home.get("id") or ""),
+            )
+            away_identity = resolve_team_identity(
+                away_name,
+                provider="espn",
+                provider_id=str(away.get("id") or ""),
+            )
+            raw_status = str(event.get("status") or "").strip()
+            status = (
+                "FT"
+                if re.search(r"\bft\b|full\s*time|finished|final", raw_status, re.IGNORECASE)
+                else "NS"
+                if re.search(r"scheduled|not\s*started|pre", raw_status, re.IGNORECASE)
+                else raw_status
+            )
+            rows.append(
+                {
+                    "event_id": event_id,
+                    "competition": competition.name,
+                    "season": normalize_football_season(season),
+                    "match": f"{home_name} vs {away_name}",
+                    "home": home_name,
+                    "away": away_name,
+                    "home_team_id": str(home.get("id") or "") or None,
+                    "away_team_id": str(away.get("id") or "") or None,
+                    "home_canonical_id": home_identity.canonical_id,
+                    "away_canonical_id": away_identity.canonical_id,
+                    "home_score": cls._espn_score(home.get("score")),
+                    "away_score": cls._espn_score(away.get("score")),
+                    "date": requested_date.isoformat(),
+                    "time_utc": actual_datetime.astimezone(UTC).strftime("%H:%M:%S"),
+                    "round": event.get("stage"),
+                    "stage": event.get("stage"),
+                    "leg": event.get("leg"),
+                    "venue": event.get("venue"),
+                    "status": status,
+                    "status_detail": raw_status,
+                    "espn_slug": espn_slug,
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _espn_score(value: Any) -> str | None:
+        if isinstance(value, dict):
+            value = value.get("value") or value.get("displayValue")
+        text = str(value).strip() if value is not None else ""
+        return text if re.fullmatch(r"\d+", text) else None
 
     async def _form(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
         team = str(arguments.get("team") or "").strip()
@@ -1830,9 +2842,26 @@ class FootballDataTool:
         team_b = str(arguments.get("team_b") or "").strip()
         if not team_a or not team_b:
             return self._error("sporttery_match requires team_a and team_b")
-        data, error = await self._get_json(_SPORTTERY, context)
+        data, error = await self._get_json(
+            _SPORTTERY, context, fetcher=self._sporttery_fetcher
+        )
         if error is not None:
             return error
+        if data.get("errorCode") not in (0, "0", None):
+            return ToolResult(
+                content=json.dumps(
+                    {
+                        "source": "sporttery:getMatchCalculatorV1",
+                        "status": "rejected",
+                        "error_code": "sporttery_business_rejected",
+                        "safe_reason": "Sporttery rejected the calculator request",
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                is_error=True,
+                metadata={"errorCode": "sporttery_business_rejected"},
+            )
         for day in (data.get("value") or {}).get("matchInfoList") or []:
             for match in day.get("subMatchList") or []:
                 home_names = _provider_team_names(match, "home")
@@ -1845,6 +2874,7 @@ class FootballDataTool:
                 return self._success(
                     {
                         "source": "sporttery:getMatchCalculatorV1",
+                        "status": "success",
                         "match_id": match.get("matchId"),
                         "competition": match.get("leagueAllName") or match.get("leagueAbbName"),
                         "home": match.get("homeTeamAllName"),
@@ -1855,13 +2885,20 @@ class FootballDataTool:
                         "hhad": match.get("hhad"),
                     }
                 )
-        return self._success(
-            {
-                "source": "sporttery:getMatchCalculatorV1",
-                "match": f"{team_a} vs {team_b}",
-                "found": False,
-                "coverage": "not found in the currently offered Sporttery fixture list",
-            }
+        return ToolResult(
+            content=json.dumps(
+                {
+                    "source": "sporttery:getMatchCalculatorV1",
+                    "status": "no_match",
+                    "match": f"{team_a} vs {team_b}",
+                    "found": False,
+                    "coverage": "not found in the currently offered Sporttery fixture list",
+                    "as_of": datetime.now(UTC).isoformat(),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            metadata={"status": "no_match"},
         )
 
     async def _team_id(self, team: str, context: ExecutionContext) -> tuple[str, ToolResult | None]:

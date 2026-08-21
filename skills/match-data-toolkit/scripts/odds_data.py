@@ -121,14 +121,11 @@ def fetch_odds(
             for item in catalog
             if isinstance(item, dict) and item.get("active") is not False
         }
-        sport_key = mapping["odds_sport_key"]
-        if sport_key not in available:
-            return _status(
-                "rejected",
-                error_code="odds_sport_not_in_catalog",
-                safe_reason="The reviewed competition is not in the current sports catalog",
-                quota=catalog_quota,
-            )
+        sport_keys = tuple(mapping.get("odds_sport_keys") or (mapping["odds_sport_key"],))
+        active_keys = [str(sport_key) for sport_key in sport_keys if sport_key in available]
+        # A stable provider route can remain callable while temporarily omitted
+        # from /sports. Probe only reviewed Runtime-owned keys before rejecting.
+        request_keys = active_keys or [str(sport_key) for sport_key in sport_keys]
         params = {
             "regions": ",".join(regions),
             "markets": ",".join(markets),
@@ -138,15 +135,19 @@ def fetch_odds(
             params["commenceTimeFrom"] = commence_from
         if commence_to:
             params["commenceTimeTo"] = commence_to
-        games, quota = _request(f"sports/{sport_key}/odds", params, api_key)
-        if not isinstance(games, list):
-            return _status(
-                "rejected",
-                error_code="odds_unexpected_payload",
-                safe_reason="The odds response was not recognized",
-                quota=quota,
-            )
-        return _status("success" if games else "empty", data=games, quota=quota)
+        rows = []
+        quota = catalog_quota
+        for sport_key in request_keys:
+            games, quota = _request(f"sports/{sport_key}/odds", params, api_key)
+            if not isinstance(games, list):
+                return _status(
+                    "rejected",
+                    error_code="odds_unexpected_payload",
+                    safe_reason="The odds response was not recognized",
+                    quota=quota,
+                )
+            rows.extend(item for item in games if isinstance(item, dict))
+        return _status("success" if rows else "empty", data=rows, quota=quota)
     except (urllib.error.URLError, TimeoutError):
         return _status(
             "unavailable",

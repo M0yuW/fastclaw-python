@@ -34,6 +34,12 @@ def normalize_messages(messages: tuple[ChatMessage, ...]) -> tuple[ChatMessage, 
     for message_index, message in enumerate(messages):
         if message.role is MessageRole.ASSISTANT:
             flush_pending()
+            # A provider can exhaust its output budget while emitting only hidden
+            # reasoning. Older runners persisted that as an empty assistant turn,
+            # which renders as a blank bubble and replays the large hidden payload
+            # on every continuation. With no answer or tool call, it is safe to drop.
+            if not str(message.content or "").strip() and not message.tool_calls:
+                continue
             calls: list[ToolCall] = []
             for call_index, call in enumerate(message.tool_calls):
                 original_id = call.id

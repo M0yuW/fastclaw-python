@@ -49,3 +49,18 @@ def test_go_session_message_fields_are_accepted_without_loss() -> None:
     assert message.timestamp.isoformat() == "2025-08-04T00:00:00+00:00"
     assert message.metadata == {"sandbox": True}
     assert message.origin == "goal_context"
+
+
+def test_normalizer_drops_thinking_only_assistant_turns() -> None:
+    messages = (
+        ChatMessage(role=MessageRole.USER, content="large request"),
+        ChatMessage(role=MessageRole.ASSISTANT, content="", thinking="repeated planning"),
+        ChatMessage(role=MessageRole.USER, content="continue"),
+    )
+
+    normalized = normalize_messages(messages)
+
+    assert [(message.role, message.content) for message in normalized] == [
+        (MessageRole.USER, "large request"),
+        (MessageRole.USER, "continue"),
+    ]

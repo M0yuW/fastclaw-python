@@ -127,8 +127,19 @@ class ToolRegistry:
         started_at = asyncio.get_running_loop().time()
         log_stage(logger, "tool_started", context=context, tool=name)
         try:
-            with anyio.fail_after(timeout_seconds):
-                results = await tool.execute_many(arguments, context)
+            isolated_batch = getattr(tool, "execute_many_isolated", None)
+            if callable(isolated_batch):
+                # Delegations have their own per-child timeout contract. An
+                # outer batch deadline would cancel completed siblings and
+                # replace every result with the same batch timeout.
+                results = await isolated_batch(
+                    arguments,
+                    context,
+                    timeout_seconds=timeout_seconds,
+                )
+            else:
+                with anyio.fail_after(timeout_seconds):
+                    results = await tool.execute_many(arguments, context)
             if len(results) != len(arguments):
                 raise RuntimeError("batch tool returned an unexpected result count")
             if any(result.direct_return for result in results):

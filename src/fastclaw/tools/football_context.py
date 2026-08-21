@@ -124,8 +124,9 @@ class FootballOddsTool:
                 name="football_odds",
                 description=(
                     "Fetch timestamped market odds for the fixture already confirmed in "
-                    "football_context. This is the only football market tool and never calls "
-                    "TheSportsDB or Sporttery."
+                    "football_context. Prefer The Odds API and use already-confirmed ESPN "
+                    "summary market data when that provider has no matching fixture. This "
+                    "tool never calls TheSportsDB or Sporttery."
                 ),
                 parameters={
                     "type": "object",
@@ -239,6 +240,7 @@ class FootballOddsTool:
                 error_code="odds_request_failed",
                 safe_reason="The Odds API request did not complete",
             )
+        primary_source = source
         matched = self._matching_odds(source, fixture, date)
         if source.status == "success" and not matched:
             source = SourceResult(
@@ -247,12 +249,23 @@ class FootballOddsTool:
                 quota=source.quota,
                 safe_reason="No matching odds fixture was returned",
             )
+        details = base_payload.get("details") or {}
+        supplemental = details.get("espn_odds") if isinstance(details, dict) else None
+        if not matched and isinstance(supplemental, list) and supplemental:
+            matched = [item for item in supplemental if isinstance(item, dict)]
+            if matched:
+                source = SourceResult("espn:summary:odds", "success", matched)
         result = ToolResult(
             content=json.dumps(
                 {
                     "fixture": fixture,
                     "odds": matched if source.status == "success" else {"status": source.status},
                     "source": source.report(),
+                    **(
+                        {"primary_source": primary_source.report()}
+                        if source.source != primary_source.source
+                        else {}
+                    ),
                     "base_evidence_key": base_key,
                     "as_of": datetime.now(UTC).isoformat(),
                 },

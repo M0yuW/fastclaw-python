@@ -48,6 +48,7 @@ from fastclaw.tools import (
     ListDirTool,
     ReadFileTool,
     SkillScriptTool,
+    SportteryPublicFetcher,
     ToolRegistry,
     ToolResult,
     WebFetchTool,
@@ -76,15 +77,26 @@ wrapper fields.
 """
 
 _EV_REQUEST_PATTERN = re.compile(
-    r"(?:\bev\b|expected\s+value|sporttery|odds?|bet(?:ting)?|wager|stake|price|"
-    r"赔率|盘口|投注|下注|体彩|期望值|去水|市场价格|敏感性)",
+    r"(?:(?<![A-Za-z0-9_])ev(?![A-Za-z0-9_])|"
+    r"(?<![A-Za-z0-9_])ev\s*analyst(?![A-Za-z0-9_])|expected[-\s]+value|"
+    r"EV专家|期望值|预期价值|价值敏感性|EV敏感性)",
+    re.IGNORECASE,
+)
+
+_SPORTTERY_REQUEST_PATTERN = re.compile(
+    r"(?:sporttery|中国体育彩票|体育彩票|竞彩|体彩|官方SP)",
     re.IGNORECASE,
 )
 
 
 def _explicit_ev_request(message: str) -> bool:
-    """Return whether the current user request explicitly asks for EV/market data."""
+    """Return whether the user explicitly asks for expected-value analysis."""
     return bool(_EV_REQUEST_PATTERN.search(message.strip()))
+
+
+def _explicit_sporttery_request(message: str) -> bool:
+    """Return whether the user explicitly asks for official Sporttery prices."""
+    return bool(_SPORTTERY_REQUEST_PATTERN.search(message.strip()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,7 +180,9 @@ def _default_tools(
     )
     agent_role = str(profile.agent.config.get("teamRole") or "").casefold()
     agent_name = profile.agent.name.casefold()
-    allow_sporttery = agent_role == "ev-analyst" or "ev analyst" in agent_name
+    allow_sporttery = agent_role in {"odds-analyst", "ev-analyst"} or any(
+        label in agent_name for label in ("odds analyst", "ev analyst")
+    )
     tools: list[Any] = [
         ReadFileTool(workspace),
         ListDirTool(workspace),
@@ -177,10 +191,13 @@ def _default_tools(
         FootballContextTool(),
         FootballDataTool(
             web_fetch,
+            sporttery_fetcher=SportteryPublicFetcher(),
             allow_sporttery=allow_sporttery,
             role_mode=(
                 "data"
                 if football_mode == "data"
+                else "odds"
+                if football_mode == "odds"
                 else "ev"
                 if football_mode == "ev"
                 else "full"
@@ -509,7 +526,10 @@ class AgentRuntimeManager:
             session_id=session_id,
             root_execution_id=root_execution_id or f"run_{uuid4().hex}",
             call_path=(agent_id,),
-            shared_state=SharedExecutionState(ev_requested=_explicit_ev_request(message)),
+            shared_state=SharedExecutionState(
+                ev_requested=_explicit_ev_request(message),
+                sporttery_requested=_explicit_sporttery_request(message),
+            ),
         )
         await self._restore_persisted_football_base(context)
         request = self._request(profile, selection.model, message)
@@ -828,7 +848,7 @@ class AgentRuntimeManager:
         target_role = str(profile.agent.config.get("teamRole") or "").casefold()
         if target_role == "ev-analyst" and not context.shared_state.ev_requested:
             return (
-                "EV analysis skipped: the user did not explicitly request odds or "
+                "EV analysis skipped: the user did not explicitly request EV or "
                 "expected-value analysis. No EV provider or market-data request was made."
             )
         selection = await self.provider_selection(profile)
@@ -864,7 +884,20 @@ class AgentRuntimeManager:
                     "prose, or event ID as a new confirmation. For every requested fixture, "
                     "call football_data with action=base_evidence now. Do not report success "
                     "until the tool calls succeed and publish machine-readable shared evidence. "
-                    "Do not call football_odds or Sporttery."
+                    "For multiple fixtures, process each independently, preserve every successful "
+                    "bundle, retry only unavailable fixtures, and report per-fixture status; never "
+                    "turn one unavailable source into a claim that all fixtures are missing. "
+                    "After publication succeeds, complete the second phase in this same "
+                    "delegation: make an independent data-only 1X2 judgment from the published "
+                    "results, standings, form, scoring/conceding record, and labeled historical "
+                    "context. Return perspective=data, lean (home win, draw, away win, or no "
+                    "clear edge), confidence from 0.0 to 1.0, normalized home/draw/away "
+                    "probabilities when supported, and the evidence used. When probabilities "
+                    "are returned, lean must equal their unique maximum unless the top two "
+                    "differ by less than 0.03; only that near-tie may be labeled no clear edge. "
+                    "Fixture confirmation "
+                    "alone is incomplete for a prediction task. Do not call football_odds or "
+                    "Sporttery, and do not use market prices, tactics, or lineup speculation."
                 )
         elif shared_evidence and "## Shared football base evidence" not in task:
             task = (
@@ -1109,7 +1142,9 @@ class AgentRuntimeManager:
                 allowed_tools = frozenset({"football_data", "football_context"})
             elif role_key == "odds-analyst":
                 effective_config["footballDataMode"] = "odds"
-                allowed_tools = frozenset({"football_odds", "football_context"})
+                allowed_tools = frozenset(
+                    {"football_odds", "football_data", "football_context"}
+                )
             elif role_key == "ev-analyst":
                 effective_config["footballDataMode"] = "ev"
                 allowed_tools = frozenset({"football_data", "football_context"})
@@ -1124,13 +1159,31 @@ class AgentRuntimeManager:
                 "that every message requests a prediction. Only for an explicit prediction, "
                 "pre-match analysis, 1X2, totals, odds, EV, or prediction-ledger request, "
                 "delegate the data-analyst first and wait for its base_evidence result. "
+                "Never infer a cup competition from clubs' previous-season division membership "
+                "or from an assumed cross-tier matchup. Promotion and relegation make that "
+                "unsafe. A user reply that confirms only a season does not confirm a proposed "
+                "competition. When the user corrects the competition, discard earlier negative "
+                "evidence for the wrong competition and retry the corrected reviewed route. "
+                "The data delegation has two required phases: publish base_evidence, then return "
+                "an independent data-only 1X2 lean and confidence from that evidence. When "
+                "writing the delegation task, explicitly require both phases; never tell the "
+                "data analyst 'do not predict', 'only establish fixture facts', or otherwise "
+                "stop after confirmation. Treat its directional report as one of five independent "
+                "specialist inputs together with tactics, odds, history, and risk. "
+                "For a partial multi-fixture result, retain every confirmed fixture, retry only "
+                "the unavailable fixture, and delegate later specialists only for confirmed "
+                "fixtures; never describe the whole batch as missing. "
                 "Only after that result succeeds may you delegate tactics, odds, history, "
                 "or risk. Those specialists receive the shared evidence and must not repeat "
-                "the primary football-data lookup. For a normal prediction, odds analysis is "
+                "the primary football-data lookup. If the data delegation returns no_match "
+                "or fixture_unconfirmed, stop the prediction workflow and report that the "
+                "reviewed season schedule did not confirm the requested fixture; do not "
+                "delegate other specialists. For a normal prediction, odds analysis is "
                 "mandatory after base evidence; only an explicit user request to exclude odds "
-                "may record odds_not_requested. EV is optional and must only be delegated "
-                "when the original user explicitly requests odds, market prices, betting, "
-                "Sporttery, EV, expected value, or sensitivity."
+                "may record odds_not_requested. EV is outside the normal prediction flow and "
+                "must only be delegated when the original user explicitly requests EV, "
+                "expected-value analysis, or EV sensitivity. Ordinary requests for odds, "
+                "market prices, betting lines, or Sporttery prices do not activate EV."
             )
             prompt_parts.append(
                 "## Football prediction output contract\n\n"
@@ -1140,17 +1193,33 @@ class AgentRuntimeManager:
                 "After reconciling all specialist reports, the final user-facing answer must "
                 "contain a clearly labeled final prediction-direction section with one row "
                 "for every requested match. Each row must include a valid 1X2 lean (home win, "
-                "draw, away win, or no clear edge), confidence (high, medium, or low), the "
-                "evidence basis, and invalidation conditions. Missing data lowers confidence; "
+                "draw, away win, or no clear edge), confidence (high, medium, or low), one exact "
+                "full-time score prediction, one half-time score prediction, one half-time/full-"
+                "time prediction, the evidence basis, and invalidation conditions. Score and "
+                "half-time/full-time are derived predictions after 1X2 reconciliation; they are "
+                "not additional specialist votes. They must be mutually consistent: the full-time "
+                "score outcome must equal final 1X2, the half-time/full-time pair must equal the "
+                "two score outcomes, and full-time goals for each team cannot be below half-time "
+                "goals. Missing data lowers confidence; "
                 "it does not justify omitting a supported low-confidence lean. Use no clear "
-                "edge only when no valid directional evidence exists, and explain why. Never "
+                "edge only when no valid directional evidence exists, and explain why. Treat "
+                "specialist no-clear-edge reports as abstentions, not votes against another "
+                "specialist's supported direction. If any valid specialist supplies a direction, "
+                "the final explicit prediction must choose home win, draw, or away win; express "
+                "conflict by lowering confidence. When supported directions conflict, sum the "
+                "reported specialist confidence by direction after excluding abstentions, select "
+                "the highest total, and use a successfully matched market direction to break an "
+                "exact tie. A successfully matched no-vig market leader "
+                "of at least 0.55 is valid directional evidence. Never "
                 "confuse markets: 1X2 is exactly home win, draw, or away win; 1X, X2, and 12 "
                 "are double-chance markets and must be labeled separately; Under/Over is a "
                 "totals market. Never relabel a double-chance or totals lean as 1X2. Never "
                 "invent facts, prices, lineups, or predictions from memory. This is analysis, "
                 "not stake advice. Record each supported 1X2 prediction with football_ledger "
                 "after reconciliation; for append, put competition, season, date, match, "
-                "our_pred, and our_confidence inside the entry object. When the user asks to "
+                "our_pred, our_confidence, our_score_pred, ht_score_pred, ft_score_pred, and "
+                "ht_ft_pred inside the entry object. `ft_score_pred` must equal "
+                "`our_score_pred`. When the user asks to "
                 "correct an existing prediction, use football_ledger operation=update with "
                 "the same competition, date, and match key and only the changed fields; do "
                 "not append a second row. Use settle only to fill actual_result or actual_score. "

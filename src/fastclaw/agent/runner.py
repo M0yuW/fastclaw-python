@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+import httpx
+
 from fastclaw.agent.models import AgentEvent, AgentEventType, AgentRunError, AgentRunRequest
 from fastclaw.agent.normalizer import normalize_messages
 from fastclaw.agent.persistence import SessionPersistence
@@ -19,6 +21,7 @@ from fastclaw.observability import log_stage
 from fastclaw.providers import (
     ChatMessage,
     ChatRequest,
+    ChatResponse,
     MessageRole,
     Provider,
     ProviderEventType,
@@ -29,6 +32,15 @@ from fastclaw.storage import SessionRecord
 from fastclaw.tools import ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+_TOKEN_LIMIT_FINISH_REASONS = frozenset({"length", "max_tokens", "max_output_tokens"})
+_EMPTY_RESPONSE_RECOVERY_INSTRUCTION = (
+    "Recovery constraint: the previous generation exhausted its output budget before "
+    "producing a visible answer or executable tool call. Do not restate the request, list "
+    "a plan, rehearse tool arguments, or reason through every item in prose. Immediately "
+    "emit the next required tool call(s), batching calls when supported. If no tool is "
+    "required, return a concise final answer now."
+)
 
 
 class AgentStream(AsyncIterator[AgentEvent]):
@@ -154,60 +166,102 @@ class AgentRunner:
             with use_execution(context):
                 for current_round in range(request.max_rounds):
                     round_index = current_round
-                    current_stage = "provider_stream"
-                    provider_started_at = asyncio.get_running_loop().time()
-                    provider_name = request.model.split("/", 1)[0]
-                    log_stage(
-                        logger,
-                        "provider_started",
-                        context=context,
-                        provider=provider_name,
-                    )
-                    try:
-                        provider_stream = self._provider.stream(
-                            ChatRequest(
-                                messages=tuple(history),
-                                model=request.model,
-                                tools=self._tools.definitions(request.allowed_tools),
-                                max_tokens=request.max_tokens,
-                                temperature=request.temperature,
-                                thinking_budget_tokens=request.thinking_budget_tokens,
-                            )
+                    provider_messages = tuple(history)
+                    recovery_attempted = False
+                    while True:
+                        current_stage = "provider_stream"
+                        provider_started_at = asyncio.get_running_loop().time()
+                        provider_name = request.model.split("/", 1)[0]
+                        log_stage(
+                            logger,
+                            "provider_started",
+                            context=context,
+                            provider=provider_name,
                         )
-                        async for provider_event in provider_stream:
-                            if provider_event.type is ProviderEventType.CONTENT_DELTA:
-                                yield event(
-                                    AgentEventType.CONTENT_DELTA,
-                                    content=provider_event.content,
+                        try:
+                            provider_stream = self._provider.stream(
+                                ChatRequest(
+                                    messages=provider_messages,
+                                    model=request.model,
+                                    tools=self._tools.definitions(request.allowed_tools),
+                                    max_tokens=request.max_tokens,
+                                    temperature=request.temperature,
+                                    thinking_budget_tokens=request.thinking_budget_tokens,
                                 )
-                        response = provider_stream.result()
-                    except BaseException as exc:
+                            )
+                            async for provider_event in provider_stream:
+                                if provider_event.type is ProviderEventType.CONTENT_DELTA:
+                                    yield event(
+                                        AgentEventType.CONTENT_DELTA,
+                                        content=provider_event.content,
+                                    )
+                            response = provider_stream.result()
+                        except BaseException as exc:
+                            log_stage(
+                                logger,
+                                "provider_finished",
+                                context=context,
+                                provider=provider_name,
+                                outcome=(
+                                    "cancelled"
+                                    if isinstance(exc, asyncio.CancelledError)
+                                    else "failed"
+                                ),
+                                duration_ms=int(
+                                    (asyncio.get_running_loop().time() - provider_started_at)
+                                    * 1000
+                                ),
+                                level=logging.WARNING,
+                            )
+                            raise
                         log_stage(
                             logger,
                             "provider_finished",
                             context=context,
                             provider=provider_name,
-                            outcome=(
-                                "cancelled" if isinstance(exc, asyncio.CancelledError) else "failed"
-                            ),
+                            outcome="completed",
                             duration_ms=int(
                                 (asyncio.get_running_loop().time() - provider_started_at) * 1000
                             ),
-                            level=logging.WARNING,
                         )
-                        raise
-                    log_stage(
-                        logger,
-                        "provider_finished",
-                        context=context,
-                        provider=provider_name,
-                        outcome="completed",
-                        duration_ms=int(
-                            (asyncio.get_running_loop().time() - provider_started_at) * 1000
-                        ),
-                    )
-                    provider_stream = None
+                        provider_stream = None
+                        if not recovery_attempted and self._should_retry_empty_response(response):
+                            recovery_attempted = True
+                            provider_messages = self._recovery_messages(history)
+                            logger.warning(
+                                "retrying empty provider response "
+                                "(root=%s agent=%s round=%d finish_reason=%s)",
+                                context.root_execution_id,
+                                context.agent_id,
+                                round_index,
+                                response.finish_reason or "missing",
+                            )
+                            continue
+                        break
+
                     current_stage = "provider_response"
+                    if self._is_incomplete_response(response):
+                        final = ChatMessage(
+                            role=MessageRole.ASSISTANT,
+                            content=self._incomplete_response_message(response),
+                            metadata={
+                                "providerFailure": "output_incomplete",
+                                "finishReason": response.finish_reason or "missing",
+                                "recoveryAttempted": recovery_attempted,
+                            },
+                        )
+                        history.append(final)
+                        await self._persistence.save(
+                            self._session_record(request, context, history, stored)
+                        )
+                        yield event(
+                            AgentEventType.CONTENT,
+                            content=final.content,
+                            message=final,
+                        )
+                        yield event(AgentEventType.DONE, message=final)
+                        return
+
                     assistant = ChatMessage(
                         role=MessageRole.ASSISTANT,
                         content=response.content,
@@ -434,6 +488,24 @@ class AgentRunner:
         except AgentRunError as exc:
             yield event(AgentEventType.ERROR, error=str(exc), is_error=True)
             yield event(AgentEventType.DONE, is_error=True)
+        except httpx.TimeoutException:
+            logger.warning(
+                "provider request timed out (root=%s agent=%s stage=%s round=%d duration_ms=%d)",
+                context.root_execution_id,
+                context.agent_id,
+                current_stage,
+                round_index,
+                int((asyncio.get_running_loop().time() - started_at) * 1000),
+            )
+            yield event(
+                AgentEventType.ERROR,
+                error=(
+                    "模型服务读取超时，本轮未能完成。系统没有把不完整的模型回复保存为"  # noqa: RUF001
+                    "成功结果；若本轮此前已经出现工具执行结果，请先检查账本状态再重试。"  # noqa: RUF001
+                ),
+                is_error=True,
+            )
+            yield event(AgentEventType.DONE, is_error=True)
         except Exception as exc:
             yield event(
                 AgentEventType.ERROR,
@@ -444,6 +516,49 @@ class AgentRunner:
         finally:
             if provider_stream is not None:
                 await provider_stream.aclose()
+
+    @staticmethod
+    def _is_token_limited(response: ChatResponse) -> bool:
+        return (response.finish_reason or "").casefold() in _TOKEN_LIMIT_FINISH_REASONS
+
+    @classmethod
+    def _should_retry_empty_response(cls, response: ChatResponse) -> bool:
+        if str(response.content or "").strip():
+            return False
+        return not response.tool_calls or cls._is_token_limited(response)
+
+    @classmethod
+    def _is_incomplete_response(cls, response: ChatResponse) -> bool:
+        return cls._is_token_limited(response) or (
+            not str(response.content or "").strip() and not response.tool_calls
+        )
+
+    @staticmethod
+    def _recovery_messages(history: list[ChatMessage]) -> tuple[ChatMessage, ...]:
+        recovered = list(history)
+        for index in range(len(recovered) - 1, -1, -1):
+            message = recovered[index]
+            if message.role is not MessageRole.USER:
+                continue
+            original = str(message.content or "").rstrip()
+            recovered[index] = message.model_copy(
+                update={
+                    "content": f"{original}\n\n{_EMPTY_RESPONSE_RECOVERY_INSTRUCTION}"
+                }
+            )
+            break
+        return tuple(recovered)
+
+    @classmethod
+    def _incomplete_response_message(cls, response: ChatResponse) -> str:
+        if cls._is_token_limited(response):
+            reason = "模型输出达到长度上限"
+        else:
+            reason = "模型未生成可见答复或可执行工具调用"
+        return (
+            f"本轮未完成：{reason}。系统已自动进行一次精简重试，但仍未完成；"  # noqa: RUF001
+            "本轮没有可确认的工具执行结果，请将大批量任务拆分后重试。"  # noqa: RUF001
+        )
 
     @staticmethod
     def _failed_tool_message(

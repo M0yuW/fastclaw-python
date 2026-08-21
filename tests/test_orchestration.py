@@ -24,6 +24,7 @@ from fastclaw.orchestration import (
 )
 from fastclaw.tools import ToolResult
 from fastclaw.tools.football_shared import FootballEvidenceCache, football_event_key
+from fastclaw.tools.registry import ToolRegistry
 
 
 def context(
@@ -134,6 +135,47 @@ async def test_data_delegation_requires_published_base_evidence() -> None:
 
 
 @pytest.mark.asyncio
+async def test_data_delegation_returns_trusted_unconfirmed_fixture_evidence() -> None:
+    bus = InProcessMessageBus()
+
+    async def data_handler(task: str, child: ExecutionContext) -> str:
+        del task
+        child.shared_state.publish_football_negative(
+            json.dumps(
+                {
+                    "status": "no_match",
+                    "fixture": None,
+                    "requested": {
+                        "competition": "UEFA Champions League",
+                        "season": "2026-2027",
+                        "date": None,
+                        "home": "Levski Sofia",
+                        "away": "AEK Athens",
+                    },
+                }
+            )
+        )
+        return "The reviewed season schedule did not contain this fixture."
+
+    bus.register(user_id="user-1", agent_id="data", handler=data_handler)
+    tool = SpawnSubagentTool(bus, data_agent_id="data", cache=FootballEvidenceCache())
+    try:
+        result = await tool.execute(
+            {"agent_id": "data", "task": "confirm the fixture"},
+            context(),
+        )
+
+        payload = json.loads(result.content)
+        assert not result.is_error
+        assert result.metadata["status"] == "fixture_unconfirmed"
+        assert payload["status"] == "no_match"
+        assert payload["evidence"][0]["requested"]["home"] == "Levski Sofia"
+        assert "Stop prediction analysis" in payload["instruction"]
+    finally:
+        await bus.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_settlement_data_delegation_bypasses_upcoming_fixture_gate() -> None:
     bus = InProcessMessageBus()
 
@@ -204,6 +246,57 @@ async def test_settlement_delegation_preserves_verified_results_when_child_repor
 
 
 @pytest.mark.asyncio
+async def test_settlement_batch_returns_only_each_delegation_result_delta() -> None:
+    bus = InProcessMessageBus()
+
+    async def data_handler(task: str, child: ExecutionContext) -> str:
+        match = "Alpha vs Beta" if "Alpha" in task else "Gamma vs Delta"
+        home, away = match.split(" vs ")
+        child.shared_state.football_settlement_results.append(
+            json.dumps(
+                {
+                    "source": "fixture:results",
+                    "rows": [
+                        {
+                            "event_id": match,
+                            "competition": "Fixture League",
+                            "season": "2026",
+                            "date": "2026-08-20",
+                            "match": match,
+                            "home": home,
+                            "away": away,
+                            "status": "FT",
+                            "home_score": "1",
+                            "away_score": "0",
+                        }
+                    ],
+                }
+            )
+        )
+        return f"verified {match}"
+
+    bus.register(user_id="user-1", agent_id="data", handler=data_handler)
+    tool = SpawnSubagentTool(bus, data_agent_id="data", cache=FootballEvidenceCache())
+    try:
+        results = await tool.execute_many(
+            (
+                {"agent_id": "data", "task": "复盘账本赛果 Alpha vs Beta"},
+                {"agent_id": "data", "task": "复盘账本赛果 Gamma vs Delta"},
+            ),
+            context(),
+        )
+
+        first = json.loads(results[0].content)
+        second = json.loads(results[1].content)
+        assert [row["match"] for row in first["verified_matches"]] == ["Alpha vs Beta"]
+        assert [row["match"] for row in second["verified_matches"]] == ["Gamma vs Delta"]
+        assert results[0].metadata["verifiedResultGroups"] == 1
+        assert results[1].metadata["verifiedResultGroups"] == 1
+    finally:
+        await bus.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_continued_session_rehydrates_base_before_specialist_gate() -> None:
     bus = InProcessMessageBus()
     cache = FootballEvidenceCache()
@@ -225,7 +318,7 @@ async def test_continued_session_rehydrates_base_before_specialist_gate() -> Non
         ),
         ToolResult(
             content=(
-                '{"evidence_schema_version":3,"fixture":'
+                    '{"evidence_schema_version":4,"fixture":'
                 '{"competition":"Spanish La Liga"},"historical_context":{}}'
             ),
         ),
@@ -308,6 +401,38 @@ async def test_spawn_subagent_batch_runs_different_targets_in_parallel_and_keeps
         release.set()
         if not pending.done():
             pending.cancel()
+        await bus.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_spawn_subagent_batch_timeout_isolated_per_child() -> None:
+    bus = InProcessMessageBus(AsyncTaskQueue(max_concurrent=2))
+
+    async def handler(task: str, child: ExecutionContext) -> str:
+        del child
+        if task == "slow":
+            await asyncio.sleep(1)
+        return task.upper()
+
+    bus.register(user_id="user-1", agent_id="fast", handler=handler)
+    bus.register(user_id="user-1", agent_id="slow", handler=handler)
+    registry = ToolRegistry((SpawnSubagentTool(bus),))
+    try:
+        results = await registry.execute_batch(
+            "spawn_subagent",
+            (
+                {"agent_id": "fast", "task": "fast"},
+                {"agent_id": "slow", "task": "slow"},
+            ),
+            context(),
+            timeout_seconds=0.05,
+        )
+
+        assert results[0].content == "FAST"
+        assert not results[0].is_error
+        assert results[1].is_error
+        assert results[1].metadata["errorCode"] == DelegationErrorCode.TIMEOUT
+    finally:
         await bus.shutdown()
 
 
