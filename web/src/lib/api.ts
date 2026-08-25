@@ -560,6 +560,21 @@ export interface ChatHistoryMessage {
   imageUrls?: string[];
 }
 
+export interface ChatContextStatus {
+  mode: "off" | "shadow" | "active";
+  status: "not_triggered" | "ready" | "degraded" | "failed";
+  profile: string;
+  strategy: string;
+  generation: number;
+  before: { tokens: number; bytes: number };
+  after: { tokens: number; bytes: number };
+  savingsRatio: number;
+  compactedMessages: number;
+  retainedMessages: number;
+  lastCompactedAt?: string | null;
+  failureCode: string;
+}
+
 export async function getChatHistory(agentId: string, sessionId: string, signal?: AbortSignal): Promise<ChatHistoryMessage[]> {
   const res = await apiFetch(`/api/chat/history?agentId=${encodeURIComponent(agentId)}&sessionId=${encodeURIComponent(sessionId)}`, { signal });
   if (!res.ok) return [];
@@ -567,6 +582,19 @@ export async function getChatHistory(agentId: string, sessionId: string, signal?
   // Backend wraps in { history: [...] }; older shape was a raw array.
   if (Array.isArray(data?.history)) return data.history;
   return Array.isArray(data) ? data : [];
+}
+
+export async function getChatContextStatus(
+  agentId: string,
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<ChatContextStatus> {
+  const res = await apiFetch(
+    `/api/chat/context-status?agentId=${encodeURIComponent(agentId)}&sessionId=${encodeURIComponent(sessionId)}`,
+    { signal },
+  );
+  if (!res.ok) throw new Error("failed to load context status");
+  return (await res.json()) as ChatContextStatus;
 }
 
 export async function getChatSessions(agentId: string, signal?: AbortSignal): Promise<{ id: string; title?: string; preview: string; thumbnailUrl?: string; createdAt?: number; updatedAt?: number }[]> {
@@ -605,9 +633,26 @@ export async function sendChat(agentId: string, sessionId: string, message: stri
   return res.json();
 }
 
+export async function stopChat(agentId: string, sessionId: string): Promise<{ ok: boolean; cancelled: boolean; count: number }> {
+  const res = await apiFetch("/api/chat/stop", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ agentId, sessionId }),
+  });
+  if (!res.ok) throw new Error(`stop failed: ${res.status}`);
+  return res.json();
+}
+
 export interface ToolResultMetadata {
   sandbox?: boolean;
   isError?: boolean;
+  status?: string;
+  errorCode?: string;
+  correlationId?: string;
+  entryKey?: string;
+  mergedRows?: number;
+  evidenceGate?: string;
+  toolFailure?: string;
 }
 
 export interface ChatStreamEvent {

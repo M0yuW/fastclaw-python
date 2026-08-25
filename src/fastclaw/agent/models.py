@@ -36,11 +36,12 @@ class AgentRunRequest(AgentModel):
     delegation_timeout: float = Field(default=120.0, gt=0)
     max_failed_tool_rounds: int = Field(default=0, ge=0, le=8)
     failed_tool_message: str = (
-        "无法生成有证据支持的结果: 本轮所需工具全部失败。请核对任务范围和数据源后重试; "
-        "在取得可验证证据前, 系统不会生成推测性结论。"
+        "本轮未完成\uFF1A所调用的工具没有成功返回。请根据下方具体工具错误处理\uFF1B在缺少可验证 "
+        "证据时\uFF0C系统不会生成推测性结论。"
     )
     scope_guard: str = ""
     system_prompt: str = ""
+    context_compaction: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentEventType(StrEnum):

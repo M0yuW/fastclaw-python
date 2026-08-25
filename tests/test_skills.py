@@ -42,6 +42,10 @@ Run scripts below /old/.fastclaw and never install at runtime.
         ),
         encoding="utf-8",
     )
+    (skill / "scripts" / "sporttery_data.py").write_text(
+        "print('sporttery')\n",
+        encoding="utf-8",
+    )
     if requirements is not None:
         (skill / "requirements.txt").write_text(requirements, encoding="utf-8")
     return skill
@@ -78,7 +82,12 @@ async def test_prepared_skill_exec_rejects_inline_code_and_injects_only_declared
     catalog = SkillCatalog(tmp_path / "skills")
     skill = catalog.discover()[0]
     await catalog.prepare(skill)
-    tool = SkillScriptTool(catalog, (skill,), forbidden_roots=(Path("/old/.fastclaw"),))
+    tool = SkillScriptTool(
+        catalog,
+        (skill,),
+        forbidden_roots=(Path("/old/.fastclaw"),),
+        forbidden_scripts=("sporttery_data.py",),
+    )
 
     result = await tool.execute(
         {"argv": ["python3", "scripts/run.py", "ok"]},
@@ -96,6 +105,8 @@ async def test_prepared_skill_exec_rejects_inline_code_and_injects_only_declared
             {"argv": ["python3", "scripts/run.py", "/old/.fastclaw/private"]},
             context(),
         )
+    with pytest.raises(ValueError, match="current Agent role"):
+        await tool.execute({"argv": ["python3", "scripts/sporttery_data.py"]}, context())
 
 
 async def test_requirements_change_selects_a_new_unprepared_environment(tmp_path: Path) -> None:

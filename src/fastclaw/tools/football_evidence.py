@@ -11,7 +11,14 @@ import httpx
 
 from fastclaw.tools.football_competitions import FootballCompetition
 
-SourceState = Literal["success", "empty", "unavailable", "rejected"]
+SourceState = Literal[
+    "success",
+    "empty",
+    "unavailable",
+    "rejected",
+    "no_match",
+    "not_requested",
+]
 
 
 def utc_now() -> str:
@@ -113,14 +120,14 @@ class TheOddsApiSource:
                     for row in catalog_rows
                     if isinstance(row, dict) and row.get("active") is not False
                 }
-                if competition.odds_sport_key not in available:
-                    return SourceResult(
-                        "the_odds_api",
-                        "rejected",
-                        error_code="odds_sport_not_in_catalog",
-                        safe_reason="The reviewed competition is not in the current sports catalog",
-                        quota=self._quota(catalog.headers),
-                    )
+                active_keys = [key for key in competition.odds_sport_keys if key in available]
+                # The provider occasionally omits a stable, directly callable
+                # sport key from /sports (Europa League is one observed case).
+                # The Runtime-owned allowlist remains the security boundary, so
+                # probe only those reviewed keys before declaring the route
+                # unavailable.  Prefer catalog-advertised alternates when they
+                # exist (for example Champions League qualification).
+                request_keys = active_keys or list(competition.odds_sport_keys)
                 params = {
                     "apiKey": self._api_key,
                     "regions": ",".join(regions),
@@ -131,10 +138,40 @@ class TheOddsApiSource:
                     params["commenceTimeFrom"] = commence_from
                 if commence_to:
                     params["commenceTimeTo"] = commence_to
-                response = await client.get(
-                    f"/v4/sports/{competition.odds_sport_key}/odds", params=params
-                )
-                return self._decode(response, source="the_odds_api")
+                rows: list[dict[str, Any]] = []
+                failures: list[SourceResult] = []
+                completed_request = False
+                latest_quota = self._quota(catalog.headers)
+                for sport_key in request_keys:
+                    response = await client.get(
+                        f"/v4/sports/{sport_key}/odds", params=params
+                    )
+                    decoded = self._decode(response, source="the_odds_api")
+                    latest_quota = decoded.quota
+                    if decoded.status in {"success", "empty"}:
+                        completed_request = True
+                        if isinstance(decoded.data, list):
+                            rows.extend(row for row in decoded.data if isinstance(row, dict))
+                    else:
+                        failures.append(decoded)
+                if rows:
+                    return SourceResult("the_odds_api", "success", rows, quota=latest_quota)
+                if completed_request:
+                    return SourceResult("the_odds_api", "empty", [], quota=latest_quota)
+                if not active_keys:
+                    return SourceResult(
+                        "the_odds_api",
+                        "rejected",
+                        error_code="odds_sport_not_in_catalog",
+                        safe_reason=(
+                            "The reviewed competition was absent from the current sports "
+                            "catalog and its stable route was not callable"
+                        ),
+                        quota=latest_quota,
+                    )
+                if failures:
+                    return failures[0]
+                return SourceResult("the_odds_api", "empty", [], quota=latest_quota)
         except (httpx.HTTPError, TimeoutError):
             return SourceResult(
                 "the_odds_api",

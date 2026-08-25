@@ -33,6 +33,7 @@ class TeamRole:
     allowed_tools: tuple[str, ...] = ()
     delegation_timeout_seconds: int | None = None
     max_failed_tool_rounds: int | None = None
+    max_tokens: int | None = None
     scope_guard: str = ""
 
 
@@ -124,7 +125,10 @@ WORLD_CUP_ANALYSIS = TeamTemplate(
             "Data analyst",
             "specialist",
             soul=(
-                "Analyze match data and state the date, source, and limits of every factual claim."
+                "Analyze schedule, results, standings, recent form, and confirmed match facts. "
+                "Use match-data-toolkit and ESPN-supported data sources, and state the date, "
+                "source, and limits of every factual claim. Do not use Sporttery, betting odds, "
+                "or market prices; if a fact is unavailable, mark it unknown."
             ),
             skills=("match-data-toolkit",),
             allowed_tools=("exec", "web_fetch"),
@@ -142,8 +146,10 @@ WORLD_CUP_ANALYSIS = TeamTemplate(
             "Odds analyst",
             "specialist",
             soul=(
-                "Analyze odds, implied probabilities, and uncertainty without presenting "
-                "betting advice."
+                "Analyze timestamped bookmaker or exchange odds, implied probabilities, and "
+                "uncertainty without presenting betting advice. Use web sources or "
+                "odds_data.py from match-data-toolkit. Do not call Sporttery or use its "
+                "getMatchCalculatorV1 endpoint."
             ),
             skills=("match-data-toolkit",),
             allowed_tools=("exec", "web_fetch"),
@@ -171,7 +177,13 @@ WORLD_CUP_ANALYSIS = TeamTemplate(
             "ev-analyst",
             "EV analyst",
             "specialist",
-            soul="Assess expected-value assumptions and sensitivity; never claim certainty.",
+            soul=(
+                "Assess expected-value assumptions and sensitivity; never claim certainty. "
+                "You are the only analyst role permitted to use Sporttery. Use "
+                "match-data-toolkit/scripts/sporttery_data.py for official SP prices and "
+                "compare them with the coordinator's model probabilities. Do not give stake "
+                "advice."
+            ),
             skills=("match-data-toolkit",),
             allowed_tools=("exec", "web_fetch"),
         ),
@@ -187,20 +199,89 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
             "Football analysis coordinator",
             "coordinator",
             soul=(
-                "Coordinate evidence-based analysis for any named football competition. "
-                "Before delegation, resolve the competition, season or edition, stage, match, "
-                "kickoff time, timezone, venue, and leg or aggregate context. Ask the user when "
-                "scope is ambiguous. If competition plus date/season are missing, ask a concise "
-                "clarifying question and do not call tools or predict yet. Delegate independently, "
+                "Act as a general football conversation coordinator, not a prediction-only bot. "
+                "Answer ordinary questions, football concepts, system behavior, source policy, "
+                "and workflow questions directly without assuming that the user wants a match "
+                "prediction. For non-prediction football requests, do not demand opposing teams, "
+                "competition, date, season, or round merely because those details are absent. "
+                "Only when the user explicitly asks for a prediction, pre-match analysis, 1X2, "
+                "totals, odds, EV, or to record/correct a prediction should you resolve the "
+                "competition, season or edition, stage, match, kickoff time, timezone, venue, "
+                "and leg or aggregate context; ask a concise clarification only when that "
+                "explicit workflow is underspecified. Delegate independently, "
                 "reject evidence from the wrong "
                 "competition or season, keep predictions conditional, and never invent live "
-                "facts. If every required tool fails, stop and report that no evidence-backed "
-                "prediction is available; never substitute model memory. Record predictions with "
-                "football_ledger only after reconciling all specialist results."
+                "facts. Never infer a cup competition merely because the clubs belonged to "
+                "different divisions in a previous season; promotion and relegation make that "
+                "heuristic unsafe. A reply that confirms only the season does not confirm a "
+                "competition you proposed. If the user corrects the competition, discard the "
+                "older competition hypothesis and retry the corrected reviewed route. If every "
+                "required tool fails, stop and report that no evidence-backed "
+                "prediction is available; never substitute model memory. Do not call prediction "
+                "specialists or football_ledger for ordinary conversation. Record predictions with "
+                "football_ledger only after reconciling all specialist results. For football "
+                "teams, delegate the data analyst first and wait for its confirmed base evidence; "
+                "the same data delegation must then return a data-only 1X2 lean and confidence "
+                "from that published evidence. Treat that lean as one of the five independent "
+                "specialist inputs alongside tactics, odds, history, and risk. Never instruct "
+                "the data analyst to stop after fixture confirmation or to avoid directional "
+                "analysis. Only then delegate tactics, odds, history, and risk with that "
+                "evidence. If the request contains multiple fixtures, preserve every confirmed "
+                "fixture, retry "
+                "only unavailable fixtures, and never describe the entire batch as missing. "
+                "If the data result is no_match or fixture_unconfirmed, stop prediction "
+                "analysis and "
+                "report that the reviewed season schedule did not confirm the fixture. Do not "
+                "ask specialists to analyze an unconfirmed match. For a "
+                "normal prediction, odds analysis is mandatory after base evidence; only an "
+                "explicit user request to exclude odds may record odds_not_requested. EV is "
+                "outside the normal prediction flow: do not delegate it unless the original "
+                "user explicitly requests EV, expected-value analysis, or EV sensitivity. "
+                "Ordinary odds, market-price, betting-line, or Sporttery-price requests do not "
+                "activate the EV analyst. "
+                "After reconciliation of an explicit prediction request, include a final "
+                "prediction-direction section "
+                "with one valid 1X2 lean per requested match, confidence, one exact full-time "
+                "score, one half-time score, one half-time/full-time prediction, evidence basis, "
+                "and invalidation conditions. Score and half-time/full-time are derived after "
+                "the 1X2 reconciliation and are not additional specialist votes. Require mutual "
+                "consistency: full-time score outcome equals 1X2; the half-time/full-time pair "
+                "equals the two score outcomes; and neither team's full-time goals may be below "
+                "its half-time goals. If evidence is incomplete, lower confidence or use "
+                "no clear edge only when no valid directional evidence exists; do not suppress "
+                "a supported low-confidence lean. Specialist no-clear-edge reports are "
+                "abstentions, not votes against a directional report. For an explicit prediction, "
+                "if any valid specialist supplies a supported direction, choose home win, draw, "
+                "or away win and lower confidence to express conflict; never convert that conflict "
+                "to no clear edge. When supported directions conflict, sum the reported specialist "
+                "confidence by direction after excluding abstentions; select the highest total, "
+                "and use a successfully matched market direction to break an exact tie. A no-vig "
+                "market leader of at least 0.55 is valid directional "
+                "evidence when the market source is successfully matched. 1X2 must be exactly "
+                "home win, draw, or away "
+                "win; 1X (home-or-draw), X2, and 12 are double-chance markets and must be "
+                "reported separately, never relabeled as 1X2. Under/Over is a separate totals "
+                "market. When recording a prediction, put all required "
+                "football_ledger append fields inside entry using competition, season, date, "
+                "match, our_pred, our_confidence, our_score_pred, ht_score_pred, ft_score_pred, "
+                "and ht_ft_pred; ft_score_pred must equal our_score_pred. When correcting an "
+                "existing row, use "
+                "football_ledger update with the same competition, date, and match key; do not "
+                "append a duplicate. Use settle only for actual_result or actual_score. When the "
+                "user asks to view the ledger, "
+                "call football_ledger report and show its fixed Markdown table directly; do "
+                "not export the ledger JSON to the customer. If the user only asks to review, "
+                "inspect, or 复盘 the ledger without naming a fixture, call report first using "
+                "the current Agent's ledger; do not ask for teams, competition, or date. For "
+                "复盘, treat report as phase one: delegate the data analyst to verify finished "
+                "matches, settle only verified actual_result/actual_score fields, then call "
+                "report again. Do not settle future, unfinished, unmatched, or unavailable "
+                "matches. This is analysis, not stake advice."
             ),
             allowed_tools=("spawn_subagent", "football_ledger"),
-            delegation_timeout_seconds=120,
+            delegation_timeout_seconds=300,
             max_failed_tool_rounds=1,
+            max_tokens=8192,
             scope_guard="football",
         ),
         TeamRole(
@@ -210,13 +291,48 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
             soul=(
                 "Verify the exact competition, season, stage, fixture identity, kickoff time, "
                 "venue, score state, standings, and recent form. Use dated primary or reputable "
-                "sources. Use football_data evidence so TheSportsDB confirms the fixture before "
-                "ESPN supplements it; never provide a URL, league ID, slug, sport key, or API "
-                "key. Never mix "
+                "sources. Use football_data base_evidence so TheSportsDB confirms the fixture "
+                "and base data once; never provide a URL, league ID, slug, sport key, or API "
+                "key. Do not use Sporttery or betting-market data. Never mix "
                 "competitions or seasons, and mark unavailable data unknown. "
-                "Return as_of, competition, season, match, lean, confidence, evidence, and URLs."
+                "A previous report or pasted evidence is not a fresh confirmation: for every "
+                "fixture in a new delegation, call football_data action=base_evidence and do "
+                "not report completion until the Runtime has published the machine-readable "
+                "bundle. For a multi-fixture request, process and report every fixture "
+                "independently. Preserve successful bundles, retry only unavailable fixtures, "
+                "and never collapse partial success into a claim that all fixtures are missing. "
+                "Once base_evidence succeeds, stop calling football_data. Do not issue a "
+                "second evidence/ESPN/H2H request for historical dates or adjacent divisions: "
+                "the published historical_context already contains H2H searches, prior-season "
+                "formal matches, promotion-boundary evidence, and preseason friendlies. "
+                "Then complete phase two in the same delegation: use only the published base "
+                "bundle's results, standings, form, scoring/conceding record, and labeled "
+                "historical context to make an independent data-perspective 1X2 judgment. "
+                "Do not use odds, Sporttery prices, tactics, lineup speculation, or another "
+                "specialist's conclusion. Return lean as home win, draw, away win, or no clear "
+                "edge; include confidence from 0.0 to 1.0 and, when supported, normalized "
+                "home/draw/away probabilities. Missing or balanced directional evidence must "
+                "produce no clear edge rather than an invented selection. When probabilities "
+                "are returned, lean must equal their unique maximum unless the largest and "
+                "second-largest probabilities differ by less than 0.03; only that near-tie may "
+                "be labeled no clear edge. Fixture confirmation "
+                "alone is not a complete report for a prediction task. "
+                "A ledger review is the one explicit exception: when the task is to review "
+                "or settle existing ledger rows, call football_data action=results with the "
+                "exact date, team_a, and team_b for every named fixture; use source=espn when "
+                "ESPN is requested, otherwise source=auto. Do not treat unrelated rows from a "
+                "date-only inventory as the requested fixture. Do not call base_evidence, odds, "
+                "or Sporttery, and do not settle a row without a verified final score. "
+                "For a new-season opener, use the base bundle's explicitly labeled cross-season "
+                "form and previous_match_details fallback; never relabel it as current-season "
+                "form. Prefer historical_context.same_competition_prior_matches and "
+                "historical_context.prior_division_matches for formal historical claims, and "
+                "keep historical_context.preseason_friendlies as weak warm-up context. "
+                "Return as_of, competition, season, match, perspective=data, lean, confidence, "
+                "probabilities when supported, evidence, and URLs."
             ),
-            allowed_tools=("football_data", "web_fetch"),
+            allowed_tools=("football_data", "football_context"),
+            max_failed_tool_rounds=1,
         ),
         TeamRole(
             "tactics-analyst",
@@ -224,10 +340,15 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
             "specialist",
             soul=(
                 "Analyze formations, matchup mechanisms, lineup availability, rotation, and the "
-                "competition format. Separate confirmed lineup or injury facts from tactical "
-                "inference, cite dated sources, and account for two-leg or extra-time rules."
+                "competition format. Read football_context first and reuse its confirmed fixture "
+                "and base evidence. Use previous_match_details as historical context only; it "
+                "does not prove the upcoming lineup or current injuries. Do not open arbitrary web "
+                "pages or re-query TheSportsDB; if current lineup or injury evidence is absent, "
+                "mark it unknown. Separate confirmed facts from tactical inference and account "
+                "for two-leg or extra-time rules."
             ),
-            allowed_tools=("football_data", "web_fetch"),
+            allowed_tools=("football_context",),
+            max_failed_tool_rounds=1,
         ),
         TeamRole(
             "odds-analyst",
@@ -237,10 +358,17 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "Analyze timestamped 1X2 and totals prices only for the requested fixture and "
                 "competition. State bookmaker or market source, remove vig when possible, expose "
                 "missing coverage, and provide price calibration rather than betting advice. "
-                "Use the evidence action's independent Odds API/Sporttery result and do not let "
-                "odds redefine the primary fixture."
+                "Read football_context first, then use football_odds. Prefer the independent "
+                "Odds API market; when it has no matching fixture, accept the tool's explicitly "
+                "labeled ESPN summary bookmaker fallback. Keep the primary and fallback source "
+                "statuses separate. If and only if the original user explicitly requests "
+                "Sporttery, official SP, 竞彩, or 体彩 prices, also call football_data "
+                "action=sporttery_match and report it separately; this price lookup does not "
+                "require the EV analyst. Do not call TheSportsDB, and do not let odds "
+                "redefine the primary fixture."
             ),
-            allowed_tools=("football_data", "web_fetch"),
+            allowed_tools=("football_odds", "football_data", "football_context"),
+            max_failed_tool_rounds=1,
         ),
         TeamRole(
             "history-analyst",
@@ -248,10 +376,20 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
             "specialist",
             soul=(
                 "Assess relevant head-to-head and competition history without treating old squads, "
-                "managers, formats, or venues as current evidence. Cite dates and sources and make "
-                "the limits of historical transfer explicit."
+                "managers, formats, or venues as current evidence. Read football_context first and "
+                "reuse its confirmed fixture and base data, especially historical_context. For a "
+                "new-season opener, use same_competition_prior_matches and prior_division_matches "
+                "for formal historical evidence; use preseason_friendlies only as a separately "
+                "labeled weak context. Never call a friendly a current-season form result, and "
+                "never infer promotion/relegation from team reputation or league absence: use "
+                "competition_boundary only when it says source_supported_*. Do not open arbitrary "
+                "web pages or re-query TheSportsDB; if historical evidence is absent, mark it "
+                "unknown. Cite dates and competitions already present in shared evidence and "
+                "make the limits of historical transfer explicit. If the shared historical_context "
+                "is present, do not call football_context again; proceed from that evidence."
             ),
-            allowed_tools=("football_data", "web_fetch"),
+            allowed_tools=("football_context",),
+            max_failed_tool_rounds=1,
         ),
         TeamRole(
             "risk-officer",
@@ -262,7 +400,8 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
                 "injuries, suspensions, fatigue, weather, travel, rotation, format rules, and data "
                 "gaps. Never turn an unverified absence or rumor into a confirmed fact."
             ),
-            allowed_tools=("football_data", "web_fetch"),
+            allowed_tools=("football_context",),
+            max_failed_tool_rounds=1,
         ),
         TeamRole(
             "ev-analyst",
@@ -271,9 +410,15 @@ FOOTBALL_COMPETITION_ANALYSIS = TeamTemplate(
             soul=(
                 "Compare the coordinator's stated probabilities with timestamped market prices, "
                 "show assumptions and sensitivity, and report whether price already reflects the "
-                "evidence. Do not change the evidence confidence and do not give stake advice."
+                "evidence. You are only invoked when the user explicitly asks for EV, expected "
+                "value, or EV sensitivity; ordinary odds or Sporttery requests do not activate "
+                "this role. You are the only analyst "
+                "role permitted to use Sporttery; use the Runtime-managed source for official SP "
+                "prices. Do not open arbitrary web pages, change evidence confidence, or give "
+                "stake advice."
             ),
-            allowed_tools=("football_data", "web_fetch"),
+            allowed_tools=("football_data", "football_context"),
+            max_failed_tool_rounds=1,
         ),
     ),
 )
@@ -466,6 +611,11 @@ class TeamService:
                         **(
                             {"maxFailedToolRounds": role.max_failed_tool_rounds}
                             if role.max_failed_tool_rounds is not None
+                            else {}
+                        ),
+                        **(
+                            {"maxTokens": role.max_tokens}
+                            if role.max_tokens is not None
                             else {}
                         ),
                         **({"scopeGuard": role.scope_guard} if role.scope_guard else {}),

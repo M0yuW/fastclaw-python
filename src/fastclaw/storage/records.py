@@ -94,6 +94,28 @@ class SessionRecord(Record):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class SessionContextSnapshotRecord(Record):
+    id: str
+    user_id: str
+    agent_id: str
+    session_key: str
+    generation: int = 1
+    mode: str = "shadow"
+    status: str = "not_triggered"
+    profile: str = "generic"
+    strategy: str = "client"
+    provider: str = ""
+    model: str = ""
+    compacted_through_message_id: str = ""
+    source_digest: str = ""
+    summary: str = ""
+    checkpoint: dict[str, Any] = Field(default_factory=dict)
+    native_state: dict[str, Any] = Field(default_factory=dict)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    failure_code: str = ""
+    created_at: datetime = Field(default_factory=utc_now)
+
+
 class AgentFileRecord(Record):
     agent_id: str
     user_id: str

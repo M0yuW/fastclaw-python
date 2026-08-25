@@ -26,7 +26,7 @@ from fastclaw.agent.models import AgentEvent, AgentEventType, AgentRunError, Age
 from fastclaw.agent.persistence import DatabaseSessionPersistence
 from fastclaw.agent.runner import AgentRunner
 from fastclaw.credentials import CredentialCipher
-from fastclaw.execution import ExecutionContext
+from fastclaw.execution import ExecutionContext, SharedExecutionState
 from fastclaw.orchestration import (
     AsyncTaskQueue,
     InProcessMessageBus,
@@ -41,15 +41,24 @@ from fastclaw.runtime import Runtime, RuntimeState
 from fastclaw.skills import Skill, SkillCatalog, SkillError
 from fastclaw.storage import AgentRecord, ConfigRecord, Database, UnitOfWork
 from fastclaw.tools import (
+    FootballContextTool,
     FootballDataTool,
     FootballLedgerTool,
+    FootballOddsTool,
     ListDirTool,
     ReadFileTool,
     SkillScriptTool,
+    SportteryPublicFetcher,
     ToolRegistry,
+    ToolResult,
     WebFetchTool,
     WorldCupLedgerTool,
     WriteFileTool,
+)
+from fastclaw.tools.football_shared import (
+    football_event_key,
+    football_evidence_is_current,
+    get_football_evidence_cache,
 )
 
 _STANDARD_PROVIDERS: dict[str, tuple[str, str]] = {
@@ -66,6 +75,28 @@ parallel, emit several ordinary `spawn_subagent` tool calls in the same
 assistant turn. Do not use legacy `delegations`, `sharedContext`, or `agentId`
 wrapper fields.
 """
+
+_EV_REQUEST_PATTERN = re.compile(
+    r"(?:(?<![A-Za-z0-9_])ev(?![A-Za-z0-9_])|"
+    r"(?<![A-Za-z0-9_])ev\s*analyst(?![A-Za-z0-9_])|expected[-\s]+value|"
+    r"EV专家|期望值|预期价值|价值敏感性|EV敏感性)",
+    re.IGNORECASE,
+)
+
+_SPORTTERY_REQUEST_PATTERN = re.compile(
+    r"(?:sporttery|中国体育彩票|体育彩票|竞彩|体彩|官方SP)",
+    re.IGNORECASE,
+)
+
+
+def _explicit_ev_request(message: str) -> bool:
+    """Return whether the user explicitly asks for expected-value analysis."""
+    return bool(_EV_REQUEST_PATTERN.search(message.strip()))
+
+
+def _explicit_sporttery_request(message: str) -> bool:
+    """Return whether the user explicitly asks for official Sporttery prices."""
+    return bool(_SPORTTERY_REQUEST_PATTERN.search(message.strip()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,19 +170,53 @@ def _default_tools(
         if isinstance(configured_targets, list)
         else None
     )
-    web_fetch = WebFetchTool(runtime.web_http_client)
+    team_data_agent_id = str(profile.agent.config.get("teamDataAgentId") or "")
+    football_mode = str(profile.agent.config.get("footballDataMode") or "")
+    web_fetch = WebFetchTool(
+        runtime.web_http_client,
+        blocked_hosts=frozenset({"thesportsdb.com"})
+        if football_mode == "context"
+        else frozenset(),
+    )
+    agent_role = str(profile.agent.config.get("teamRole") or "").casefold()
+    agent_name = profile.agent.name.casefold()
+    allow_sporttery = agent_role in {"odds-analyst", "ev-analyst"} or any(
+        label in agent_name for label in ("odds analyst", "ev analyst")
+    )
     tools: list[Any] = [
         ReadFileTool(workspace),
         ListDirTool(workspace),
         WriteFileTool(workspace),
         web_fetch,
-        FootballDataTool(web_fetch),
-        SpawnSubagentTool(bus, team_targets),
+        FootballContextTool(),
+        FootballDataTool(
+            web_fetch,
+            sporttery_fetcher=SportteryPublicFetcher(),
+            allow_sporttery=allow_sporttery,
+            role_mode=(
+                "data"
+                if football_mode == "data"
+                else "odds"
+                if football_mode == "odds"
+                else "ev"
+                if football_mode == "ev"
+                else "full"
+            ),
+        ),
+        FootballOddsTool(),
+        SpawnSubagentTool(bus, team_targets, data_agent_id=team_data_agent_id),
         FootballLedgerTool(data_root),
         WorldCupLedgerTool(data_root),
     ]
     if profile.skills:
-        tools.append(SkillScriptTool(catalog, profile.skills, forbidden_roots=(legacy_data_root,)))
+        tools.append(
+            SkillScriptTool(
+                catalog,
+                profile.skills,
+                forbidden_roots=(legacy_data_root,),
+                forbidden_scripts=() if allow_sporttery else ("sporttery_data.py",),
+            )
+        )
     tools.extend(plugins.tools())
     return ToolRegistry(tools)
 
@@ -224,13 +289,13 @@ class ManagedAgentStream(AsyncIterator[AgentEvent]):
                         )
                     )
             finally:
-                self._manager._untrack_root(self.context.agent_id, self.context.root_execution_id)
+                self._manager._untrack_root(self.context)
                 if not self._saw_done:
                     self._error = self._error or "agent stream ended without a terminal event"
                 if not self._detached:
                     self._events.put_nowait(self._STOP)
 
-        self._manager._track_root(self.context.agent_id, self.context.root_execution_id)
+        self._manager._track_root(self.context)
         self._task = asyncio.create_task(supervise())
 
     def __aiter__(self) -> ManagedAgentStream:
@@ -315,6 +380,7 @@ class AgentRuntimeManager:
         self._tool_factory = tool_factory
         self._profiles: dict[str, AgentRuntimeProfile] = {}
         self._agent_roots: dict[str, set[str]] = {}
+        self._session_roots: dict[tuple[str, str, str], set[str]] = {}
         self.skill_catalog = SkillCatalog(config.data_root / "skills")
         package_plugins = Path(__file__).resolve().parents[1] / "bundled_plugins"
         checkout_plugins = Path(__file__).resolve().parents[3] / "plugins"
@@ -460,7 +526,12 @@ class AgentRuntimeManager:
             session_id=session_id,
             root_execution_id=root_execution_id or f"run_{uuid4().hex}",
             call_path=(agent_id,),
+            shared_state=SharedExecutionState(
+                ev_requested=_explicit_ev_request(message),
+                sporttery_requested=_explicit_sporttery_request(message),
+            ),
         )
+        await self._restore_persisted_football_base(context)
         request = self._request(profile, selection.model, message)
 
         async def producer(emit: Callable[[AgentEvent], None]) -> TaskResult:
@@ -494,6 +565,66 @@ class AgentRuntimeManager:
             producer=producer,
         )
 
+    async def _restore_persisted_football_base(self, context: ExecutionContext) -> None:
+        """Rehydrate confirmed football bundles after a process restart.
+
+        The in-process cache protects a live continuation, while the child data
+        Agent's tool result is also persisted in its Session. Restore only
+        successful, machine-readable ``football_data`` results for this exact
+        user/session; prose reports are deliberately ignored.
+        """
+
+        cache = get_football_evidence_cache()
+        async with UnitOfWork(self.database) as unit:
+            store = unit.require_store()
+            agents = await store.list_agents(context.user_id)
+            stored_sessions = [
+                stored
+                for agent in agents
+                if (stored := await store.get_session(
+                    context.user_id, agent.id, context.session_id
+                ))
+                is not None
+            ]
+
+        for stored in stored_sessions:
+            for message in stored.messages:
+                if message.get("role") != "tool" or message.get("name") != "football_data":
+                    continue
+                content = message.get("content")
+                if not isinstance(content, str):
+                    continue
+                if not football_evidence_is_current(content):
+                    # Old sessions may contain a valid fixture bundle but lack
+                    # the explicit prior-season/tier history contract. Do not
+                    # silently reuse it; continuation must refresh the data
+                    # analyst bundle before specialists run.
+                    continue
+                try:
+                    payload = json.loads(content)
+                except json.JSONDecodeError:
+                    continue
+                fixture = payload.get("fixture") if isinstance(payload, dict) else None
+                if not isinstance(fixture, dict):
+                    continue
+                competition = str(fixture.get("competition") or "").strip()
+                season = str(fixture.get("season") or "").strip()
+                date = str(
+                    fixture.get("requested_date") or fixture.get("date") or ""
+                ).strip()
+                team_a = str(fixture.get("home") or "").strip()
+                team_b = str(fixture.get("away") or "").strip()
+                if not all((competition, season, date, team_a, team_b)):
+                    continue
+                key = football_event_key(competition, season, date, team_a, team_b)
+                result = ToolResult(
+                    content=content,
+                    metadata={"persistedSession": True, "sourceAgentId": stored.agent_id},
+                )
+                context.shared_state.publish_football_base(key.value, content)
+                await cache.put("base", key, result)
+                await cache.put_session_base(context.session_id, key, result)
+
     async def chat(self, **values: str) -> ChatMessage:
         stream = await self.stream(**values)
         try:
@@ -519,15 +650,30 @@ class AgentRuntimeManager:
         roots = {root for agent_id in agent_ids for root in self._agent_roots.get(agent_id, set())}
         await asyncio.gather(*(self.cancel_root(root) for root in roots))
 
-    def _track_root(self, agent_id: str, root_execution_id: str) -> None:
-        self._agent_roots.setdefault(agent_id, set()).add(root_execution_id)
+    async def cancel_session_roots(self, *, user_id: str, agent_id: str, session_id: str) -> int:
+        """Cancel all active roots for one tenant/agent/session tuple."""
+        key = (user_id, agent_id, session_id)
+        roots = tuple(self._session_roots.get(key, ()))
+        await asyncio.gather(*(self.cancel_root(root) for root in roots))
+        return len(roots)
 
-    def _untrack_root(self, agent_id: str, root_execution_id: str) -> None:
-        roots = self._agent_roots.get(agent_id)
+    def _track_root(self, context: ExecutionContext) -> None:
+        self._agent_roots.setdefault(context.agent_id, set()).add(context.root_execution_id)
+        key = (context.user_id, context.agent_id, context.session_id)
+        self._session_roots.setdefault(key, set()).add(context.root_execution_id)
+
+    def _untrack_root(self, context: ExecutionContext) -> None:
+        roots = self._agent_roots.get(context.agent_id)
         if roots is not None:
-            roots.discard(root_execution_id)
+            roots.discard(context.root_execution_id)
             if not roots:
-                self._agent_roots.pop(agent_id, None)
+                self._agent_roots.pop(context.agent_id, None)
+        key = (context.user_id, context.agent_id, context.session_id)
+        session_roots = self._session_roots.get(key)
+        if session_roots is not None:
+            session_roots.discard(context.root_execution_id)
+            if not session_roots:
+                self._session_roots.pop(key, None)
 
     async def readiness(self) -> dict[str, bool]:
         database_ready = False
@@ -699,8 +845,80 @@ class AgentRuntimeManager:
             if (source_is_team_member or target_is_team_member) and not permitted:
                 raise AgentRunError("team delegation is restricted to active specialists")
         profile = self._profiles[agent_id]
+        target_role = str(profile.agent.config.get("teamRole") or "").casefold()
+        if target_role == "ev-analyst" and not context.shared_state.ev_requested:
+            return (
+                "EV analysis skipped: the user did not explicitly request EV or "
+                "expected-value analysis. No EV provider or market-data request was made."
+            )
         selection = await self.provider_selection(profile)
-        request = self._request(profile, selection.model, task)
+        shared_evidence = context.shared_state.render_football_base()
+        settlement_task = False
+        if target_role == "data-analyst":
+            if re.search(
+                r"复盘|结算|赛果|实际结果|核对(?:已结束)?比赛|核对.*赛果|"
+                r"settle(?:ment)?\s+ledger|finished\s+matches",
+                task,
+                re.IGNORECASE,
+            ):
+                settlement_task = True
+                context.shared_state.football_settlement_review = True
+                task = (
+                    f"{task}\n\n## Runtime settlement-review requirement\n"
+                    "This is a ledger settlement review, not a new prediction. Read the "
+                    "pending ledger rows supplied by the coordinator, group them by reviewed "
+                    "competition and season, and call football_data with action=results. "
+                    "For every named pending fixture, include the exact YYYY-MM-DD date, "
+                    "team_a, and team_b in the tool arguments; preserve home/away order and "
+                    "never use a competition/date-only response to decide that a specific "
+                    "fixture has no result. The Runtime rejects date-only settlement queries; "
+                    "if exact pending rows are not present in this task, report that the "
+                    "coordinator must first provide them instead of querying adjacent dates. "
+                    "If the user or coordinator requests ESPN, pass source=espn; "
+                    "otherwise use source=auto so a missing target in TheSportsDB falls back "
+                    "to ESPN. Match rows by date and home/away identity. Return only "
+                    "machine-readable verified results with final score, result, source, and "
+                    "status; distinguish not_finished, no_match, and unavailable. Return a "
+                    "verified_matches list for every row whose status is FT/final and whose "
+                    "score is numeric. Partial success is valid: do not retry another action "
+                    "or erase verified rows because a different competition failed. Never use "
+                    "Sporttery, odds, or memory."
+                )
+            else:
+                task = (
+                    f"{task}\n\n## Runtime evidence-publication requirement\n"
+                    "This is a fresh data delegation. Do not treat a previous report, pasted "
+                    "prose, or event ID as a new confirmation. For every requested fixture, "
+                    "call football_data with action=base_evidence now. Do not report success "
+                    "until the tool calls succeed and publish machine-readable shared evidence. "
+                    "For multiple fixtures, process each independently, preserve every successful "
+                    "bundle, retry only unavailable fixtures, and report per-fixture status; never "
+                    "turn one unavailable source into a claim that all fixtures are missing. "
+                    "After publication succeeds, complete the second phase in this same "
+                    "delegation: make an independent data-only 1X2 judgment from the published "
+                    "results, standings, form, scoring/conceding record, and labeled historical "
+                    "context. Return perspective=data, lean (home win, draw, away win, or no "
+                    "clear edge), confidence from 0.0 to 1.0, normalized home/draw/away "
+                    "probabilities when supported, and the evidence used. When probabilities "
+                    "are returned, lean must equal their unique maximum unless the top two "
+                    "differ by less than 0.03; only that near-tie may be labeled no clear edge. "
+                    "Fixture confirmation "
+                    "alone is incomplete for a prediction task. Do not call football_odds or "
+                    "Sporttery, and do not use market prices, tactics, or lineup speculation."
+                )
+        elif shared_evidence and "## Shared football base evidence" not in task:
+            task = (
+                f"{task}\n\n## Shared football base evidence\n"
+                "The data analyst already confirmed this fixture. Reuse this evidence; "
+                "do not re-query TheSportsDB or replace the confirmed fixture.\n"
+                f"{shared_evidence}"
+            )
+        request = self._request(
+            profile,
+            selection.model,
+            task,
+            allowed_tools=frozenset({"football_data"}) if settlement_task else None,
+        )
         return await self._run(profile, selection, request, context, lambda event: None)
 
     async def _run(
@@ -851,12 +1069,13 @@ class AgentRuntimeManager:
                 )
             )
         policy = str(effective_config.get("policy") or "").strip()
+        configured_allowed_tools = effective_config.get("allowedTools")
         if policy == "no-tools":
             allowed_tools: frozenset[str] | None = frozenset()
         elif policy == "delegate-only":
             allowed_tools = frozenset({"spawn_subagent"})
         else:
-            configured = effective_config.get("allowedTools")
+            configured = configured_allowed_tools
             if isinstance(configured, list):
                 allowed_tools = frozenset(str(item) for item in configured)
             elif skills:
@@ -896,7 +1115,133 @@ class AgentRuntimeManager:
                     for member in members
                     if member.member_type == "specialist" and member.status == "active"
                 ]
+                data_member = next(
+                    (
+                        member
+                        for member in members
+                        if member.member_type == "specialist"
+                        and member.role_key == "data-analyst"
+                        and member.status == "active"
+                    ),
+                    None,
+                )
+                if data_member is not None:
+                    effective_config["teamDataAgentId"] = data_member.agent_id
             break
+        role_key = str(effective_config.get("teamRole") or "")
+        competition_team_tools = {"football_data", "football_odds", "football_context"}
+        is_competition_team = (
+            isinstance(configured_allowed_tools, list)
+            and bool(competition_team_tools.intersection(configured_allowed_tools))
+        ) or (
+            role_key == "coordinator" and effective_config.get("scopeGuard") == "football"
+        )
+        if is_competition_team and role_key in {
+            "data-analyst",
+            "odds-analyst",
+            "tactics-analyst",
+            "history-analyst",
+            "risk-officer",
+            "ev-analyst",
+        }:
+            if role_key == "data-analyst":
+                effective_config["footballDataMode"] = "data"
+                allowed_tools = frozenset({"football_data", "football_context"})
+            elif role_key == "odds-analyst":
+                effective_config["footballDataMode"] = "odds"
+                allowed_tools = frozenset(
+                    {"football_odds", "football_data", "football_context"}
+                )
+            elif role_key == "ev-analyst":
+                effective_config["footballDataMode"] = "ev"
+                allowed_tools = frozenset({"football_data", "football_context"})
+            else:
+                effective_config["footballDataMode"] = "context"
+                allowed_tools = frozenset({"football_context"})
+        if is_competition_team and role_key == "coordinator":
+            prompt_parts.append(
+                "## Football evidence order\n\n"
+                "Treat this as a general football conversation by default. Answer ordinary "
+                "football, system, source, and workflow questions directly and do not assume "
+                "that every message requests a prediction. Only for an explicit prediction, "
+                "pre-match analysis, 1X2, totals, odds, EV, or prediction-ledger request, "
+                "delegate the data-analyst first and wait for its base_evidence result. "
+                "Never infer a cup competition from clubs' previous-season division membership "
+                "or from an assumed cross-tier matchup. Promotion and relegation make that "
+                "unsafe. A user reply that confirms only a season does not confirm a proposed "
+                "competition. When the user corrects the competition, discard earlier negative "
+                "evidence for the wrong competition and retry the corrected reviewed route. "
+                "The data delegation has two required phases: publish base_evidence, then return "
+                "an independent data-only 1X2 lean and confidence from that evidence. When "
+                "writing the delegation task, explicitly require both phases; never tell the "
+                "data analyst 'do not predict', 'only establish fixture facts', or otherwise "
+                "stop after confirmation. Treat its directional report as one of five independent "
+                "specialist inputs together with tactics, odds, history, and risk. "
+                "For a partial multi-fixture result, retain every confirmed fixture, retry only "
+                "the unavailable fixture, and delegate later specialists only for confirmed "
+                "fixtures; never describe the whole batch as missing. "
+                "Only after that result succeeds may you delegate tactics, odds, history, "
+                "or risk. Those specialists receive the shared evidence and must not repeat "
+                "the primary football-data lookup. If the data delegation returns no_match "
+                "or fixture_unconfirmed, stop the prediction workflow and report that the "
+                "reviewed season schedule did not confirm the requested fixture; do not "
+                "delegate other specialists. For a normal prediction, odds analysis is "
+                "mandatory after base evidence; only an explicit user request to exclude odds "
+                "may record odds_not_requested. EV is outside the normal prediction flow and "
+                "must only be delegated when the original user explicitly requests EV, "
+                "expected-value analysis, or EV sensitivity. Ordinary requests for odds, "
+                "market prices, betting lines, or Sporttery prices do not activate EV."
+            )
+            prompt_parts.append(
+                "## Football prediction output contract\n\n"
+                "Apply this contract only when the user explicitly requests a prediction or "
+                "prediction-ledger operation. For ordinary football conversation, answer the "
+                "actual question and do not ask for fixture scope or produce a prediction. "
+                "After reconciling all specialist reports, the final user-facing answer must "
+                "contain a clearly labeled final prediction-direction section with one row "
+                "for every requested match. Each row must include a valid 1X2 lean (home win, "
+                "draw, away win, or no clear edge), confidence (high, medium, or low), one exact "
+                "full-time score prediction, one half-time score prediction, one half-time/full-"
+                "time prediction, the evidence basis, and invalidation conditions. Score and "
+                "half-time/full-time are derived predictions after 1X2 reconciliation; they are "
+                "not additional specialist votes. They must be mutually consistent: the full-time "
+                "score outcome must equal final 1X2, the half-time/full-time pair must equal the "
+                "two score outcomes, and full-time goals for each team cannot be below half-time "
+                "goals. Missing data lowers confidence; "
+                "it does not justify omitting a supported low-confidence lean. Use no clear "
+                "edge only when no valid directional evidence exists, and explain why. Treat "
+                "specialist no-clear-edge reports as abstentions, not votes against another "
+                "specialist's supported direction. If any valid specialist supplies a direction, "
+                "the final explicit prediction must choose home win, draw, or away win; express "
+                "conflict by lowering confidence. When supported directions conflict, sum the "
+                "reported specialist confidence by direction after excluding abstentions, select "
+                "the highest total, and use a successfully matched market direction to break an "
+                "exact tie. A successfully matched no-vig market leader "
+                "of at least 0.55 is valid directional evidence. Never "
+                "confuse markets: 1X2 is exactly home win, draw, or away win; 1X, X2, and 12 "
+                "are double-chance markets and must be labeled separately; Under/Over is a "
+                "totals market. Never relabel a double-chance or totals lean as 1X2. Never "
+                "invent facts, prices, lineups, or predictions from memory. This is analysis, "
+                "not stake advice. Record each supported 1X2 prediction with football_ledger "
+                "after reconciliation; for append, put competition, season, date, match, "
+                "our_pred, our_confidence, our_score_pred, ht_score_pred, ft_score_pred, and "
+                "ht_ft_pred inside the entry object. `ft_score_pred` must equal "
+                "`our_score_pred`. When the user asks to "
+                "correct an existing prediction, use football_ledger operation=update with "
+                "the same competition, date, and match key and only the changed fields; do "
+                "not append a second row. Use settle only to fill actual_result or actual_score. "
+                "If append reports existing_requires_update, call update before responding. "
+                "view the ledger, call football_ledger with operation=report and show its "
+                "fixed Markdown table directly; never export or offer the ledger JSON to the "
+                "customer. If the user only asks to review or 复盘 the ledger without a named "
+                "fixture, call report first and do not request fixture scope. For 复盘, first "
+                "call report with pending_only=true, then include every target row's exact "
+                "competition, season, YYYY-MM-DD date, home team, and away team in the data "
+                "analyst delegation task. Never delegate a generic 'finished matches' query "
+                "without those identities. Then delegate the data analyst to query competition "
+                "results, settle only verified finished matches, and call report again; leave "
+                "future, unfinished, unmatched, or unavailable matches pending."
+            )
         system_prompt = "\n\n".join(prompt_parts).replace(
             str(self.config.legacy_data_root), str(self.config.data_root)
         )
@@ -955,13 +1300,34 @@ class AgentRuntimeManager:
         return {"finance-tools": config}, {"finance-tools": environment}, enabled
 
     @staticmethod
-    def _request(profile: AgentRuntimeProfile, model: str, message: str) -> AgentRunRequest:
+    def _request(
+        profile: AgentRuntimeProfile,
+        model: str,
+        message: str,
+        *,
+        allowed_tools: frozenset[str] | None = None,
+    ) -> AgentRunRequest:
         config = profile.agent.config
+        configured_max_failed_tool_rounds = config.get("maxFailedToolRounds")
+        if configured_max_failed_tool_rounds is None:
+            # Older persisted football teams predate the fail-closed specialist
+            # policy.  Their profiles do not have maxFailedToolRounds, so keep
+            # an unavailable external data source from consuming the entire
+            # coordinator delegation budget with model retries.  An explicit
+            # value always wins, including 0 for an intentionally unlimited
+            # retry policy.
+            default_max_failed_tool_rounds = int(
+                config.get("teamMemberType") == "specialist"
+                and profile.allowed_tools is not None
+                and "football_data" in profile.allowed_tools
+            )
+        else:
+            default_max_failed_tool_rounds = int(configured_max_failed_tool_rounds or 0)
         return AgentRunRequest(
             model=model,
             message=message,
             system_prompt=profile.system_prompt or str(config.get("soul") or ""),
-            allowed_tools=profile.allowed_tools,
+            allowed_tools=profile.allowed_tools if allowed_tools is None else allowed_tools,
             max_rounds=int(config.get("maxToolIterations") or 8),
             max_tokens=int(config.get("maxTokens") or 4096),
             temperature=float(
@@ -971,8 +1337,13 @@ class AgentRuntimeManager:
                 int(config["thinkingBudgetTokens"]) if config.get("thinkingBudgetTokens") else None
             ),
             delegation_timeout=float(config.get("delegationTimeoutSeconds") or 120),
-            max_failed_tool_rounds=int(config.get("maxFailedToolRounds") or 0),
+            max_failed_tool_rounds=default_max_failed_tool_rounds,
             scope_guard=str(config.get("scopeGuard") or ""),
+            context_compaction=(
+                dict(config.get("contextCompaction") or {})
+                if isinstance(config.get("contextCompaction"), dict)
+                else {}
+            ),
         )
 
     @staticmethod

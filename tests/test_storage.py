@@ -20,6 +20,7 @@ from fastclaw.storage import (
     APIKeyRecord,
     ConfigRecord,
     Database,
+    SessionContextSnapshotRecord,
     SessionRecord,
     UnitOfWork,
     UserRecord,
@@ -40,7 +41,7 @@ async def test_sqlite_defaults_and_repository_round_trip(tmp_path: Path) -> None
     try:
         async with database.session() as session:
             assert await session.scalar(text("SELECT version_num FROM alembic_version")) == (
-                "20260806_02"
+                "20260824_01"
             )
             assert await session.scalar(text("PRAGMA journal_mode")) == "wal"
             assert await session.scalar(text("PRAGMA foreign_keys")) == 1
@@ -86,6 +87,20 @@ async def test_sqlite_defaults_and_repository_round_trip(tmp_path: Path) -> None
                     chatter_user_id="user-1",
                 )
             )
+            await store.save_session_context_snapshot(
+                SessionContextSnapshotRecord(
+                    id="snapshot-1",
+                    user_id="user-1",
+                    agent_id="agent-1",
+                    session_key="session-1",
+                    generation=1,
+                    mode="shadow",
+                    status="ready",
+                    profile="generic",
+                    strategy="client",
+                    metrics={"beforeBytes": 1000, "afterBytes": 100},
+                )
+            )
             await store.save_config(
                 ConfigRecord(
                     id="config-1",
@@ -103,6 +118,11 @@ async def test_sqlite_defaults_and_repository_round_trip(tmp_path: Path) -> None
             store = unit.require_store()
             user = await store.get_user_by_login("alice@example.test")
             assert user is not None
+            snapshot = await store.get_latest_session_context_snapshot(
+                "user-1", "agent-1", "session-1"
+            )
+            assert snapshot is not None
+            assert snapshot.metrics["afterBytes"] == 100
             assert verify_password("correct horse battery staple", user.password_hash)
             assert not verify_password("wrong", user.password_hash)
             assert (await store.get_agent("agent-1")).is_public  # type: ignore[union-attr]

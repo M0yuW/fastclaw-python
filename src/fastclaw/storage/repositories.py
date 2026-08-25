@@ -17,6 +17,7 @@ from fastclaw.storage.models import (
     APIKeyModel,
     ConfigModel,
     CronJobModel,
+    SessionContextSnapshotModel,
     SessionModel,
     UserModel,
     WebSessionModel,
@@ -29,6 +30,7 @@ from fastclaw.storage.records import (
     APIKeyRecord,
     ConfigRecord,
     CronJobRecord,
+    SessionContextSnapshotRecord,
     SessionRecord,
     UserRecord,
     WebSessionRecord,
@@ -69,6 +71,12 @@ class SessionRepository(Protocol):
     async def save_session(self, record: SessionRecord) -> None: ...
     async def get_session(self, user_id: str, agent_id: str, key: str) -> SessionRecord | None: ...
     async def list_sessions(self, user_id: str, agent_id: str) -> Sequence[SessionRecord]: ...
+    async def save_session_context_snapshot(
+        self, record: SessionContextSnapshotRecord
+    ) -> None: ...
+    async def get_latest_session_context_snapshot(
+        self, user_id: str, agent_id: str, session_key: str
+    ) -> SessionContextSnapshotRecord | None: ...
     async def delete_session(self, user_id: str, agent_id: str, key: str) -> None: ...
 
 
@@ -306,6 +314,26 @@ class SQLAlchemyStore:
         ).all()
         return [self._session_record(model) for model in models]
 
+    async def save_session_context_snapshot(
+        self, record: SessionContextSnapshotRecord
+    ) -> None:
+        await self.session.merge(SessionContextSnapshotModel(**record.model_dump()))
+
+    async def get_latest_session_context_snapshot(
+        self, user_id: str, agent_id: str, session_key: str
+    ) -> SessionContextSnapshotRecord | None:
+        model = await self.session.scalar(
+            select(SessionContextSnapshotModel)
+            .where(
+                SessionContextSnapshotModel.user_id == user_id,
+                SessionContextSnapshotModel.agent_id == agent_id,
+                SessionContextSnapshotModel.session_key == session_key,
+            )
+            .order_by(SessionContextSnapshotModel.generation.desc())
+            .limit(1)
+        )
+        return self._session_context_snapshot_record(model) if model is not None else None
+
     async def delete_session(self, user_id: str, agent_id: str, key: str) -> None:
         await self.session.execute(
             delete(SessionModel).where(
@@ -492,6 +520,15 @@ class SQLAlchemyStore:
             created_at=model.created_at,
             updated_at=model.updated_at,
         )
+
+    @staticmethod
+    def _session_context_snapshot_record(
+        model: SessionContextSnapshotModel,
+    ) -> SessionContextSnapshotRecord:
+        return SessionContextSnapshotRecord(**{
+            column.name: getattr(model, column.name)
+            for column in SessionContextSnapshotModel.__table__.columns
+        })
 
     @staticmethod
     def _config_record(model: ConfigModel) -> ConfigRecord:

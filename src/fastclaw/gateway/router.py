@@ -29,6 +29,7 @@ from fastclaw.gateway.models import (
     APIKeyAgents,
     APIKeyCreate,
     ChatInput,
+    ChatStopInput,
     LoginRequest,
     OnboardRequest,
     OpenAIChatInput,
@@ -708,8 +709,10 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         required_tools = sorted({tool for role in template.roles for tool in role.allowed_tools})
         available_tools = {
             "exec",
+            "football_context",
             "football_data",
             "football_ledger",
+            "football_odds",
             "list_dir",
             "read_file",
             "spawn_subagent",
@@ -1755,6 +1758,54 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             )
         }
 
+    @router.get("/api/chat/context-status")
+    async def chat_context_status(
+        agentId: str,
+        sessionId: str,
+        auth: AuthContext = auth_dependency,
+    ) -> dict[str, Any]:
+        await service.require_agent(auth, agentId)
+        async with UnitOfWork(gateway.database) as unit:
+            snapshot = await unit.require_store().get_latest_session_context_snapshot(
+                auth.identity.effective_user_id, agentId, sessionId
+            )
+        if snapshot is None:
+            return {
+                "mode": "shadow",
+                "status": "not_triggered",
+                "profile": "auto",
+                "strategy": "none",
+                "generation": 0,
+                "before": {"tokens": 0, "bytes": 0},
+                "after": {"tokens": 0, "bytes": 0},
+                "savingsRatio": 0,
+                "compactedMessages": 0,
+                "retainedMessages": 0,
+                "lastCompactedAt": None,
+                "failureCode": "",
+            }
+        metrics = snapshot.metrics
+        return {
+            "mode": snapshot.mode,
+            "status": snapshot.status,
+            "profile": snapshot.profile,
+            "strategy": snapshot.strategy,
+            "generation": snapshot.generation,
+            "before": {
+                "tokens": int(metrics.get("beforeTokens") or 0),
+                "bytes": int(metrics.get("beforeBytes") or 0),
+            },
+            "after": {
+                "tokens": int(metrics.get("afterTokens") or 0),
+                "bytes": int(metrics.get("afterBytes") or 0),
+            },
+            "savingsRatio": float(metrics.get("savingsRatio") or 0),
+            "compactedMessages": int(metrics.get("compactedMessages") or 0),
+            "retainedMessages": int(metrics.get("retainedMessages") or 0),
+            "lastCompactedAt": snapshot.created_at.isoformat(),
+            "failureCode": snapshot.failure_code,
+        }
+
     @router.get("/api/chat/sessions")
     async def chat_sessions(agentId: str, auth: AuthContext = auth_dependency) -> dict[str, Any]:
         await service.require_agent(auth, agentId)
@@ -2118,6 +2169,20 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
                 stream.detach()
 
         return StreamingResponse(events(), media_type="text/event-stream")
+
+    @router.post("/api/chat/stop")
+    async def stop_chat(
+        payload: ChatStopInput, auth: AuthContext = auth_dependency
+    ) -> dict[str, Any]:
+        if auth.identity.read_only:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "actAs is read-only")
+        await service.require_agent(auth, payload.agent_id)
+        cancelled = await gateway.agent_manager.cancel_session_roots(
+            user_id=auth.identity.effective_user_id,
+            agent_id=payload.agent_id,
+            session_id=payload.session_id,
+        )
+        return {"ok": True, "cancelled": cancelled > 0, "count": cancelled}
 
     @router.get("/v1/agents")
     async def v1_agents(auth: AuthContext = auth_dependency) -> dict[str, Any]:

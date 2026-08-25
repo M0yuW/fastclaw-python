@@ -145,13 +145,31 @@ async def test_general_football_team_creation_persists_role_prompts(tmp_path: Pa
         assert coordinator is not None
         assert coordinator.config["allowedTools"] == ["spawn_subagent", "football_ledger"]
         assert coordinator.config["model"] == "deepseek-v4-pro"
-        assert coordinator.config["delegationTimeoutSeconds"] == 120
+        assert coordinator.config["delegationTimeoutSeconds"] == 300
         assert coordinator.config["maxFailedToolRounds"] == 1
+        assert coordinator.config["maxTokens"] == 8192
         assert coordinator.config["scopeGuard"] == "football"
         assert "season or edition" in coordinator.config["soul"]
+        assert "final prediction-direction section" in coordinator.config["soul"]
+        assert "1X2 must be exactly home win, draw, or away win" in coordinator.config["soul"]
+        assert "abstentions, not votes" in coordinator.config["soul"]
+        assert "sum the reported specialist confidence by direction" in coordinator.config["soul"]
+        assert "no-vig market leader of at least 0.55" in coordinator.config["soul"]
+        assert (
+            "Sporttery-price requests do not activate the EV analyst"
+            in coordinator.config["soul"]
+        )
+        assert "Never infer a cup competition" in coordinator.config["soul"]
+        assert "one exact full-time score" in coordinator.config["soul"]
+        assert "our_score_pred, ht_score_pred, ft_score_pred" in coordinator.config["soul"]
         assert data_analyst is not None
         assert data_analyst.config["model"] == "deepseek-v4-flash"
-        assert data_analyst.config["allowedTools"] == ["football_data", "web_fetch"]
+        assert data_analyst.config["allowedTools"] == ["football_data", "football_context"]
+        assert data_analyst.config["maxFailedToolRounds"] == 1
+        assert (
+            "largest and second-largest probabilities differ by less than 0.03"
+            in data_analyst.config["soul"]
+        )
         assert "skills" not in data_analyst.config
     finally:
         await database.close()
@@ -198,7 +216,17 @@ def test_general_football_template_is_public_and_competition_scoped() -> None:
     assert template in public_templates()
     assert len(template.roles) == 7
     assert template.roles[0].allowed_tools == ("spawn_subagent", "football_ledger")
-    assert all(role.allowed_tools == ("football_data", "web_fetch") for role in template.roles[1:])
+    assert template.roles[1].allowed_tools == ("football_data", "football_context")
+    assert template.roles[2].allowed_tools == ("football_context",)
+    assert template.roles[3].allowed_tools == (
+        "football_odds",
+        "football_data",
+        "football_context",
+    )
+    assert template.roles[4].allowed_tools == ("football_context",)
+    assert template.roles[5].allowed_tools == ("football_context",)
+    assert template.roles[6].allowed_tools == ("football_data", "football_context")
+    assert all(role.max_failed_tool_rounds == 1 for role in template.roles[1:])
     assert all(not role.skills for role in template.roles)
     combined_prompt = "\n".join(role.soul for role in template.roles)
     assert "competition" in combined_prompt.lower()

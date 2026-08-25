@@ -3,8 +3,9 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
-import { getStatus, getChatHistory, getChatSessions, sendChatStream, type AgentInfo, type ChatHistoryMessage } from "@/lib/api";
+import { getStatus, getChatHistory, getChatSessions, sendChatStream, stopChat, type AgentInfo, type ChatHistoryMessage } from "@/lib/api";
 import { createChatStreamBatcher, reduceChatStreamEvents, type StreamMessage } from "@/lib/chat-stream";
+import { formatToolSummary } from "@/lib/tool-summary";
 import { useAgentName } from "@/hooks/use-agent-name";
 import { Bot, Send, Copy, Check, SquarePen, MessageSquare, Wrench, ChevronDown, ChevronRight, Square } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -85,8 +86,11 @@ export default function ChatPage() {
   const sessionsGenerationRef = useRef(0);
 
   const abortStream = useCallback(() => {
+    if (selectedAgent && sessionId) {
+      void stopChat(selectedAgent, sessionId).catch(() => {});
+    }
     abortRef.current?.abort();
-  }, []);
+  }, [selectedAgent, sessionId]);
   const invalidateStream = useCallback(() => {
     streamGenerationRef.current++;
     abortRef.current?.abort();
@@ -585,8 +589,7 @@ function ToolCallGroup({ msg }: { msg: ChatMessage }) {
                     <span className="text-muted-foreground/50 font-mono truncate flex-1 text-left text-[11px]">
                       {(() => {
                         try {
-                          const args = JSON.parse(tc.arguments);
-                          return Object.values(args).join(", ");
+                          return formatToolSummary(tc.arguments, tc.name);
                         } catch {
                           return tc.arguments;
                         }

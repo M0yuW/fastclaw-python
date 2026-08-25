@@ -150,6 +150,12 @@ class ChatRequest(ProviderModel):
     thinking_budget_tokens: int | None = Field(default=None, gt=0)
 
 
+class NativeCompactionResult(ProviderModel):
+    messages: tuple[ChatMessage, ...]
+    state: dict[str, JsonValue] = Field(default_factory=dict)
+    strategy: str
+
+
 class ChatResponse(ProviderModel):
     content: str = ""
     tool_calls: tuple[ToolCall, ...] = ()

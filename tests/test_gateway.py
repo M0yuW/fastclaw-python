@@ -23,6 +23,7 @@ from fastclaw.storage import (
     AgentRecord,
     APIKeyRecord,
     Database,
+    SessionContextSnapshotRecord,
     SessionRecord,
     UnitOfWork,
     UserRecord,
@@ -117,10 +118,11 @@ async def test_team_api_is_idempotent_and_enforces_lifecycle(tmp_path: Path) -> 
             "details": {},
         }
         assert football_preview.json()["checks"]["tools"]["required"] == [
+            "football_context",
             "football_data",
             "football_ledger",
+            "football_odds",
             "spawn_subagent",
-            "web_fetch",
         ]
         preview = await client.post(
             "/api/agent-teams/preview",
@@ -658,6 +660,20 @@ async def test_chat_stream_and_history_use_configured_provider(tmp_path: Path) -
         assert messages[-1]["content"] == "hello world"
 
 
+async def test_chat_stop_is_scoped_to_authenticated_agent_and_session(tmp_path: Path) -> None:
+    async with gateway_client(tmp_path / "chat-stop.db") as (client, _database, _app):
+        created = await onboard(client)
+        await login(client)
+
+        stopped = await client.post(
+            "/api/chat/stop",
+            json={"agentId": created["agentId"], "sessionId": "no-active-run"},
+        )
+
+        assert stopped.status_code == 200
+        assert stopped.json() == {"ok": True, "cancelled": False, "count": 0}
+
+
 async def test_admin_act_as_is_tenant_scoped_and_read_only(tmp_path: Path) -> None:
     async with gateway_client(tmp_path / "admin.db") as (client, database, _app):
         created = await onboard(client)
@@ -787,6 +803,28 @@ async def test_session_management_config_and_unsupported_envelopes(tmp_path: Pat
                     updated_at=now,
                 )
             )
+            await unit.require_store().save_session_context_snapshot(
+                SessionContextSnapshotRecord(
+                    id="snapshot-1",
+                    user_id=created["userId"],
+                    agent_id=created["agentId"],
+                    session_key="session-1",
+                    generation=1,
+                    mode="shadow",
+                    status="ready",
+                    profile="generic",
+                    strategy="client",
+                    metrics={
+                        "beforeTokens": 100,
+                        "afterTokens": 20,
+                        "beforeBytes": 400,
+                        "afterBytes": 80,
+                        "savingsRatio": 0.8,
+                        "compactedMessages": 8,
+                        "retainedMessages": 3,
+                    },
+                )
+            )
         await login(client)
 
         renamed = await client.put(
@@ -794,6 +832,10 @@ async def test_session_management_config_and_unsupported_envelopes(tmp_path: Pat
             json={"agentId": created["agentId"], "title": "Renamed"},
         )
         sessions = await client.get("/api/chat/sessions", params={"agentId": created["agentId"]})
+        context_status = await client.get(
+            "/api/chat/context-status",
+            params={"agentId": created["agentId"], "sessionId": "session-1"},
+        )
         safe_config = await client.post(
             "/api/config", json={"agents": {"defaults": {"maxTokens": 2048}}}
         )
@@ -813,6 +855,8 @@ async def test_session_management_config_and_unsupported_envelopes(tmp_path: Pat
         )
 
         assert renamed.json() == {"ok": True}
+        assert context_status.json()["savingsRatio"] == 0.8
+        assert context_status.json()["before"] == {"tokens": 100, "bytes": 400}
         assert sessions.json()["sessions"][0]["title"] == "Renamed"
         assert safe_config.json() == {"ok": True}
         assert leaked_config.status_code == 400

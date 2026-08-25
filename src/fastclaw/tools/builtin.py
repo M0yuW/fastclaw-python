@@ -291,18 +291,24 @@ class ExecTool:
 
 
 class WebFetchTool:
+    _RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
     def __init__(
         self,
         client: httpx.AsyncClient,
         *,
         max_bytes: int = 1_000_000,
         max_redirects: int = 5,
+        max_retries: int = 2,
         resolver: HostResolver | None = None,
+        blocked_hosts: frozenset[str] = frozenset(),
     ) -> None:
         self._client = client
         self._max_bytes = max_bytes
         self._max_redirects = max_redirects
+        self._max_retries = max(0, max_retries)
         self._resolver = resolver or self._resolve_host
+        self._blocked_hosts = frozenset(host.casefold().strip(".") for host in blocked_hosts)
         self.definition = ToolDefinition(
             function=ToolFunction(
                 name="web_fetch",
@@ -318,11 +324,13 @@ class WebFetchTool:
     async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
         del context
         url = str(arguments["url"])
+        retry_index = 0
         for redirect_index in range(self._max_redirects + 1):
             target, denial = await self._validate_public_url(url)
             if denial:
                 return ToolResult(content=denial, is_error=True)
             assert target is not None
+            retry_delay: float | None = None
             with pinned_network_target(target.host, target.port, target.addresses):
                 async with self._client.stream("GET", url, follow_redirects=False) as response:
                     if response.is_redirect:
@@ -333,15 +341,52 @@ class WebFetchTool:
                             return ToolResult(content="redirect limit exceeded", is_error=True)
                         url = urljoin(str(response.url), location)
                         continue
-                    response.raise_for_status()
-                    body = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        remaining = self._max_bytes - len(body)
-                        body.extend(chunk[:remaining])
-                        if len(chunk) > remaining:
-                            return ToolResult(content="response exceeds size limit", is_error=True)
-                    return ToolResult(content=body.decode(errors="replace"))
+                    if response.status_code in self._RETRYABLE_STATUS_CODES:
+                        if retry_index < self._max_retries:
+                            retry_delay = self._retry_delay(response, retry_index)
+                        else:
+                            return self._http_error(response, target.host)
+                    elif not response.is_success:
+                        return self._http_error(response, target.host)
+                    if retry_delay is not None:
+                        retry_index += 1
+                    else:
+                        retry_index = 0
+                        body = bytearray()
+                        async for chunk in response.aiter_bytes():
+                            remaining = self._max_bytes - len(body)
+                            body.extend(chunk[:remaining])
+                            if len(chunk) > remaining:
+                                return ToolResult(
+                                    content="response exceeds size limit", is_error=True
+                                )
+                        return ToolResult(content=body.decode(errors="replace"))
+            if retry_delay is not None:
+                await asyncio.sleep(retry_delay)
+                continue
         raise AssertionError("redirect loop terminated unexpectedly")
+
+    @classmethod
+    def _retry_delay(cls, response: httpx.Response, retry_index: int) -> float:
+        retry_after = response.headers.get("retry-after", "").strip()
+        try:
+            return min(5.0, max(0.0, float(retry_after)))
+        except ValueError:
+            return min(2.0, 0.5 * (2**retry_index))
+
+    @staticmethod
+    def _http_error(response: httpx.Response, host: str) -> ToolResult:
+        status = response.status_code
+        retryable = status in WebFetchTool._RETRYABLE_STATUS_CODES
+        return ToolResult(
+            content=f"HTTP {status} from {host}",
+            is_error=True,
+            metadata={
+                "errorCode": f"web_http_{status}",
+                "httpStatus": status,
+                "retryable": retryable,
+            },
+        )
 
     async def _validate_public_url(self, url: str) -> tuple[_PublicTarget | None, str]:
         parsed = urlsplit(url)
@@ -351,6 +396,12 @@ class WebFetchTool:
             return None, "URL credentials are denied"
         if parsed.hostname is None:
             return None, "URL host is required"
+        hostname = parsed.hostname.casefold().strip(".")
+        if any(
+            hostname == blocked or hostname.endswith(f".{blocked}")
+            for blocked in self._blocked_hosts
+        ):
+            return None, "URL host is denied for this Agent role"
         try:
             port = parsed.port or (443 if parsed.scheme == "https" else 80)
         except ValueError:

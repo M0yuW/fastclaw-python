@@ -26,6 +26,22 @@ def _load_espn_script() -> ModuleType:
     return module
 
 
+def _load_ledger_report_script() -> ModuleType:
+    script = (
+        Path(__file__).parents[1]
+        / "skills"
+        / "match-data-toolkit"
+        / "scripts"
+        / "ledger_report.py"
+    )
+    spec = importlib.util.spec_from_file_location("bundled_ledger_report", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_bundled_espn_script_matches_runtime_competition_catalog() -> None:
     module = _load_espn_script()
     script_mappings = {
@@ -36,6 +52,30 @@ def test_bundled_espn_script_matches_runtime_competition_catalog() -> None:
     assert script_mappings == runtime_mappings
     assert module.resolve_competition("瑞典超")["espn_slug"] == "swe.1"
     assert module.resolve_competition("swe.2") is None
+
+
+def test_bundled_ledger_report_is_fixed_markdown_not_json() -> None:
+    module = _load_ledger_report_script()
+    rows = [
+        {
+            "competition": "荷甲",
+            "season": "2026-27",
+            "date": "2026-08-15",
+            "match": "球队 A vs 球队 B",
+            "our_pred": "球队 A",
+            "our_confidence": "medium",
+        }
+    ]
+
+    report = module.render_report(rows, rows, "## 全量预测数据 1 行")
+
+    assert "统计: 总计 1 行; 已结算 0; 待结算 1; 命中 0; 未中 0; 命中率 0.0%。" in report
+    assert (
+        "| # | 赛事 | 赛季 | 日期 | 比赛 | 1X2预测 | 信心 | 比分 | "
+        "半全场 | 实际 | 比分 | 状态 |"
+    ) in report
+    assert "| 1 | 荷甲 | 2026-27 | 08-15 | 球队 A vs 球队 B | 球队 A | medium |" in report
+    assert not report.lstrip().startswith(("[", "{"))
 
 
 def test_bundled_espn_script_uses_mapping_and_rejects_response_mismatch() -> None:

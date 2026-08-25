@@ -51,7 +51,13 @@ class RuntimeShutdownError(RuntimeError):
 
 
 def _default_http_client() -> httpx.AsyncClient:
-    return httpx.AsyncClient(timeout=httpx.Timeout(30.0))
+    # Reasoning models can legitimately take longer than 30 seconds before the
+    # first SSE data frame, especially for coordinator turns with several tool
+    # calls. Keep connection/write/pool failures fast while allowing a longer
+    # interval between streamed response frames.
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=30.0, read=180.0, write=30.0, pool=30.0)
+    )
 
 
 class Runtime:

@@ -24,6 +24,7 @@ OVERLAY_PATHS = {
     "package.json",
     "pnpm-lock.yaml",
     "src/app/agents/[id]/chat/page.tsx",
+    "src/app/chat/page.tsx",
     "src/app/agents/[id]/skills/page.tsx",
     "src/app/agents/page.tsx",
     "src/app/skills/page.tsx",

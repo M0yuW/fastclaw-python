@@ -19,11 +19,13 @@ will coordinate remediation and disclosure with the reporter.
 
 Provider API keys are encrypted with AES-GCM and bound to their stable config
 record ID. The database contains only versioned ciphertext. The master key is
-loaded from `FASTCLAW_MASTER_KEY` or a data-root `master.key` file restricted to
-mode `0600`; it must never be committed or stored beside database backups.
-Browser/API responses contain only masked credentials, and production browser
-traffic must use HTTPS. Environment-provided Provider keys override stored
-credentials without copying them into the database.
+loaded from `FASTCLAW_MASTER_KEY` or a data-root `master.key` file. POSIX hosts
+restrict the file to mode `0600`; Windows stores a current-user DPAPI-protected
+payload and does not treat POSIX mode bits as an ACL. A DPAPI key file is not
+portable to another Windows account or device, so cross-device deployments must
+share `FASTCLAW_MASTER_KEY` through a secret manager. The key must never be
+committed or stored beside database backups. Browser/API responses contain only
+masked credentials, and production browser traffic must use HTTPS.
 
 ## Outbound web fetch policy
 

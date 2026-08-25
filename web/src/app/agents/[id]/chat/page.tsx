@@ -3,8 +3,9 @@
 import { useEffect, useState, useRef, useCallback, useId, useMemo } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Button } from "@/components/ui/button";
-import { getAgent, getChatHistory, getChatSessions, listAgentFiles, renameChatSession, sendChatStream, uploadAgentFiles, getAuthToken, getSkills, type ChatHistoryMessage, type SkillInfo, type ToolResultMetadata } from "@/lib/api";
+import { getAgent, getChatContextStatus, getChatHistory, getChatSessions, listAgentFiles, renameChatSession, sendChatStream, stopChat, uploadAgentFiles, getAuthToken, getSkills, type ChatContextStatus, type ChatHistoryMessage, type SkillInfo, type ToolResultMetadata } from "@/lib/api";
 import { createChatStreamBatcher, reduceChatStreamEvents, type StreamMessage } from "@/lib/chat-stream";
+import { formatToolSummary } from "@/lib/tool-summary";
 import { useAgentIdFromURL } from "@/hooks/use-agent-id";
 import { Bot, Send, Copy, Check, Pencil, Wrench, ChevronDown, ChevronRight, Download, X, File, FileText, Image as ImageIcon, FileCode, Film, Music, Puzzle, SlidersHorizontal, ShieldCheck, Paperclip, Square } from "lucide-react";
 import Image from "next/image";
@@ -281,6 +282,7 @@ export default function AgentChatPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [contextStatus, setContextStatus] = useState<ChatContextStatus | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const currentSession = sessions.find((session) => session.id === sessionId);
   const sessionTitle = currentSession?.title || currentSession?.preview || "";
@@ -312,8 +314,11 @@ export default function AgentChatPage() {
   const sessionsGenerationRef = useRef(0);
 
   const abortStream = useCallback(() => {
+    if (selectedAgent && sessionId) {
+      void stopChat(selectedAgent, sessionId).catch(() => {});
+    }
     abortRef.current?.abort();
-  }, []);
+  }, [selectedAgent, sessionId]);
   const invalidateStream = useCallback(() => {
     streamGenerationRef.current++;
     abortRef.current?.abort();
@@ -493,13 +498,16 @@ export default function AgentChatPage() {
   // sidebar toggle). Re-fires whenever the title changes.
   const headerSlot = useMemo(
     () => (
-      <ChatHeaderTitle
-        title={sessionTitle}
-        fallback={`Chat with ${agentName || selectedAgent}`}
-        onSave={handleRenameTitle}
-      />
+      <div className="flex min-w-0 items-center gap-2">
+        <ChatHeaderTitle
+          title={sessionTitle}
+          fallback={`Chat with ${agentName || selectedAgent}`}
+          onSave={handleRenameTitle}
+        />
+        <ContextStatusBadge status={contextStatus} />
+      </div>
     ),
-    [sessionTitle, agentName, selectedAgent, handleRenameTitle],
+    [sessionTitle, agentName, selectedAgent, handleRenameTitle, contextStatus],
   );
   usePageHeader(headerSlot, [headerSlot]);
 
@@ -542,6 +550,13 @@ export default function AgentChatPage() {
       })
       .catch(() => {
         if (!controller.signal.aborted) setMessages([]);
+      });
+    getChatContextStatus(selectedAgent, sessionId, controller.signal)
+      .then((status) => {
+        if (!controller.signal.aborted) setContextStatus(status);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setContextStatus(null);
       });
     return () => {
       if (historyAbortRef.current === controller) historyAbortRef.current = null;
@@ -793,6 +808,9 @@ export default function AgentChatPage() {
         });
       }
       loadSessions(selectedAgent);
+      getChatContextStatus(selectedAgent, sessionId)
+        .then(setContextStatus)
+        .catch(() => setContextStatus(null));
       // First-turn of a brand-new session just got persisted — tell the
       // global sidebar to refetch its Chats list so the new title shows
       // up without a full page reload.
@@ -1369,6 +1387,50 @@ function ChatHeaderTitle({ title, fallback, onSave }: ChatHeaderTitleProps) {
   );
 }
 
+function ContextStatusBadge({ status }: { status: ChatContextStatus | null }) {
+  const [open, setOpen] = useState(false);
+  if (!status) return null;
+  const percent = Math.max(0, Math.round(status.savingsRatio * 100));
+  const label =
+    status.status === "not_triggered"
+      ? "未触发"
+      : status.status === "failed"
+        ? "压缩失败"
+        : status.status === "degraded"
+          ? "压缩降级"
+          : status.mode === "shadow"
+            ? `影子压缩 · ${percent}%`
+            : `已压缩 · ${percent}%`;
+  const tone =
+    status.status === "failed"
+      ? "border-red-500/40 text-red-600"
+      : status.status === "degraded"
+        ? "border-amber-500/40 text-amber-600"
+        : "border-border text-muted-foreground";
+  return (
+    <div className="relative shrink-0">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        className={`rounded-full border px-2 py-0.5 text-[11px] ${tone}`}
+        aria-expanded={open}
+      >
+        {label}
+      </button>
+      {open && (
+        <div className="absolute left-0 top-7 z-50 w-64 rounded-lg border bg-popover p-3 text-xs text-popover-foreground shadow-lg">
+          <div>策略：{status.strategy} / {status.profile}</div>
+          <div>体积：{status.before.bytes.toLocaleString()} → {status.after.bytes.toLocaleString()} bytes</div>
+          <div>估算：{status.before.tokens.toLocaleString()} → {status.after.tokens.toLocaleString()} tokens</div>
+          <div>消息：压缩 {status.compactedMessages}，保留 {status.retainedMessages}</div>
+          {status.lastCompactedAt && <div>时间：{new Date(status.lastCompactedAt).toLocaleString()}</div>}
+          {status.failureCode && <div className="mt-1 text-red-600">原因：{status.failureCode}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Renders a group of tool calls as a collapsible summary. */
 function ToolCallGroup({ msg, surfacedSrcs, agentId, sessionId }: { msg: ChatMessage; surfacedSrcs?: ReadonlySet<string>; agentId: string; sessionId: string }) {
   const [groupOpen, setGroupOpen] = useState(false);
@@ -1459,8 +1521,7 @@ function ToolCallGroup({ msg, surfacedSrcs, agentId, sessionId }: { msg: ChatMes
                     <span className="text-muted-foreground/50 font-mono truncate flex-1 text-left text-[11px]">
                       {(() => {
                         try {
-                          const args = JSON.parse(tc.arguments);
-                          return Object.values(args).join(", ");
+                          return formatToolSummary(tc.arguments, tc.name);
                         } catch {
                           return tc.arguments;
                         }
@@ -1488,9 +1549,25 @@ function ToolCallGroup({ msg, surfacedSrcs, agentId, sessionId }: { msg: ChatMes
                           <p className={`text-[10px] font-medium uppercase mb-1 ${tc.isError ? "text-red-500" : "text-muted-foreground"}`}>
                             {tc.isError ? "Error" : "Output"}
                           </p>
-                          <pre className={`text-xs font-mono rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-60 ${tc.isError ? "bg-red-500/10 text-red-700 dark:text-red-300" : "bg-muted/50"}`}>
-                            {tc.result.length > 2000 ? tc.result.slice(0, 2000) + "..." : tc.result}
-                          </pre>
+                          {tc.name === "football_ledger" ||
+                          tc.name === "ledger_report" ||
+                          tc.result.includes("| # | 赛事 |") ? (
+                            <div className="chat-markdown max-w-full overflow-x-auto rounded bg-muted/50 p-2 text-xs">
+                              <ReactMarkdown
+                                remarkPlugins={[remarkGfm]}
+                                components={chatMarkdownComponents}
+                                urlTransform={makeUrlTransform(agentId, sessionId)}
+                              >
+                                {tc.result.length > 12000
+                                  ? `${tc.result.slice(0, 12000)}...`
+                                  : tc.result}
+                              </ReactMarkdown>
+                            </div>
+                          ) : (
+                            <pre className={`text-xs font-mono rounded p-2 overflow-x-auto whitespace-pre-wrap break-all max-h-60 ${tc.isError ? "bg-red-500/10 text-red-700 dark:text-red-300" : "bg-muted/50"}`}>
+                              {tc.result.length > 2000 ? tc.result.slice(0, 2000) + "..." : tc.result}
+                            </pre>
+                          )}
                         </div>
                       ) : (
                         <p className="text-xs text-muted-foreground/60 italic">Executing...</p>

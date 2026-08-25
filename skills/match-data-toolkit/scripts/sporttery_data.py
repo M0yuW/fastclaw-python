@@ -12,12 +12,17 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import urllib.parse
-import urllib.request
+from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common.http_fetch import fetch_json
 
 API_URL = "https://webapi.sporttery.cn/gateway/uniform/football/getMatchCalculatorV1.qry?channel=c"
 REFERER = "https://m.sporttery.cn/mjc/jsq/zqspf/"
+
+# Total budget for the one call this script makes, retries included.
+REQUEST_TIMEOUT = 20.0
 
 ALIASES = {
     "colombia": "哥伦比亚",
@@ -42,16 +47,15 @@ def output_json(data: Any) -> None:
 
 
 def fetch_payload() -> dict[str, Any]:
-    req = urllib.request.Request(
+    return fetch_json(
         API_URL,
         headers={
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X) sporttery-ev/1.0",
             "Referer": REFERER,
             "Accept": "application/json,text/plain,*/*",
         },
+        timeout=REQUEST_TIMEOUT,
     )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode("utf-8"))
 
 
 def norm(s: str) -> str:

@@ -29,9 +29,10 @@ from fastclaw.tools import (
     WebFetchTool,
     WorldCupLedgerTool,
     WriteFileTool,
+    canonical_competition_display,
     resolve_football_competition,
 )
-from fastclaw.tools.football_data import EspnPublicFetcher
+from fastclaw.tools.football_data import EspnPublicFetcher, SportteryPublicFetcher
 
 
 class FixtureFetcher:
@@ -68,6 +69,16 @@ async def test_espn_fetcher_rejects_non_fixed_origin_without_starting_process() 
     assert "fixed soccer API origin" in result.content
 
 
+@pytest.mark.asyncio
+async def test_sporttery_fetcher_rejects_non_fixed_endpoint_without_process() -> None:
+    result = await SportteryPublicFetcher().execute(
+        {"url": "https://webapi.sporttery.cn/other"}, context()
+    )
+
+    assert result.is_error
+    assert result.metadata["errorCode"] == "sporttery_url_rejected"
+
+
 def test_football_competition_catalog_resolves_reviewed_aliases() -> None:
     sweden = resolve_football_competition("瑞典超", country="瑞典")
     champions_league = resolve_football_competition("UCL", country="Europe")
@@ -75,8 +86,33 @@ def test_football_competition_catalog_resolves_reviewed_aliases() -> None:
     assert sweden is not None and sweden.espn_slug == "swe.1"
     assert champions_league is not None
     assert champions_league.espn_slug == "uefa.champions"
+    assert champions_league.espn_qualifying_slug == "uefa.champions_qual"
+    assert champions_league.odds_sport_keys == (
+        "soccer_uefa_champs_league",
+        "soccer_uefa_champs_league_qualification",
+    )
+    assert (
+        resolve_football_competition("UEFA Champions League Qualification")
+        == champions_league
+    )
+    assert resolve_football_competition("欧冠附加赛") == champions_league
+    europa_league = resolve_football_competition("UEFA Europa League Qualifying")
+    assert europa_league is not None
+    assert europa_league.espn_qualifying_slug == "uefa.europa_qual"
+    assert resolve_football_competition("欧罗巴附加赛") == europa_league
+    assert (
+        resolve_football_competition("UEFA Europa League 欧联资格赛")
+        == europa_league
+    )
+    assert (
+        resolve_football_competition("UEFA Europa League 欧罗巴资格赛")
+        == europa_league
+    )
     assert len({item.espn_slug for item in FOOTBALL_COMPETITIONS}) == len(FOOTBALL_COMPETITIONS)
-    assert resolve_football_competition("瑞典超", country="挪威") is None
+    assert resolve_football_competition("瑞典超", country="挪威") == sweden
+    assert canonical_competition_display("English Premier League") == "英超"
+    assert canonical_competition_display("UEFA Champions League Qualification") == "欧冠"
+    assert canonical_competition_display("荷甲 Eredivisie") == "荷甲"
 
 
 @pytest.mark.asyncio
@@ -97,6 +133,34 @@ async def test_football_data_exposes_only_trusted_provider_mapping() -> None:
         "country": "Sweden",
         "espn_slug": "swe.1",
     }
+    assert rejected.is_error
+    assert fetcher.urls == []
+
+
+@pytest.mark.asyncio
+async def test_football_data_treats_team_country_as_advisory_for_unique_competition() -> None:
+    fetcher = FixtureFetcher({})
+    tool = FootballDataTool(fetcher, espn_fetcher=fetcher)
+
+    resolved = await tool.execute(
+        {
+            "action": "competition_resolve",
+            "competition": "UEFA Champions League",
+            "country": "Bulgaria",
+        },
+        context(),
+    )
+    rejected = await tool.execute(
+        {
+            "action": "competition_resolve",
+            "competition": "Not A Reviewed League",
+            "country": "Bulgaria",
+        },
+        context(),
+    )
+
+    assert not resolved.is_error
+    assert json.loads(resolved.content)["mapping"]["key"] == "uefa-champions-league"
     assert rejected.is_error
     assert fetcher.urls == []
 
@@ -258,7 +322,7 @@ async def test_football_data_resolves_non_world_cup_competition_and_schedule() -
 
 
 @pytest.mark.asyncio
-async def test_football_data_sporttery_match_is_not_world_cup_filtered() -> None:
+async def test_football_data_sporttery_match_is_ev_only() -> None:
     fetcher = FixtureFetcher(
         {
             "getMatchCalculatorV1": {
@@ -283,7 +347,7 @@ async def test_football_data_sporttery_match_is_not_world_cup_filtered() -> None
         }
     )
 
-    result = await FootballDataTool(fetcher).execute(
+    result = await FootballDataTool(fetcher, allow_sporttery=True).execute(
         {
             "action": "sporttery_match",
             "team_a": "Sirius",
@@ -295,6 +359,213 @@ async def test_football_data_sporttery_match_is_not_world_cup_filtered() -> None
     payload = json.loads(result.content)
     assert payload["competition"] == "瑞典超级联赛"
     assert payload["match_id"] == "swe-1"
+    assert payload["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_football_data_uses_dedicated_sporttery_fetcher() -> None:
+    primary = FixtureFetcher({})
+    sporttery = FixtureFetcher(
+        {
+            "getMatchCalculatorV1": {
+                "errorCode": "0",
+                "value": {
+                    "matchInfoList": [
+                        {
+                            "subMatchList": [
+                                {
+                                    "matchId": "laliga-1",
+                                    "leagueAbbName": "西甲",
+                                    "homeTeamAllName": "西班牙人",
+                                    "awayTeamAllName": "莱万特",
+                                    "had": {"h": "1.97", "d": "2.94", "a": "3.55"},
+                                }
+                            ]
+                        }
+                    ]
+                },
+            }
+        }
+    )
+    tool = FootballDataTool(
+        primary,
+        sporttery_fetcher=sporttery,
+        allow_sporttery=True,
+        role_mode="ev",
+    )
+    execution = context()
+    execution.shared_state.ev_requested = True
+
+    result = await tool.execute(
+        {"action": "sporttery_match", "team_a": "Espanyol", "team_b": "Levante"},
+        execution,
+    )
+
+    assert not result.is_error
+    assert json.loads(result.content)["match_id"] == "laliga-1"
+    assert primary.urls == []
+    assert len(sporttery.urls) == 1
+
+
+@pytest.mark.asyncio
+async def test_football_data_sporttery_matches_uel_english_to_chinese_names() -> None:
+    sporttery = FixtureFetcher(
+        {
+            "getMatchCalculatorV1": {
+                "errorCode": "0",
+                "value": {
+                    "matchInfoList": [
+                        {
+                            "subMatchList": [
+                                {
+                                    "matchId": 2040953,
+                                    "leagueAllName": "欧罗巴联赛",
+                                    "homeTeamAllName": "特拉布宗体育",
+                                    "homeTeamAbbName": "特拉布宗",
+                                    "awayTeamAllName": "费伦茨瓦罗斯",
+                                    "awayTeamAbbName": "费伦茨",
+                                    "had": {"h": "1.53", "d": "3.77", "a": "4.75"},
+                                }
+                            ]
+                        }
+                    ]
+                },
+            }
+        }
+    )
+    tool = FootballDataTool(
+        FixtureFetcher({}),
+        sporttery_fetcher=sporttery,
+        allow_sporttery=True,
+        role_mode="ev",
+    )
+    execution = context()
+    execution.shared_state.ev_requested = True
+
+    result = await tool.execute(
+        {
+            "action": "sporttery_match",
+            "team_a": "Trabzonspor",
+            "team_b": "Ferencvaros",
+        },
+        execution,
+    )
+
+    payload = json.loads(result.content)
+    assert payload["status"] == "success"
+    assert payload["match_id"] == 2040953
+    assert payload["had"] == {"h": "1.53", "d": "3.77", "a": "4.75"}
+
+
+@pytest.mark.asyncio
+async def test_odds_analyst_sporttery_route_requires_explicit_request() -> None:
+    sporttery = FixtureFetcher(
+        {
+            "getMatchCalculatorV1": {
+                "errorCode": "0",
+                "value": {
+                    "matchInfoList": [
+                        {
+                            "subMatchList": [
+                                {
+                                    "matchId": 2040953,
+                                    "homeTeamAllName": "特拉布宗体育",
+                                    "awayTeamAllName": "费伦茨瓦罗斯",
+                                    "had": {"h": "1.53", "d": "3.77", "a": "4.75"},
+                                }
+                            ]
+                        }
+                    ]
+                },
+            }
+        }
+    )
+    tool = FootballDataTool(
+        FixtureFetcher({}),
+        sporttery_fetcher=sporttery,
+        allow_sporttery=True,
+        role_mode="odds",
+    )
+    execution = context()
+
+    blocked = await tool.execute(
+        {
+            "action": "sporttery_match",
+            "team_a": "Trabzonspor",
+            "team_b": "Ferencvaros",
+        },
+        execution,
+    )
+    execution.shared_state.sporttery_requested = True
+    matched = await tool.execute(
+        {
+            "action": "sporttery_match",
+            "team_a": "Trabzonspor",
+            "team_b": "Ferencvaros",
+        },
+        execution,
+    )
+
+    assert blocked.is_error
+    assert "explicit Sporttery request" in blocked.content
+    assert json.loads(matched.content)["match_id"] == 2040953
+
+
+@pytest.mark.asyncio
+async def test_football_data_sporttery_reports_rejected_and_no_match() -> None:
+    rejected_fetcher = FixtureFetcher(
+        {"getMatchCalculatorV1": {"errorCode": "1001", "errorMessage": "rejected"}}
+    )
+    rejected_tool = FootballDataTool(
+        rejected_fetcher,
+        allow_sporttery=True,
+        role_mode="ev",
+    )
+    execution = context()
+    execution.shared_state.ev_requested = True
+
+    rejected = await rejected_tool.execute(
+        {"action": "sporttery_match", "team_a": "Espanyol", "team_b": "Levante"},
+        execution,
+    )
+
+    assert rejected.is_error
+    assert rejected.metadata["errorCode"] == "sporttery_business_rejected"
+
+    no_match_fetcher = FixtureFetcher(
+        {"getMatchCalculatorV1": {"errorCode": "0", "value": {"matchInfoList": []}}}
+    )
+    no_match_tool = FootballDataTool(
+        no_match_fetcher,
+        allow_sporttery=True,
+        role_mode="ev",
+    )
+    no_match = await no_match_tool.execute(
+        {"action": "sporttery_match", "team_a": "Espanyol", "team_b": "Levante"},
+        execution,
+    )
+
+    assert not no_match.is_error
+    assert json.loads(no_match.content)["status"] == "no_match"
+    assert no_match.metadata["status"] == "no_match"
+
+
+@pytest.mark.asyncio
+async def test_football_data_rejects_sporttery_for_non_ev_roles() -> None:
+    fetcher = FixtureFetcher({})
+
+    result = await FootballDataTool(fetcher).execute(
+        {
+            "action": "sporttery_match",
+            "team_a": "Sirius",
+            "team_b": "Brommapojkarna",
+        },
+        context(),
+    )
+
+    assert result.is_error
+    assert "EV analyst role" in result.content
+    assert fetcher.urls == []
 
 
 @pytest.mark.asyncio
@@ -340,7 +611,7 @@ async def test_worldcup_ledger_is_atomic_unique_and_reports_directly(tmp_path: P
     }
 
     appended = await tool.execute({"operation": "append", "entry": entry}, context())
-    with pytest.raises(ValueError, match="already contains"):
+    with pytest.raises(ValueError, match="ledger already contains this date and match"):
         await tool.execute({"operation": "append", "entry": entry}, context())
     settled = await tool.execute(
         {
@@ -376,18 +647,19 @@ async def test_football_ledger_scopes_entries_by_competition(tmp_path: Path) -> 
 
     await tool.execute({"operation": "append", "entry": premier_league}, context())
     await tool.execute({"operation": "append", "entry": fa_cup}, context())
-    with pytest.raises(ValueError, match="already contains"):
-        await tool.execute(
-            {
-                "operation": "append",
-                "entry": {
-                    **premier_league,
-                    "competition": " premier  league ",
-                    "match": "team a VS team b",
-                },
+    existing = await tool.execute(
+        {
+            "operation": "append",
+            "entry": {
+                **premier_league,
+                "competition": " premier  league ",
+                "match": "team a VS team b",
             },
-            context(),
-        )
+        },
+        context(),
+    )
+    assert existing.metadata["status"] == "existing_requires_update"
+    assert "operation=update" in existing.content
 
     await tool.execute(
         {
@@ -406,12 +678,364 @@ async def test_football_ledger_scopes_entries_by_competition(tmp_path: Path) -> 
     pending_report = await tool.execute({"operation": "report", "pending_only": True}, context())
 
     assert premier_report.direct_return is True
-    assert "Premier League" in premier_report.content
+    assert "## 全量预测数据 1 行" in premier_report.content
+    assert (
+        "| # | 赛事 | 赛季 | 日期 | 比赛 | 1X2预测 | 信心 | 比分 | "
+        "半全场 | 实际 | 比分 | 状态 |"
+    ) in premier_report.content
+    assert (
+        "| 1 | 英超 | 2026/27 | 08-15 | Team A vs Team B | Team A | mid |"
+        in premier_report.content
+    )
+    assert "Premier League" not in premier_report.content
     assert "FA Cup" not in premier_report.content
     assert "1-1" in premier_report.content
     assert "FA Cup" in pending_report.content
     assert "Premier League" not in pending_report.content
     assert (tmp_path / "workspaces" / "agent-1" / "football" / "ledger.json").is_file()
+
+
+@pytest.mark.asyncio
+async def test_football_ledger_updates_existing_prediction_in_place(tmp_path: Path) -> None:
+    tool = FootballLedgerTool(tmp_path)
+    entry = {
+        "competition": "荷甲 Eredivisie",
+        "season": "2026-27",
+        "date": "2026-08-15",
+        "match": "SBV精英 vs 埃因霍温",
+        "our_pred": "主胜 精英",
+        "our_confidence": "low",
+        "notes": "首轮样本",
+    }
+    await tool.execute({"operation": "append", "entry": entry}, context())
+
+    updated = await tool.execute(
+        {
+            "operation": "update",
+            "entry": {
+                "competition": " 荷甲  Eredivisie ",
+                "date": "2026-08-15",
+                "match": "SBV精英 VS 埃因霍温",
+                "our_pred": "客胜 埃因霍温",
+                "our_confidence": "medium",
+                "notes": "The Odds API: PSV客胜去水约65%",
+            },
+        },
+        context(),
+    )
+
+    assert updated.content == "prediction updated"
+    assert updated.metadata["status"] == "updated"
+    report = await tool.execute(
+        {"operation": "report", "competition": "荷甲 Eredivisie"}, context()
+    )
+    assert "客胜 埃因霍温" in report.content
+    assert "主胜 精英" not in report.content
+    assert "首轮样本" not in report.content
+
+
+@pytest.mark.asyncio
+async def test_football_ledger_updates_legacy_team_ids_and_bilingual_competition_alias(
+    tmp_path: Path,
+) -> None:
+    tool = FootballLedgerTool(tmp_path)
+    ledger = tmp_path / "workspaces" / "agent-1" / "football" / "ledger.json"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text(
+        json.dumps(
+            [
+                {
+                    "competition": "UEFA Europa League 欧罗巴资格赛",
+                    "season": "2026-2027",
+                    "date": "2026-08-20",
+                    "match": "凯拉特 vs 安德莱赫特",
+                    "home_canonical_id": "凯拉特",
+                    "away_canonical_id": "安德莱赫特",
+                    "our_pred": "away win",
+                    "our_confidence": "medium",
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    updated = await tool.execute(
+        {
+            "operation": "update",
+            "entry": {
+                "competition": "UEFA Europa League 欧联资格赛",
+                "date": "2026-08-20",
+                "match": "凯拉特 vs 安德莱赫特",
+                "our_score_pred": "0-2",
+                "ht_score_pred": "0-1",
+                "ft_score_pred": "0-2",
+                "ht_ft_pred": "负/负",
+            },
+        },
+        context(),
+    )
+
+    assert updated.content == "prediction updated"
+    assert updated.metadata["status"] == "updated"
+    stored = json.loads(ledger.read_text(encoding="utf-8"))
+    assert stored[0]["our_score_pred"] == "0-2"
+
+
+@pytest.mark.asyncio
+async def test_football_ledger_returns_structured_update_key_mismatch(tmp_path: Path) -> None:
+    tool = FootballLedgerTool(tmp_path)
+
+    result = await tool.execute(
+        {
+            "operation": "update",
+            "entry": {
+                "competition": "UEFA Europa League",
+                "date": "2026-08-20",
+                "match": "Missing A vs Missing B",
+                "our_score_pred": "1-0",
+            },
+        },
+        context(),
+    )
+
+    assert result.is_error
+    assert result.metadata["errorCode"] == "ledger_update_key_mismatch"
+    assert "do not retry unchanged" in result.content
+
+
+def test_football_ledger_coalesces_competition_and_team_aliases() -> None:
+    rows = [
+        {
+            "competition": "西甲 La Liga",
+            "season": "2026-27",
+            "date": "2026-08-15",
+            "match": "Deportivo Alavés vs Getafe",
+            "our_pred": "主胜",
+            "our_confidence": "low",
+            "notes": "基础分析",
+        },
+        {
+            "competition": "西甲",
+            "season": "2026-27",
+            "date": "2026-08-15",
+            "match": "阿拉维斯 vs 赫塔费",
+            "our_pred": "无明确方向",
+            "our_confidence": "low",
+            "notes": "赔率无匹配",
+        },
+    ]
+
+    merged, count = FootballLedgerTool.coalesce_rows(rows)
+
+    assert count == 1
+    assert len(merged) == 1
+    assert merged[0]["competition"] == "西甲 La Liga"
+    assert merged[0]["our_pred"] == "无明确方向"
+    assert "旧预测: 主胜" in merged[0]["notes"]
+    assert "旧备注: 基础分析" in merged[0]["notes"]
+
+
+@pytest.mark.asyncio
+async def test_football_ledger_alias_append_requires_update(tmp_path: Path) -> None:
+    tool = FootballLedgerTool(tmp_path)
+    await tool.execute(
+        {
+            "operation": "append",
+            "entry": {
+                "competition": "西甲 La Liga",
+                "date": "2026-08-15",
+                "season": "2026-27",
+                "match": "Deportivo Alavés vs Getafe",
+                "our_pred": "主胜",
+                "our_confidence": "low",
+            },
+        },
+        context(),
+    )
+
+    duplicate = await tool.execute(
+        {
+            "operation": "append",
+            "entry": {
+                "competition": "西甲",
+                "date": "2026-08-15",
+                "season": "2026-27",
+                "match": "阿拉维斯 vs 赫塔费",
+                "our_pred": "客胜",
+                "our_confidence": "medium",
+            },
+        },
+        context(),
+    )
+
+    assert duplicate.metadata["status"] == "existing_requires_update"
+
+
+@pytest.mark.asyncio
+async def test_football_ledger_normalizes_model_append_aliases(tmp_path: Path) -> None:
+    tool = FootballLedgerTool(tmp_path)
+
+    result = await tool.execute(
+        {
+            "operation": "append",
+            "competition": "西甲 La Liga",
+            "season": "2026-27",
+            "date": "2026-08-15",
+            "match": "塞维利亚 vs 巴列卡诺",
+            "entry": {
+                "prediction": "塞维利亚不败(1X)",
+                "confidence": "low",
+                "basis": "market calibration",
+            },
+        },
+        context(),
+    )
+
+    assert result.content == "prediction appended"
+    rows = json.loads(
+        (tmp_path / "workspaces" / "agent-1" / "football" / "ledger.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert rows[0]["competition"] == "西甲"
+    assert rows[0]["our_pred"] == "塞维利亚不败(1X)"
+    assert rows[0]["our_confidence"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_football_ledger_normalizes_htft_shorthand_and_competition_display(
+    tmp_path: Path,
+) -> None:
+    tool = FootballLedgerTool(tmp_path)
+    result = await tool.execute(
+        {
+            "operation": "append",
+            "entry": {
+                "competition": "UEFA Champions League Qualification",
+                "season": "2026-27",
+                "date": "2026-08-22",
+                "match": "Hull City vs Manchester United",
+                "our_pred": "客胜",
+                "our_confidence": "low",
+                "our_score_pred": "0-2",
+                "ht_score_pred": "0-1",
+                "ft_score_pred": "0-2",
+                "ht_ft_pred": "客/客",
+            },
+        },
+        context(),
+    )
+
+    assert result.content == "prediction appended"
+    ledger = tmp_path / "workspaces" / "agent-1" / "football" / "ledger.json"
+    stored = json.loads(ledger.read_text(encoding="utf-8"))[0]
+    assert stored["competition"] == "欧冠"
+    assert stored["ht_ft_pred"] == "负/负"
+    report = await tool.execute({"operation": "report"}, context())
+    assert "欧冠" in report.content
+    assert "HT 0-1 / FT 0-2 / 负/负" in report.content
+    assert "客/客" not in report.content
+
+
+@pytest.mark.asyncio
+async def test_football_ledger_report_marks_pending_and_settled_rows(tmp_path: Path) -> None:
+    tool = FootballLedgerTool(tmp_path)
+    await tool.execute(
+        {
+            "operation": "append",
+            "entry": {
+                "competition": "荷甲",
+                "season": "2026-27",
+                "date": "2026-08-15",
+                "match": "球队 A vs 球队 B",
+                "our_pred": "球队 A",
+                "our_confidence": "medium",
+                "our_score_pred": "1-0",
+            },
+        },
+        context(),
+    )
+    await tool.execute(
+        {
+            "operation": "append",
+            "entry": {
+                "competition": "荷甲",
+                "season": "2026-27",
+                "date": "2026-08-16",
+                "match": "球队 C vs 球队 D",
+                "our_pred": "球队 D",
+                "our_confidence": "low",
+            },
+        },
+        context(),
+    )
+    await tool.execute(
+        {
+            "operation": "settle",
+            "competition": "荷甲",
+            "date": "2026-08-15",
+            "match": "球队 A vs 球队 B",
+            "actual_result": "球队 A",
+            "actual_score": "1-0",
+        },
+        context(),
+    )
+
+    report = await tool.execute({"operation": "report", "competition": "荷甲"}, context())
+
+    assert "统计: 总计 2 行; 已结算 1; 待结算 1; 命中 1; 未中 0; 命中率 100.0%。" in report.content
+    assert (
+        "| 1 | 荷甲 | 2026-27 | 08-15 | 球队 A vs 球队 B | 球队 A | medium | 1-0 | — | "
+        "球队 A | 1-0 | ✅ |"
+    ) in report.content
+    assert (
+        "| 2 | 荷甲 | 2026-27 | 08-16 | 球队 C vs 球队 D | 球队 D | low | — | — | — | "
+        "— | ⏳ |"
+    ) in report.content
+    assert not report.content.lstrip().startswith("[")
+    assert not report.content.lstrip().startswith("{")
+
+
+@pytest.mark.asyncio
+async def test_football_ledger_settle_accepts_short_dates_and_provider_aliases(
+    tmp_path: Path,
+) -> None:
+    tool = FootballLedgerTool(tmp_path)
+    await tool.execute(
+        {
+            "operation": "append",
+            "entry": {
+                "competition": "荷甲 Eredivisie",
+                "season": "2026-27",
+                "date": "2026-08-15",
+                "match": "威廉二世 vs 奈梅亨",
+                "our_pred": "客胜 奈梅亨",
+                "our_confidence": "medium",
+            },
+        },
+        context(),
+    )
+
+    settled = await tool.execute(
+        {
+            "operation": "settle",
+            "entry": {
+                "competition": "Dutch Eredivisie",
+                "date": "08-15",
+                "match": "Willem II vs NEC Nijmegen",
+                "actual_result": "客胜",
+                "actual_score": "1-4",
+            },
+        },
+        context(),
+    )
+
+    assert not settled.is_error
+    assert settled.metadata["status"] == "settled"
+    report = await tool.execute({"operation": "report"}, context())
+    assert "| 客胜 | 1-4 | ✅ |" in report.content
+    assert "命中 1; 未中 0; 命中率 100.0%" in report.content
 
 
 @pytest.mark.asyncio
@@ -439,6 +1063,51 @@ async def test_tool_policy_and_web_scheme_are_enforced() -> None:
     assert denied.is_error
     assert bad_scheme.is_error
     assert fetched.content == "fixture"
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_retries_rate_limited_provider() -> None:
+    attempts = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(429, headers={"retry-after": "0"}, request=request)
+        return httpx.Response(200, text="fixture", request=request)
+
+    async def resolver(host: str, port: int) -> Sequence[str]:
+        del host, port
+        return ("93.184.216.34",)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await WebFetchTool(client, resolver=resolver, max_retries=1).execute(
+            {"url": "https://www.thesportsdb.com/data"}, context()
+        )
+
+    assert not result.is_error
+    assert result.content == "fixture"
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_exposes_rate_limit_after_bounded_retries() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, request=request)
+
+    async def resolver(host: str, port: int) -> Sequence[str]:
+        del host, port
+        return ("93.184.216.34",)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await WebFetchTool(client, resolver=resolver, max_retries=0).execute(
+            {"url": "https://www.thesportsdb.com/data"}, context()
+        )
+
+    assert result.is_error
+    assert result.metadata["errorCode"] == "web_http_429"
+    assert result.metadata["httpStatus"] == 429
+    assert result.metadata["retryable"] is True
 
 
 @pytest.mark.asyncio
@@ -693,3 +1362,71 @@ async def test_exec_cancellation_kills_the_entire_process_group(tmp_path: Path) 
     process_group_id = int(process_group_file.read_text(encoding="utf-8"))
     with pytest.raises(ProcessLookupError):
         os.killpg(process_group_id, 0)
+
+
+@pytest.mark.asyncio
+async def test_football_ledger_validates_score_and_half_full_consistency(
+    tmp_path: Path,
+) -> None:
+    tool = FootballLedgerTool(tmp_path)
+    valid = {
+        "competition": "English Premier League",
+        "season": "2026-27",
+        "date": "2026-08-21",
+        "match": "Arsenal vs Coventry City",
+        "our_pred": "home win",
+        "our_confidence": "high",
+        "our_score_pred": "2-0",
+        "ht_score_pred": "0-0",
+        "ft_score_pred": "2-0",
+        "ht_ft_pred": "平/胜",
+    }
+
+    appended = await tool.execute({"operation": "append", "entry": valid}, context())
+    assert appended.content == "prediction appended"
+
+    with pytest.raises(ValueError, match="full-time score outcome must equal"):
+        await tool.execute(
+            {
+                "operation": "append",
+                "entry": {
+                    **valid,
+                    "date": "2026-08-22",
+                    "our_score_pred": "0-1",
+                    "ft_score_pred": "0-1",
+                    "ht_ft_pred": "平/负",
+                },
+            },
+            context(),
+        )
+
+    with pytest.raises(ValueError, match="half-time outcome must equal"):
+        await tool.execute(
+            {
+                "operation": "append",
+                "entry": {
+                    **valid,
+                    "date": "2026-08-23",
+                    "ht_ft_pred": "胜/胜",
+                },
+            },
+            context(),
+        )
+
+    with pytest.raises(ValueError, match="ft_score_pred must equal"):
+        await tool.execute(
+            {
+                "operation": "update",
+                "entry": {
+                    "competition": valid["competition"],
+                    "date": valid["date"],
+                    "match": valid["match"],
+                    "ft_score_pred": "3-0",
+                },
+            },
+            context(),
+        )
+
+    report = await tool.execute({"operation": "report"}, context())
+    assert "2-0" in report.content
+    assert "HT 0-0 / FT 2-0 / 平/胜" in report.content
