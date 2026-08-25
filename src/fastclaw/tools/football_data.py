@@ -34,6 +34,7 @@ from fastclaw.tools.football_shared import (
     FOOTBALL_EVIDENCE_SCHEMA_VERSION,
     FootballEvidenceCache,
     football_event_key,
+    football_fixture_state_key,
     get_football_evidence_cache,
     normalize_football_season,
 )
@@ -372,6 +373,15 @@ class FootballDataTool:
                         "team": {"type": "string"},
                         "team_a": {"type": "string"},
                         "team_b": {"type": "string"},
+                        "source": {
+                            "type": "string",
+                            "enum": ["auto", "thesportsdb", "espn"],
+                            "description": (
+                                "Results only: auto tries TheSportsDB and falls back to ESPN "
+                                "when the requested fixture is absent; espn forces the reviewed "
+                                "ESPN scoreboard source."
+                            ),
+                        },
                         "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                         "regions": {
                             "type": "array",
@@ -406,6 +416,25 @@ class FootballDataTool:
                 result = self._error(
                     "settlement review only permits football_data action=results; "
                     "base_evidence and evidence are forbidden"
+                )
+                context.shared_state.football_settlement_errors.append(result.content)
+                return result
+            if not (
+                str(arguments.get("team_a") or "").strip()
+                and str(arguments.get("team_b") or "").strip()
+            ):
+                result = ToolResult(
+                    content=json.dumps(
+                        {
+                            "error": (
+                                "settlement results require exact team_a and team_b; "
+                                "do not use a competition/date-only query for a ledger fixture"
+                            )
+                        },
+                        ensure_ascii=False,
+                    ),
+                    is_error=True,
+                    metadata={"errorCode": "football_settlement_target_required"},
                 )
                 context.shared_state.football_settlement_errors.append(result.content)
                 return result
@@ -465,7 +494,46 @@ class FootballDataTool:
                 )
             return await self._sporttery_match(arguments, context)
         if action == "base_evidence":
-            return await self._evidence(arguments, context, include_odds=False)
+            try:
+                return await self._evidence(arguments, context, include_odds=False)
+            except Exception:
+                # Registry will expose the tool exception to the coordinator,
+                # while the keyed state still records that this fixture became
+                # unavailable. Never convert an implementation/provider error
+                # into a misleading no_match observation.
+                competition = str(arguments.get("competition") or "")
+                season = normalize_football_season(str(arguments.get("season") or ""))
+                date = str(arguments.get("date") or "")
+                team_a = str(arguments.get("team_a") or "")
+                team_b = str(arguments.get("team_b") or "")
+                if all((competition, season, team_a, team_b)):
+                    failure = ToolResult(
+                        content=json.dumps(
+                            {
+                                "status": "unavailable",
+                                "fixture": None,
+                                "requested": {
+                                    "competition": competition,
+                                    "season": season,
+                                    "date": date or None,
+                                    "home": team_a,
+                                    "away": team_b,
+                                },
+                                "error": "football_data base_evidence execution failed",
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        is_error=True,
+                    )
+                    context.shared_state.publish_football_observation(
+                        football_fixture_state_key(
+                            competition, season, date, team_a, team_b
+                        ),
+                        "unavailable",
+                        failure.content,
+                    )
+                raise
         if action == "evidence":
             return await self._evidence(arguments, context, include_odds=self._role_mode != "data")
         return self._error("unsupported football_data action")
@@ -798,7 +866,13 @@ class FootballDataTool:
                     _cached_key, cached = cached_match
             if cached is not None:
                 if not cached.is_error:
-                    context.shared_state.publish_football_base(cache_key.value, cached.content)
+                    context.shared_state.publish_football_base(
+                        cache_key.value,
+                        cached.content,
+                        fixture_key=football_fixture_state_key(
+                            competition.name, season, date, team_a, team_b
+                        ),
+                    )
                     await self._cache.put_session_base(context.session_id, cache_key, cached)
                 return cached
 
@@ -845,9 +919,29 @@ class FootballDataTool:
                         sources=sources,
                         warnings=warnings,
                     )
-                    context.shared_state.publish_football_negative(result.content)
+                    self._publish_fixture_observation(
+                        context,
+                        "no_match",
+                        result,
+                        competition=competition,
+                        season=season,
+                        date=date,
+                        team_a=team_a,
+                        team_b=team_b,
+                    )
                     return result
-                return self._fail_closed(competition, sources, warnings)
+                result = self._fail_closed(competition, sources, warnings)
+                self._publish_fixture_observation(
+                    context,
+                    "unavailable",
+                    result,
+                    competition=competition,
+                    season=season,
+                    date=date,
+                    team_a=team_a,
+                    team_b=team_b,
+                )
+                return result
             fixture = fallback_fixture
             if not date:
                 date = str(fixture.get("date") or "")
@@ -872,7 +966,18 @@ class FootballDataTool:
                 schedule.status != "success"
                 or not isinstance(schedule.data, dict)
             ) and not competition.espn_qualifying_slug:
-                return self._fail_closed(competition, sources, warnings)
+                result = self._fail_closed(competition, sources, warnings)
+                self._publish_fixture_observation(
+                    context,
+                    "unavailable",
+                    result,
+                    competition=competition,
+                    season=season,
+                    date=date,
+                    team_a=team_a,
+                    team_b=team_b,
+                )
+                return result
             if schedule.status == "success" and isinstance(schedule.data, dict):
                 fixture = self._select_primary_fixture(
                     schedule.data,
@@ -933,9 +1038,31 @@ class FootballDataTool:
                         warnings.append("source_date_adjacent_to_requested_date")
                     warnings.append("primary_fixture_confirmed_by_espn_qualifying")
                 elif qualifier_match == "ambiguous":
-                    return self._fail_closed(competition, sources, warnings)
+                    result = self._fail_closed(competition, sources, warnings)
+                    self._publish_fixture_observation(
+                        context,
+                        "unavailable",
+                        result,
+                        competition=competition,
+                        season=season,
+                        date=date,
+                        team_a=team_a,
+                        team_b=team_b,
+                    )
+                    return result
                 elif qualifier_match == "unavailable":
-                    return self._fail_closed(competition, sources, warnings)
+                    result = self._fail_closed(competition, sources, warnings)
+                    self._publish_fixture_observation(
+                        context,
+                        "unavailable",
+                        result,
+                        competition=competition,
+                        season=season,
+                        date=date,
+                        team_a=team_a,
+                        team_b=team_b,
+                    )
+                    return result
             if fixture is None:
                 if season_schedule.status == "success" and isinstance(
                     season_schedule.data, dict
@@ -949,9 +1076,29 @@ class FootballDataTool:
                         sources=sources,
                         warnings=warnings,
                     )
-                    context.shared_state.publish_football_negative(result.content)
+                    self._publish_fixture_observation(
+                        context,
+                        "no_match",
+                        result,
+                        competition=competition,
+                        season=season,
+                        date=date,
+                        team_a=team_a,
+                        team_b=team_b,
+                    )
                     return result
-                return self._fail_closed(competition, sources, warnings)
+                result = self._fail_closed(competition, sources, warnings)
+                self._publish_fixture_observation(
+                    context,
+                    "unavailable",
+                    result,
+                    competition=competition,
+                    season=season,
+                    date=date,
+                    team_a=team_a,
+                    team_b=team_b,
+                )
+                return result
         cache_key = football_event_key(competition.name, season, date, team_a, team_b)
 
         if not league_id:
@@ -1093,7 +1240,13 @@ class FootballDataTool:
             )
             await self._cache.put("base", cache_key, result)
             await self._cache.put_session_base(context.session_id, cache_key, result)
-            context.shared_state.publish_football_base(cache_key.value, result.content)
+            context.shared_state.publish_football_base(
+                cache_key.value,
+                result.content,
+                fixture_key=football_fixture_state_key(
+                    competition.name, season, date, team_a, team_b
+                ),
+            )
             return result
 
         regions = tuple(str(value) for value in arguments.get("regions") or ("eu",))
@@ -2355,6 +2508,26 @@ class FootballDataTool:
         return None
 
     @staticmethod
+    def _publish_fixture_observation(
+        context: ExecutionContext,
+        status: str,
+        result: ToolResult,
+        *,
+        competition: FootballCompetition,
+        season: str,
+        date: str,
+        team_a: str,
+        team_b: str,
+    ) -> None:
+        context.shared_state.publish_football_observation(
+            football_fixture_state_key(
+                competition.name, season, date, team_a, team_b
+            ),
+            status,
+            result.content,
+        )
+
+    @staticmethod
     def _fail_closed(
         competition: FootballCompetition,
         sources: list[SourceResult],
@@ -2467,6 +2640,28 @@ class FootballDataTool:
         if trusted_error is not None:
             return trusted_error
         assert competition is not None
+        results_source = str(arguments.get("source") or "auto").strip().casefold()
+        if action == "results" and results_source not in {
+            "auto",
+            "thesportsdb",
+            "espn",
+        }:
+            return self._error(
+                "results source must be auto, thesportsdb, or espn"
+            )
+        if action == "results" and results_source == "espn":
+            return await self._espn_results(
+                competition,
+                arguments=arguments,
+                context=context,
+                primary_source=SourceResult(
+                    "thesportsdb:eventsday.php",
+                    "not_requested",
+                    error_code="explicit_espn_source",
+                    safe_reason="The caller explicitly selected ESPN for results",
+                ),
+                source_mode="explicit",
+            )
         league_id, source = await self._resolve_tsdb_league(competition, context)
         if not league_id:
             if action == "results":
@@ -2512,15 +2707,38 @@ class FootballDataTool:
                         for row in day_rows[:limit]
                         if isinstance(row, dict)
                     ]
-                    return self._success(
-                        {
-                            "source": "thesportsdb:eventsday.php",
-                            "action": action,
-                            "league_id": league_id,
-                            "date": date,
-                            "count": len(rows),
-                            "rows": rows,
-                        }
+                    rows = self._filter_result_rows(rows, arguments)
+                    if rows or not self._has_result_target(arguments):
+                        return self._success(
+                            {
+                                "source": "thesportsdb:eventsday.php",
+                                "action": action,
+                                "league_id": league_id,
+                                "date": date,
+                                "count": len(rows),
+                                "rows": rows,
+                            }
+                        )
+                    if results_source == "thesportsdb":
+                        return self._results_no_match(
+                            date=date,
+                            source="thesportsdb:eventsday.php",
+                            league_id=league_id,
+                            reason="requested fixture was absent from the primary day results",
+                        )
+                    return await self._espn_results(
+                        competition,
+                        arguments=arguments,
+                        context=context,
+                        primary_source=SourceResult(
+                            "thesportsdb:eventsday.php",
+                            "no_match",
+                            error_code="target_fixture_not_in_results",
+                            safe_reason=(
+                                "The primary day endpoint returned other fixtures but not "
+                                "the requested fixture"
+                            ),
+                        ),
                     )
             path = "eventsseason.php?" + urlencode({"id": league_id, "s": season})
             key = "events"
@@ -2532,6 +2750,18 @@ class FootballDataTool:
             key = "table"
         data, error = await self._get_json(f"{_SPORTS_DB}/{path}", context)
         if error is not None:
+            if action == "results" and results_source == "auto":
+                return await self._espn_results(
+                    competition,
+                    arguments=arguments,
+                    context=context,
+                    primary_source=SourceResult(
+                        f"thesportsdb:{path.split('?', 1)[0]}",
+                        "unavailable",
+                        error_code=str(error.metadata.get("errorCode") or "primary_results_error"),
+                        safe_reason="The primary results endpoint failed",
+                    ),
+                )
             return error
         raw_rows = data.get(key) or []
         rows = [
@@ -2539,7 +2769,26 @@ class FootballDataTool:
             for row in raw_rows[:limit]
             if isinstance(row, dict)
         ]
-        if action == "results" and not rows:
+        if action == "results":
+            rows = self._filter_result_rows(rows, arguments)
+            if rows:
+                return self._success(
+                    {
+                        "source": f"thesportsdb:{path.split('?', 1)[0]}",
+                        "action": action,
+                        "league_id": league_id,
+                        "date": str(arguments.get("date") or "") or None,
+                        "count": len(rows),
+                        "rows": rows,
+                    }
+                )
+            if results_source == "thesportsdb":
+                return self._results_no_match(
+                    date=str(arguments.get("date") or ""),
+                    source=f"thesportsdb:{path.split('?', 1)[0]}",
+                    league_id=league_id,
+                    reason="requested fixture was absent from the primary season results",
+                )
             return await self._espn_results(
                 competition,
                 arguments=arguments,
@@ -2547,8 +2796,8 @@ class FootballDataTool:
                 primary_source=SourceResult(
                     f"thesportsdb:{path.split('?', 1)[0]}",
                     "no_match",
-                    error_code="results_empty",
-                    safe_reason="The primary results source returned no rows",
+                    error_code="target_fixture_not_in_results",
+                    safe_reason="The requested fixture was absent from primary season results",
                 ),
             )
         return self._success(
@@ -2568,6 +2817,7 @@ class FootballDataTool:
         arguments: dict[str, Any],
         context: ExecutionContext,
         primary_source: SourceResult,
+        source_mode: str = "fallback",
     ) -> ToolResult:
         """Fetch dated results from reviewed ESPN feeds after a TSDB miss.
 
@@ -2641,6 +2891,7 @@ class FootballDataTool:
                 date=date,
                 espn_slug=slug,
             )
+            rows = self._filter_result_rows(rows, arguments)
             if rows:
                 return self._success(
                     {
@@ -2650,7 +2901,11 @@ class FootballDataTool:
                         "count": len(rows),
                         "rows": rows,
                         "sources": sources,
-                        "fallback": "thesportsdb_to_espn",
+                        "fallback": (
+                            "explicit_espn"
+                            if source_mode == "explicit"
+                            else "thesportsdb_to_espn"
+                        ),
                     }
                 )
             if qualifying_requested and kind == "qualifying":
@@ -2666,7 +2921,11 @@ class FootballDataTool:
                     "count": 0,
                     "rows": [],
                     "sources": sources,
-                    "fallback": "thesportsdb_to_espn",
+                    "fallback": (
+                        "explicit_espn"
+                        if source_mode == "explicit"
+                        else "thesportsdb_to_espn"
+                    ),
                 }
             )
             return result.model_copy(
@@ -2686,6 +2945,77 @@ class FootballDataTool:
             ),
             is_error=True,
             metadata={"errorCode": "football_results_unavailable"},
+        )
+
+    @staticmethod
+    def _has_result_target(arguments: dict[str, Any]) -> bool:
+        return bool(
+            str(arguments.get("team_a") or "").strip()
+            and str(arguments.get("team_b") or "").strip()
+        ) or bool(str(arguments.get("team") or "").strip())
+
+    @classmethod
+    def _filter_result_rows(
+        cls, rows: list[dict[str, Any]], arguments: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Keep only the requested date and fixture, preserving home/away order."""
+
+        requested_date = str(arguments.get("date") or "").strip()
+        requested_season = normalize_football_season(str(arguments.get("season") or ""))
+        team_a = str(arguments.get("team_a") or "").strip()
+        team_b = str(arguments.get("team_b") or "").strip()
+        team = str(arguments.get("team") or "").strip()
+
+        def same_side(requested: str, row: dict[str, Any], side: str) -> bool:
+            if not requested:
+                return False
+            return football_teams_match(
+                requested,
+                str(row.get(side) or ""),
+                right_provider="thesportsdb",
+                right_provider_id=row.get(f"{side}_team_id"),
+            ) or _normalize_team_identity(requested) == str(
+                row.get(f"{side}_canonical_id") or ""
+            )
+
+        filtered: list[dict[str, Any]] = []
+        for row in rows:
+            row_date = str(row.get("date") or "")[:10]
+            if requested_date and row_date != requested_date:
+                continue
+            row_season = str(row.get("season") or "").strip()
+            if row_season and requested_season:
+                if normalize_football_season(row_season) != requested_season:
+                    continue
+            if team_a and team_b:
+                if not (
+                    same_side(team_a, row, "home")
+                    and same_side(team_b, row, "away")
+                ):
+                    continue
+            elif team and not (same_side(team, row, "home") or same_side(team, row, "away")):
+                continue
+            filtered.append(row)
+        return filtered
+
+    @staticmethod
+    def _results_no_match(
+        *, date: str, source: str, league_id: str, reason: str
+    ) -> ToolResult:
+        result = FootballDataTool._success(
+            {
+                "source": source,
+                "action": "results",
+                "status": "no_match",
+                "league_id": league_id,
+                "date": date,
+                "count": 0,
+                "rows": [],
+                "safe_reason": reason,
+            }
+        )
+        return result.model_copy(
+            update={"metadata": {"status": "no_match", "errorCode": "results_no_match"}}
         )
 
     @classmethod

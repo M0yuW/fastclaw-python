@@ -263,6 +263,14 @@ async def test_settlement_data_delegation_exposes_results_tool_only(tmp_path: Pa
         assert result == "specialist answer"
         request = provider.requests[-1]
         assert {tool.function.name for tool in request.tools} == {"football_data"}
+        user_message = next(
+            message for message in reversed(request.messages) if message.role is MessageRole.USER
+        )
+        assert isinstance(user_message.content, str)
+        assert "team_a" in user_message.content
+        assert "team_b" in user_message.content
+        assert "source=espn" in user_message.content
+        assert "source=auto" in user_message.content
         assert execution.shared_state.football_settlement_review is True
     finally:
         await close_manager(manager, runtime, database)

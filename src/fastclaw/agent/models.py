@@ -41,6 +41,7 @@ class AgentRunRequest(AgentModel):
     )
     scope_guard: str = ""
     system_prompt: str = ""
+    context_compaction: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentEventType(StrEnum):

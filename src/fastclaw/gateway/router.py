@@ -1758,6 +1758,54 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             )
         }
 
+    @router.get("/api/chat/context-status")
+    async def chat_context_status(
+        agentId: str,
+        sessionId: str,
+        auth: AuthContext = auth_dependency,
+    ) -> dict[str, Any]:
+        await service.require_agent(auth, agentId)
+        async with UnitOfWork(gateway.database) as unit:
+            snapshot = await unit.require_store().get_latest_session_context_snapshot(
+                auth.identity.effective_user_id, agentId, sessionId
+            )
+        if snapshot is None:
+            return {
+                "mode": "shadow",
+                "status": "not_triggered",
+                "profile": "auto",
+                "strategy": "none",
+                "generation": 0,
+                "before": {"tokens": 0, "bytes": 0},
+                "after": {"tokens": 0, "bytes": 0},
+                "savingsRatio": 0,
+                "compactedMessages": 0,
+                "retainedMessages": 0,
+                "lastCompactedAt": None,
+                "failureCode": "",
+            }
+        metrics = snapshot.metrics
+        return {
+            "mode": snapshot.mode,
+            "status": snapshot.status,
+            "profile": snapshot.profile,
+            "strategy": snapshot.strategy,
+            "generation": snapshot.generation,
+            "before": {
+                "tokens": int(metrics.get("beforeTokens") or 0),
+                "bytes": int(metrics.get("beforeBytes") or 0),
+            },
+            "after": {
+                "tokens": int(metrics.get("afterTokens") or 0),
+                "bytes": int(metrics.get("afterBytes") or 0),
+            },
+            "savingsRatio": float(metrics.get("savingsRatio") or 0),
+            "compactedMessages": int(metrics.get("compactedMessages") or 0),
+            "retainedMessages": int(metrics.get("retainedMessages") or 0),
+            "lastCompactedAt": snapshot.created_at.isoformat(),
+            "failureCode": snapshot.failure_code,
+        }
+
     @router.get("/api/chat/sessions")
     async def chat_sessions(agentId: str, auth: AuthContext = auth_dependency) -> dict[str, Any]:
         await service.require_agent(auth, agentId)

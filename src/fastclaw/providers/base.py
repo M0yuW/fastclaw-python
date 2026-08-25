@@ -4,7 +4,7 @@ from typing import Protocol, runtime_checkable
 
 import httpx
 
-from fastclaw.providers.models import ChatRequest, ChatResponse
+from fastclaw.providers.models import ChatMessage, ChatRequest, ChatResponse, NativeCompactionResult
 from fastclaw.providers.stream import ProviderStream
 
 
@@ -47,3 +47,16 @@ class Provider(Protocol):
         """Start a lazily-executed streaming chat request."""
 
         ...
+
+
+@runtime_checkable
+class ProviderContextCompactor(Protocol):
+    """Optional native context compaction capability."""
+
+    async def compact_context(
+        self,
+        *,
+        messages: tuple[ChatMessage, ...],
+        model: str,
+        target_tokens: int,
+    ) -> NativeCompactionResult: ...

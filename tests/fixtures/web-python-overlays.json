@@ -15,8 +15,8 @@
       "sha256": "fb1628fc7a2498a2f1530f375578fbcea48e4d734f6d344c4aa07b54ab50d1b0"
     },
     "src/app/agents/[id]/chat/page.tsx": {
-      "reason": "Surface failed tool results instead of rendering successful status",
-      "sha256": "879633aafddc6a523cd9f724b4a126b4b40e004132b40f50506031eb6028715e"
+      "reason": "Surface tool failures and session context compaction status",
+      "sha256": "6136a7e9a2c836ec9f85c865a019e3cdc1a35dc20be88015db7629c803a1abea"
     },
     "src/app/chat/page.tsx": {
       "reason": "Use safe summaries for nested tool arguments in the legacy chat page",
@@ -31,8 +31,8 @@
       "sha256": "126d4b29dbafc2e69aea2933a7857f1236fcfc50a4cd38dfccbc0d56cb352940"
     },
     "src/lib/api.ts": {
-      "reason": "Typed chat tool failure and ledger metadata for the updated tool-status UI",
-      "sha256": "c15417a9a17cbcb2c0835fb4d9e58c64b3afecc061decfaa7f17bc5875bf6422"
+      "reason": "Typed chat tool, ledger, and context compaction status metadata",
+      "sha256": "af5d9b17463b6c43e4a7b4764fbb42c6b9d9f887d3ea130c89b19041aebc73fa"
     },
     "src/app/skills/page.tsx": {
       "reason": "Restrict skill discovery and installation to the local catalog",

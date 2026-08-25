@@ -1,7 +1,7 @@
 """Provider extension points."""
 
 from fastclaw.providers.anthropic import AnthropicProvider
-from fastclaw.providers.base import Provider
+from fastclaw.providers.base import Provider, ProviderContextCompactor
 from fastclaw.providers.errors import (
     ProviderError,
     ProviderHTTPError,
@@ -17,6 +17,7 @@ from fastclaw.providers.models import (
     FunctionCall,
     ImageURL,
     MessageRole,
+    NativeCompactionResult,
     ProviderEvent,
     ProviderEventType,
     ToolCall,
@@ -36,8 +37,10 @@ __all__ = [
     "FunctionCall",
     "ImageURL",
     "MessageRole",
+    "NativeCompactionResult",
     "OpenAIProvider",
     "Provider",
+    "ProviderContextCompactor",
     "ProviderError",
     "ProviderEvent",
     "ProviderEventType",

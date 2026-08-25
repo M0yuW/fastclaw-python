@@ -11,7 +11,14 @@ import httpx
 
 from fastclaw.tools.football_competitions import FootballCompetition
 
-SourceState = Literal["success", "empty", "unavailable", "rejected", "no_match"]
+SourceState = Literal[
+    "success",
+    "empty",
+    "unavailable",
+    "rejected",
+    "no_match",
+    "not_requested",
+]
 
 
 def utc_now() -> str:

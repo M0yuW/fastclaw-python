@@ -61,6 +61,37 @@ def football_event_key(
     )
 
 
+def football_fixture_state_key(
+    competition: str, season: str, date: str, team_a: str, team_b: str
+) -> str:
+    """Build the canonical key used by the root execution evidence state.
+
+    Unlike the legacy cache key, the date component deliberately remains an
+    ISO ``YYYY-MM-DD`` value so different dates cannot collapse together.
+    Team identities are resolved before joining, which makes provider aliases
+    such as Athletic Club/Athletic Bilbao and RC Lens/Lens equivalent.
+    """
+
+    normalized_date = _normalize_fixture_date(date)
+    return "|".join(
+        (
+            canonical_competition_identity(competition),
+            normalize_football_season(season),
+            normalized_date,
+            football_team_identity(team_a),
+            football_team_identity(team_b),
+        )
+    )
+
+
+def _normalize_fixture_date(value: str) -> str:
+    text = str(value or "").strip()
+    match = re.match(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})", text)
+    if match is not None:
+        return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+    return normalize_competition_name(text)
+
+
 def normalize_football_season(value: str) -> str:
     """Normalize compact and expanded season labels to the provider form."""
 
@@ -270,15 +301,19 @@ def _fixture_matches(
 ) -> bool:
     if not isinstance(fixture, dict):
         return False
+    fixture_dates = tuple(
+        str(fixture.get(name) or "") for name in ("requested_date", "date")
+    )
     return (
         normalize_competition_name(str(fixture.get("competition") or ""))
         == normalize_competition_name(competition)
         and normalize_football_season(str(fixture.get("season") or ""))
         == normalize_football_season(season)
-        and normalize_competition_name(
-            str(fixture.get("requested_date") or fixture.get("date") or "")
+        and any(
+            normalize_competition_name(fixture_date) == normalize_competition_name(date)
+            for fixture_date in fixture_dates
+            if fixture_date
         )
-        == normalize_competition_name(date)
         and _team_match(
             str(fixture.get("home") or ""),
             team_a,

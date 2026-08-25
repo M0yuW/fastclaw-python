@@ -6,10 +6,12 @@ import asyncio
 import json
 import logging
 import re
+from collections.abc import Collection
 from typing import Any
 
 from fastclaw.execution import ExecutionContext
 from fastclaw.orchestration.bus import (
+    DelegatedTaskError,
     DelegationError,
     DelegationErrorCode,
     DelegationOutcome,
@@ -70,6 +72,7 @@ class SpawnSubagentTool:
 
     async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
         await self._hydrate_session_base(context)
+        attempts_before = self._football_attempts(context)
         agent_id = arguments.get("agent_id")
         task = arguments.get("task")
         if not isinstance(agent_id, str) or not agent_id or not isinstance(task, str):
@@ -93,12 +96,78 @@ class SpawnSubagentTool:
                     is_error=True,
                     metadata={"errorCode": "football_data_first"},
                 )
-        result = await self._bus.request(
-            context,
-            target_agent_id=agent_id,
-            task=task,
-        )
+        try:
+            result = await self._bus.request(
+                context,
+                target_agent_id=agent_id,
+                task=task,
+            )
+        except DelegatedTaskError as exc:
+            if self._data_agent_id and agent_id == self._data_agent_id:
+                fixture_keys = self._changed_football_fixture_keys(context, attempts_before)
+                summary = context.shared_state.football_delegation_summary(
+                    fixture_keys=fixture_keys
+                )
+                if summary["confirmed"]:
+                    # The child may have published several successful
+                    # football_data results before its provider stream broke.
+                    # Preserve those fixtures and let the coordinator continue
+                    # with an explicit degraded checkpoint instead of turning
+                    # the whole delegation into an opaque registry failure.
+                    return self._football_data_result(
+                        context,
+                        child_report=(
+                            "data delegation failed after partial execution; "
+                            "confirmed evidence was retained; "
+                            f"delegation={exc.correlation_id}"
+                        ),
+                        correlation_id=exc.correlation_id,
+                        degraded=True,
+                        fixture_keys=fixture_keys,
+                    )
+                if summary["status"] == "no_match":
+                    return self._football_data_result(
+                        context,
+                        child_report=(
+                            "data delegation failed after a confirmed no-match result; "
+                            f"delegation={exc.correlation_id}"
+                        ),
+                        correlation_id=exc.correlation_id,
+                        fixture_keys=fixture_keys,
+                    )
+                # Do not re-raise a data-child failure after session hydration:
+                # the caller would otherwise receive only a generic handler
+                # error, while a global summary could make the same failure
+                # appear to have confirmed an unrelated old fixture.
+                return ToolResult(
+                    content=json.dumps(
+                        {
+                            "status": "unavailable",
+                            "confirmed": summary["confirmed"],
+                            "unresolved": summary["unresolved"],
+                            "source_failures": summary["source_failures"],
+                            "child_report": (
+                                "data delegation failed before current fixture evidence "
+                                f"was published; delegation={exc.correlation_id}"
+                            ),
+                            "instruction": (
+                                "Retry the current data task. Do not treat this as no_match "
+                                "and do not reuse confirmed fixtures from an older request."
+                            ),
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    is_error=True,
+                    metadata={
+                        "errorCode": "football_data_delegation_failed",
+                        "correlationId": exc.correlation_id,
+                        "status": "unavailable",
+                    },
+                )
+            raise
         if self._data_agent_id and agent_id == self._data_agent_id:
+            fixture_keys = self._changed_football_fixture_keys(context, attempts_before)
             if settlement_task:
                 return self._settlement_result(
                     context,
@@ -107,26 +176,12 @@ class SpawnSubagentTool:
                     results_start=settlement_results_start,
                     errors_start=settlement_errors_start,
                 )
-            elif context.shared_state.has_football_negative():
-                return self._negative_evidence_result(
-                    context,
-                    child_report=str(result.value or ""),
-                    correlation_id=result.correlation_id,
-                )
-            elif not context.shared_state.has_football_base():
-                detail = str(result.value or "").strip()
-                if len(detail) > 500:
-                    detail = f"{detail[:497]}..."
-                return ToolResult(
-                    content=(
-                        "data analyst completed without publishing machine-readable football "
-                        "base evidence; retry the data task and call football_data "
-                        "action=base_evidence before reporting success"
-                        + (f". Underlying result: {detail}" if detail else "")
-                    ),
-                    is_error=True,
-                    metadata={"errorCode": "football_base_not_published"},
-                )
+            return self._football_data_result(
+                context,
+                child_report=str(result.value or ""),
+                correlation_id=result.correlation_id,
+                fixture_keys=fixture_keys,
+            )
         return ToolResult(
             content=result.value,
             metadata={"correlationId": result.correlation_id},
@@ -134,21 +189,42 @@ class SpawnSubagentTool:
 
     @staticmethod
     def _negative_evidence_result(
-        context: ExecutionContext, *, child_report: str, correlation_id: str
+        context: ExecutionContext,
+        *,
+        child_report: str,
+        correlation_id: str,
+        fixture_keys: Collection[str] | None = None,
     ) -> ToolResult:
         report = str(child_report or "").strip()
         if len(report) > 1000:
             report = f"{report[:997]}..."
         evidence: list[object] = []
-        for content in context.shared_state.football_negative_evidence:
+        selected_keys = set(fixture_keys) if fixture_keys is not None else None
+        for key, state in context.shared_state.football_evidence_states.items():
+            if selected_keys is not None and key not in selected_keys:
+                continue
+            if state.status != "no_match":
+                continue
+            content = state.content
             try:
                 evidence.append(json.loads(content))
             except json.JSONDecodeError:
                 evidence.append({"raw": content})
+        if not evidence and selected_keys is None:
+            for content in context.shared_state.football_negative_evidence:
+                try:
+                    evidence.append(json.loads(content))
+                except json.JSONDecodeError:
+                    evidence.append({"raw": content})
+        summary = context.shared_state.football_delegation_summary(
+            fixture_keys=fixture_keys
+        )
         return ToolResult(
             content=json.dumps(
                 {
                     "status": "no_match",
+                    "confirmed": summary["confirmed"],
+                    "unresolved": summary["unresolved"],
                     "evidence": evidence,
                     "child_report": report,
                     "instruction": (
@@ -217,6 +293,93 @@ class SpawnSubagentTool:
                 "status": "settlement_review",
                 "correlationId": correlation_id,
                 "verifiedResultGroups": len(result_contents),
+            },
+        )
+
+    @staticmethod
+    def _football_data_result(
+        context: ExecutionContext,
+        *,
+        child_report: str,
+        correlation_id: str,
+        degraded: bool = False,
+        fixture_keys: Collection[str] | None = None,
+    ) -> ToolResult:
+        """Summarize per-fixture evidence without resurrecting stale negatives."""
+
+        report = str(child_report or "").strip()
+        if len(report) > 1000:
+            report = f"{report[:997]}..."
+        summary = context.shared_state.football_delegation_summary(
+            fixture_keys=fixture_keys
+        )
+        if not summary["confirmed"]:
+            if summary["status"] == "no_match":
+                return SpawnSubagentTool._negative_evidence_result(
+                    context,
+                    child_report=report,
+                    correlation_id=correlation_id,
+                    fixture_keys=fixture_keys,
+                )
+            if summary["status"] == "unknown":
+                detail = report
+                if len(detail) > 500:
+                    detail = f"{detail[:497]}..."
+                return ToolResult(
+                    content=(
+                        "data analyst completed without publishing machine-readable football "
+                        "base evidence; retry the data task and call football_data "
+                        "action=base_evidence before reporting success"
+                        + (f". Underlying result: {detail}" if detail else "")
+                    ),
+                    is_error=True,
+                    metadata={"errorCode": "football_base_not_published"},
+                )
+            detail = report
+            return ToolResult(
+                content=json.dumps(
+                    {
+                        **summary,
+                        "child_report": detail,
+                        "instruction": (
+                            "Retry only unresolved fixtures after the source or tool failure; "
+                            "do not treat unavailable as no_match."
+                        ),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                is_error=True,
+                metadata={"errorCode": "football_base_not_published", "status": summary["status"]},
+            )
+        if summary["status"] == "confirmed" and all(
+            not item["fixture"] for item in summary["confirmed"]
+        ):
+            # Compatibility for older in-process handlers that publish a
+            # trusted marker but return a plain child string. Real football
+            # data bundles always contain fixture identity.
+            return ToolResult(
+                content=report,
+                metadata={
+                    "status": "confirmed",
+                    "correlationId": correlation_id,
+                    "confirmedFixtures": len(summary["confirmed"]),
+                    "unresolvedFixtures": 0,
+                    **({"degraded": True} if degraded else {}),
+                },
+            )
+        return ToolResult(
+            content=json.dumps(
+                {**summary, "child_report": report},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            metadata={
+                "status": summary["status"],
+                "correlationId": correlation_id,
+                "confirmedFixtures": len(summary["confirmed"]),
+                "unresolvedFixtures": len(summary["unresolved"]),
+                **({"degraded": True} if degraded else {}),
             },
         )
 
@@ -308,6 +471,7 @@ class SpawnSubagentTool:
         timeout_seconds: float | None,
     ) -> tuple[ToolResult, ...]:
         await self._hydrate_session_base(context)
+        attempts_before = self._football_attempts(context)
         requests: list[DelegationRequest] = []
         request_indexes: list[int] = []
         results: list[ToolResult | None] = [None] * len(arguments)
@@ -355,7 +519,14 @@ class SpawnSubagentTool:
                         timeout_seconds=timeout_seconds,
                     )
 
-            if any(results[index] is None or results[index].is_error for index in data_indexes):
+            fixture_keys = self._changed_football_fixture_keys(context, attempts_before)
+            summary = context.shared_state.football_delegation_summary(
+                fixture_keys=fixture_keys
+            )
+            if (
+                any(results[index] is None or results[index].is_error for index in data_indexes)
+                and not summary["confirmed"]
+            ):
                 for index in range(len(arguments)):
                     if results[index] is None:
                         results[index] = ToolResult(
@@ -384,10 +555,7 @@ class SpawnSubagentTool:
                         )
                 return tuple(result for result in results if result is not None)
 
-            if (
-                context.shared_state.has_football_negative()
-                and not context.shared_state.has_football_base()
-            ):
+            if summary["status"] == "no_match" and not summary["confirmed"]:
                 for index in range(len(arguments)):
                     if results[index] is None:
                         results[index] = ToolResult(
@@ -523,3 +691,28 @@ class SpawnSubagentTool:
         for key, result in await self._cache.get_session_base(context.session_id):
             if not result.is_error and football_evidence_is_current(result.content):
                 context.shared_state.publish_football_base(key.value, result.content)
+
+    @staticmethod
+    def _football_attempts(context: ExecutionContext) -> dict[str, int]:
+        return {
+            key: state.attempt
+            for key, state in context.shared_state.football_evidence_states.items()
+        }
+
+    @staticmethod
+    def _changed_football_fixture_keys(
+        context: ExecutionContext, attempts_before: dict[str, int]
+    ) -> frozenset[str]:
+        """Return only fixtures observed by the current data delegation.
+
+        Session hydration intentionally restores all confirmed bundles so a
+        continued session can use them.  That restored set must not be used as
+        the result of a later, unrelated data attempt, especially when that
+        attempt fails before publishing any evidence.
+        """
+
+        return frozenset(
+            key
+            for key, state in context.shared_state.football_evidence_states.items()
+            if state.attempt > attempts_before.get(key, 0)
+        )

@@ -10,6 +10,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     LargeBinary,
     String,
@@ -137,6 +138,41 @@ class SessionModel(Base):
     chatter_user_id: Mapped[str] = mapped_column(String, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class SessionContextSnapshotModel(Base):
+    __tablename__ = "session_context_snapshots"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["user_id", "agent_id", "session_key"],
+            ["sessions.user_id", "sessions.agent_id", "sessions.key"],
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint(
+            "user_id", "agent_id", "session_key", "generation",
+            name="uq_session_context_snapshot_generation",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    agent_id: Mapped[str] = mapped_column(String, index=True)
+    session_key: Mapped[str] = mapped_column(String, index=True)
+    generation: Mapped[int] = mapped_column(default=1)
+    mode: Mapped[str] = mapped_column(String, default="shadow")
+    status: Mapped[str] = mapped_column(String, default="not_triggered")
+    profile: Mapped[str] = mapped_column(String, default="generic")
+    strategy: Mapped[str] = mapped_column(String, default="client")
+    provider: Mapped[str] = mapped_column(String, default="")
+    model: Mapped[str] = mapped_column(String, default="")
+    compacted_through_message_id: Mapped[str] = mapped_column(String, default="")
+    source_digest: Mapped[str] = mapped_column(String, default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    checkpoint: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    native_state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    failure_code: Mapped[str] = mapped_column(String, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
 class AgentFileModel(Base):

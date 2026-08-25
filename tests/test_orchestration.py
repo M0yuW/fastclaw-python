@@ -5,10 +5,11 @@ import json
 import logging
 import random
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 
 import pytest
 
-from fastclaw.execution import ExecutionContext
+from fastclaw.execution import ExecutionContext, SharedExecutionState
 from fastclaw.orchestration import (
     AsyncTaskQueue,
     BackpressureError,
@@ -23,7 +24,12 @@ from fastclaw.orchestration import (
     WaitTicket,
 )
 from fastclaw.tools import ToolResult
-from fastclaw.tools.football_shared import FootballEvidenceCache, football_event_key
+from fastclaw.tools.football_context import FootballContextTool
+from fastclaw.tools.football_shared import (
+    FootballEvidenceCache,
+    football_event_key,
+    football_fixture_state_key,
+)
 from fastclaw.tools.registry import ToolRegistry
 
 
@@ -37,6 +43,373 @@ def context(
         root_execution_id=root,
         call_path=path,
     )
+
+
+def _fixture_content(
+    home: str,
+    away: str,
+    *,
+    status: str = "confirmed",
+    competition: str = "Spanish La Liga",
+    requested_date: str = "2026-08-22",
+    source_date: str | None = None,
+) -> str:
+    return json.dumps(
+        {
+            "status": status,
+            "fixture": {
+                "competition": competition,
+                "season": "2026-2027",
+                "requested_date": requested_date,
+                "date": source_date or requested_date,
+                "home": home,
+                "away": away,
+            },
+            "evidence_schema_version": 4,
+            "historical_context": {},
+        },
+        ensure_ascii=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_football_context_accepts_requested_and_source_dates_for_one_fixture() -> None:
+    state = SharedExecutionState()
+    requested_date = "2026-08-23"
+    source_date = "2026-08-22"
+    key = football_fixture_state_key(
+        "意甲", "2026-27", requested_date, "国际米兰", "蒙扎"
+    )
+    content = _fixture_content(
+        "Inter Milan",
+        "Monza",
+        competition="Italian Serie A",
+        requested_date=requested_date,
+        source_date=source_date,
+    )
+    state.publish_football_observation(key, "confirmed", content)
+    tool = FootballContextTool(cache=FootballEvidenceCache())
+
+    for lookup_date in (requested_date, source_date):
+        result = await tool.execute(
+            {
+                "competition": "意甲",
+                "season": "2026-2027",
+                "date": lookup_date,
+                "team_a": "Inter Milan",
+                "team_b": "Monza",
+            },
+            replace(context(), shared_state=state),
+        )
+        assert not result.is_error
+        assert json.loads(result.content)["fixture"]["date"] == source_date
+
+
+@pytest.mark.asyncio
+async def test_football_context_cache_accepts_source_date_alias_after_restore() -> None:
+    cache = FootballEvidenceCache()
+    requested_date = "2026-08-23"
+    source_date = "2026-08-22"
+    key = football_event_key(
+        "意甲", "2026-27", requested_date, "Inter Milan", "Monza"
+    )
+    content = _fixture_content(
+        "Inter Milan",
+        "Monza",
+        competition="Italian Serie A",
+        requested_date=requested_date,
+        source_date=source_date,
+    )
+    await cache.put("base", key, ToolResult(content=content))
+
+    result = await FootballContextTool(cache=cache).execute(
+        {
+            "competition": "意甲",
+            "season": "2026-2027",
+            "date": source_date,
+            "team_a": "Inter Milan",
+            "team_b": "Monza",
+        },
+        context(),
+    )
+    assert not result.is_error
+    assert result.metadata["cacheHit"] is True
+    assert json.loads(result.content)["fixture"]["requested_date"] == requested_date
+
+
+@pytest.mark.asyncio
+async def test_data_delegation_failure_keeps_confirmed_evidence_and_is_not_generic_tool_failure(
+) -> None:
+    bus = InProcessMessageBus()
+
+    async def data_handler(task: str, child: ExecutionContext) -> str:
+        del task
+        key = football_fixture_state_key(
+            "意甲", "2026-27", "2026-08-23", "国际米兰", "蒙扎"
+        )
+        child.shared_state.publish_football_observation(
+            key,
+            "confirmed",
+            _fixture_content(
+                "Inter Milan",
+                "Monza",
+                competition="Italian Serie A",
+                requested_date="2026-08-23",
+                source_date="2026-08-22",
+            ),
+        )
+        raise RuntimeError("provider connection dropped")
+
+    bus.register(user_id="user-1", agent_id="data", handler=data_handler)
+    tool = SpawnSubagentTool(bus, data_agent_id="data", cache=FootballEvidenceCache())
+    try:
+        result = await tool.execute(
+            {"agent_id": "data", "task": "reconfirm the fixture"}, context()
+        )
+        payload = json.loads(result.content)
+        assert not result.is_error
+        assert payload["status"] == "confirmed"
+        assert len(payload["confirmed"]) == 1
+        assert "data delegation failed" in payload["child_report"]
+        assert "spawn_subagent" not in payload["child_report"]
+        assert result.metadata["degraded"] is True
+    finally:
+        await bus.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_data_failure_does_not_reuse_hydrated_fixture_from_an_older_request() -> None:
+    """A continued session must not report an old fixture for a new failed task."""
+
+    bus = InProcessMessageBus()
+    cache = FootballEvidenceCache()
+    stale_key = football_event_key(
+        "荷甲", "2026-27", "2026-08-22", "福图纳锡塔德", "阿尔克马尔"
+    )
+    await cache.put_session_base(
+        "session-1",
+        stale_key,
+        ToolResult(
+            content=_fixture_content(
+                "Fortuna Sittard",
+                "AZ Alkmaar",
+                competition="Dutch Eredivisie",
+            )
+        ),
+    )
+
+    async def data_handler(task: str, child: ExecutionContext) -> str:
+        del task, child
+        raise RuntimeError("provider timed out before publishing the new fixture")
+
+    bus.register(user_id="user-1", agent_id="data", handler=data_handler)
+    tool = SpawnSubagentTool(bus, data_agent_id="data", cache=cache)
+    try:
+        result = await tool.execute(
+            {"agent_id": "data", "task": "confirm the current Ligue 1 fixtures"},
+            context(),
+        )
+
+        assert result.is_error
+        assert result.metadata["errorCode"] == "football_data_delegation_failed"
+        assert "Fortuna Sittard" not in result.content
+        assert "AZ Alkmaar" not in result.content
+        assert '"status":"unavailable"' in result.content
+    finally:
+        await bus.shutdown()
+
+
+def test_fixture_state_key_unifies_reviewed_team_aliases_and_keeps_identity_boundaries() -> None:
+    athletic_club = football_fixture_state_key(
+        "西甲",
+        "2026-27",
+        "2026-08-22",
+        "Athletic Club",
+        "Sevilla",
+    )
+    athletic_bilbao = football_fixture_state_key(
+        "Spanish La Liga",
+        "2026-2027",
+        "2026-08-22",
+        "Athletic Bilbao",
+        "Sevilla FC",
+    )
+    assert athletic_club == athletic_bilbao
+    assert "2026-08-22" in athletic_club
+
+    assert football_fixture_state_key(
+        "法甲", "2026-27", "2026-08-22", "RC Lens", "AJ Auxerre"
+    ) == football_fixture_state_key(
+        "Ligue 1", "2026-2027", "2026-08-22", "Lens", "Auxerre"
+    )
+    assert football_fixture_state_key(
+        "法甲", "2026-27", "2026-08-23", "Lens", "Auxerre"
+    ) != football_fixture_state_key(
+        "法甲", "2026-27", "2026-08-22", "Auxerre", "Lens"
+    )
+
+
+def test_fixture_evidence_state_confirmed_cannot_be_downgraded_and_keeps_audit() -> None:
+    state = SharedExecutionState()
+    key = football_fixture_state_key(
+        "西甲", "2026-27", "2026-08-22", "Athletic Club", "Sevilla"
+    )
+
+    state.publish_football_observation(
+        key,
+        "no_match",
+        _fixture_content("Athletic Club", "Sevilla", status="no_match"),
+    )
+    state.publish_football_observation(
+        key,
+        "confirmed",
+        _fixture_content("Athletic Bilbao", "Sevilla"),
+    )
+    state.publish_football_observation(
+        key,
+        "unavailable",
+        json.dumps({"status": "unavailable", "fixture": None}),
+    )
+
+    current = state.football_fixture_state(key)
+    assert current is not None
+    assert current.status == "confirmed"
+    assert current.content is not None
+    assert len(current.audit) == 3
+    assert state.football_delegation_summary()["status"] == "confirmed"
+
+
+def test_fixture_delegation_summary_is_partial_for_two_confirmed_and_one_no_match() -> None:
+    state = SharedExecutionState()
+    fixtures = (
+        ("Fortuna Sittard", "AZ Alkmaar", "confirmed"),
+        ("Athletic Bilbao", "Sevilla", "confirmed"),
+        ("Lens", "Auxerre", "no_match"),
+    )
+    for home, away, status in fixtures:
+        key = football_fixture_state_key("测试联赛", "2026-27", "2026-08-22", home, away)
+        state.publish_football_observation(
+            key,
+            status,
+            _fixture_content(home, away, status=status),
+        )
+
+    summary = state.football_delegation_summary()
+    assert summary["status"] == "partial"
+    assert len(summary["confirmed"]) == 2
+    assert len(summary["unresolved"]) == 1
+    assert summary["next_action"] == "delegate_specialists"
+
+
+@pytest.mark.asyncio
+async def test_data_delegation_ignores_historical_negative_after_alias_retry_and_allows_specialists(
+) -> None:
+    bus = InProcessMessageBus()
+    specialist_called: list[str] = []
+
+    async def data_handler(task: str, child: ExecutionContext) -> str:
+        del task
+        key = football_fixture_state_key(
+            "西甲", "2026-27", "2026-08-22", "Athletic Club", "Sevilla"
+        )
+        child.shared_state.publish_football_observation(
+            key, "no_match", _fixture_content("Athletic Club", "Sevilla", status="no_match")
+        )
+        child.shared_state.publish_football_observation(
+            key, "confirmed", _fixture_content("Athletic Bilbao", "Sevilla")
+        )
+        return "three fixtures confirmed; one had an alias retry"
+
+    async def specialist_handler(task: str, child: ExecutionContext) -> str:
+        del child
+        specialist_called.append(task)
+        return "specialist complete"
+
+    bus.register(user_id="user-1", agent_id="data", handler=data_handler)
+    bus.register(user_id="user-1", agent_id="odds", handler=specialist_handler)
+    tool = SpawnSubagentTool(bus, data_agent_id="data", cache=FootballEvidenceCache())
+    try:
+        results = await tool.execute_many(
+            (
+                {"agent_id": "data", "task": "confirm fixtures"},
+                {"agent_id": "odds", "task": "analyze confirmed odds"},
+            ),
+            context(),
+        )
+        payload = json.loads(results[0].content)
+        assert not results[0].is_error
+        assert payload["status"] == "confirmed"
+        assert not results[0].metadata.get("status") == "fixture_unconfirmed"
+        assert specialist_called == ["analyze confirmed odds"]
+        assert results[1].content == "specialist complete"
+    finally:
+        await bus.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_three_fixture_alias_retry_scenario_reaches_specialist_phase() -> None:
+    """Reproduce session s-1787319787602-vymppy without network or ledger writes."""
+
+    bus = InProcessMessageBus(AsyncTaskQueue(max_concurrent=5))
+    specialist_calls: list[str] = []
+
+    async def data_handler(task: str, child: ExecutionContext) -> str:
+        del task
+        fixtures = (
+            ("荷甲", "2026-27", "2026-08-22", "福图纳锡塔德", "阿尔克马尔", False),
+            ("西甲", "2026-27", "2026-08-22", "Athletic Club", "塞维利亚", True),
+            ("法甲", "2026-27", "2026-08-22", "RC Lens", "AJ Auxerre", True),
+        )
+        for competition, season, date, home, away, retried in fixtures:
+            first_key = football_fixture_state_key(competition, season, date, home, away)
+            if retried:
+                child.shared_state.publish_football_observation(
+                    first_key,
+                    "no_match",
+                    _fixture_content(home, away, status="no_match"),
+                )
+                if home == "Athletic Club":
+                    home, away = "Athletic Bilbao", "塞维利亚"
+                else:
+                    home, away = "Lens", "Auxerre"
+            confirmed_key = football_fixture_state_key(
+                competition, season, date, home, away
+            )
+            child.shared_state.publish_football_observation(
+                confirmed_key,
+                "confirmed",
+                _fixture_content(home, away),
+            )
+        return "all three base evidence bundles confirmed"
+
+    async def specialist_handler(task: str, child: ExecutionContext) -> str:
+        assert child.shared_state.football_delegation_summary()["status"] == "confirmed"
+        specialist_calls.append(task)
+        return task
+
+    bus.register(user_id="user-1", agent_id="data", handler=data_handler)
+    for agent_id in ("tactics", "odds", "history", "risk"):
+        bus.register(user_id="user-1", agent_id=agent_id, handler=specialist_handler)
+    tool = SpawnSubagentTool(bus, data_agent_id="data", cache=FootballEvidenceCache())
+    try:
+        results = await tool.execute_many(
+            (
+                {"agent_id": "data", "task": "confirm the three fixtures"},
+                {"agent_id": "tactics", "task": "tactics"},
+                {"agent_id": "odds", "task": "odds"},
+                {"agent_id": "history", "task": "history"},
+                {"agent_id": "risk", "task": "risk"},
+            ),
+            context(),
+        )
+        payload = json.loads(results[0].content)
+        assert payload["status"] == "confirmed"
+        assert len(payload["confirmed"]) == 3
+        assert payload["unresolved"] == []
+        assert specialist_calls == ["tactics", "odds", "history", "risk"]
+        assert all(not result.is_error for result in results)
+    finally:
+        await bus.shutdown()
 
 
 def test_spawn_subagent_schema_exposes_only_delegation_arguments() -> None:
@@ -454,7 +827,11 @@ async def test_spawn_subagent_batch_serializes_multiple_data_tasks_before_specia
     bus.register(user_id="user-1", agent_id="data", handler=data_handler)
     bus.register(user_id="user-1", agent_id="tactics", handler=specialist_handler)
     bus.register(user_id="user-1", agent_id="history", handler=specialist_handler)
-    tool = SpawnSubagentTool(bus, data_agent_id="data")
+    tool = SpawnSubagentTool(
+        bus,
+        data_agent_id="data",
+        cache=FootballEvidenceCache(),
+    )
     try:
         results = await tool.execute_many(
             (

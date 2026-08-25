@@ -13,6 +13,12 @@ from uuid import uuid4
 
 import httpx
 
+from fastclaw.agent.context_compaction import (
+    ContextCompactionSettings,
+    ContextPlan,
+    ContextPlanner,
+    ensure_context_message_ids,
+)
 from fastclaw.agent.models import AgentEvent, AgentEventType, AgentRunError, AgentRunRequest
 from fastclaw.agent.normalizer import normalize_messages
 from fastclaw.agent.persistence import SessionPersistence
@@ -111,6 +117,7 @@ class AgentRunner:
         round_index = 0
         failed_tool_rounds = 0
         ledger_write_succeeded = False
+        successful_tool_results: list[str] = []
         provider_stream: ProviderStream | None = None
         current_stage = "session_load"
         started_at = asyncio.get_running_loop().time()
@@ -127,6 +134,51 @@ class AgentRunner:
             )
             seq += 1
             return emitted
+
+        async def persist_provider_checkpoint(
+            *, error: BaseException, failure_code: str
+        ) -> ChatMessage:
+            """Persist a resumable result when the model stream breaks.
+
+            A transport failure is not a data-source result.  Keeping the
+            successful tool messages in the session lets a continuation reuse
+            them instead of turning a partially completed run into an opaque
+            top-level exception.
+            """
+
+            names = list(dict.fromkeys(successful_tool_results))
+            detail = f"{type(error).__name__}: {error}".strip()
+            if names:
+                completed = ", ".join(names)
+                content = (
+                    "本轮未完成：模型服务连接中断，未能完成后续汇总。"  # noqa: RUF001
+                    f"本轮已成功的工具结果已保留（{completed}），这不等同于数据源缺失；"  # noqa: RUF001
+                    "请继续本会话，系统将从已完成结果继续。"  # noqa: RUF001
+                )
+                checkpoint: dict[str, Any] = {
+                    "completed": names,
+                    "pending": "provider_followup",
+                }
+            else:
+                content = (
+                    "本轮未完成：模型服务不可用，未产生成功的工具执行结果，"  # noqa: RUF001
+                    "因此未生成预测性结论；请稍后重试。"  # noqa: RUF001
+                )
+                checkpoint = {"completed": [], "pending": "provider_retry"}
+            final = ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content=content,
+                metadata={
+                    "providerFailure": failure_code,
+                    "errorType": type(error).__name__,
+                    "error": detail[:500],
+                    "stage": current_stage,
+                    "checkpoint": checkpoint,
+                },
+            )
+            history.append(final)
+            await self._persistence.save(self._session_record(request, context, history, stored))
+            return final
 
         try:
             stored = await self._persistence.load(
@@ -145,6 +197,7 @@ class AgentRunner:
                 history.insert(0, runtime_system)
             history.append(ChatMessage(role=MessageRole.USER, content=request.message))
             history = list(normalize_messages(tuple(history)))
+            history = ensure_context_message_ids(history, session_id=context.session_id)
             clarification = self._scope_clarification(request.scope_guard, history)
             if clarification:
                 final = ChatMessage(
@@ -163,10 +216,29 @@ class AgentRunner:
                 )
                 yield event(AgentEventType.DONE, message=final)
                 return
+            context_plan = ContextPlan(tuple(history), len(history), False)
+            snapshot_capable = all(
+                callable(getattr(self._persistence, name, None))
+                for name in ("latest_context_snapshot", "save_context_snapshot")
+            )
+            if snapshot_capable and stored is not None:
+                settings = ContextCompactionSettings.model_validate(
+                    request.context_compaction
+                )
+                planner = ContextPlanner(self._provider, self._persistence)  # type: ignore[arg-type]
+                context_plan = await planner.prepare(
+                    history,
+                    user_id=context.user_id,
+                    agent_id=context.agent_id,
+                    session_id=context.session_id,
+                    model=request.model,
+                    settings=settings,
+                    scope_guard=request.scope_guard,
+                )
             with use_execution(context):
                 for current_round in range(request.max_rounds):
                     round_index = current_round
-                    provider_messages = tuple(history)
+                    provider_messages = context_plan.with_delta(history)
                     recovery_attempted = False
                     while True:
                         current_stage = "provider_stream"
@@ -227,7 +299,9 @@ class AgentRunner:
                         provider_stream = None
                         if not recovery_attempted and self._should_retry_empty_response(response):
                             recovery_attempted = True
-                            provider_messages = self._recovery_messages(history)
+                            provider_messages = self._recovery_messages(
+                                list(provider_messages), successful_tool_results
+                            )
                             logger.warning(
                                 "retrying empty provider response "
                                 "(root=%s agent=%s round=%d finish_reason=%s)",
@@ -243,12 +317,12 @@ class AgentRunner:
                     if self._is_incomplete_response(response):
                         final = ChatMessage(
                             role=MessageRole.ASSISTANT,
-                            content=self._incomplete_response_message(response),
-                            metadata={
-                                "providerFailure": "output_incomplete",
-                                "finishReason": response.finish_reason or "missing",
-                                "recoveryAttempted": recovery_attempted,
-                            },
+                            content=self._incomplete_response_message(
+                                response, successful_tool_results
+                            ),
+                            metadata=self._incomplete_response_metadata(
+                                response, successful_tool_results, recovery_attempted
+                            ),
                         )
                         history.append(final)
                         await self._persistence.save(
@@ -314,6 +388,8 @@ class AgentRunner:
                                 in {"appended", "updated", "settled"}
                             ):
                                 ledger_write_succeeded = True
+                            if not result.is_error:
+                                successful_tool_results.append(call.function.name)
                             history.append(
                                 ChatMessage(
                                     role=MessageRole.TOOL,
@@ -398,6 +474,8 @@ class AgentRunner:
                             and result_metadata.get("status") in {"appended", "updated", "settled"}
                         ):
                             ledger_write_succeeded = True
+                        if not is_error:
+                            successful_tool_results.append(call.function.name)
                         round_results.append(is_error)
                         if is_error:
                             round_failures.append((call.function.name, result_content))
@@ -488,7 +566,7 @@ class AgentRunner:
         except AgentRunError as exc:
             yield event(AgentEventType.ERROR, error=str(exc), is_error=True)
             yield event(AgentEventType.DONE, is_error=True)
-        except httpx.TimeoutException:
+        except httpx.TimeoutException as exc:
             logger.warning(
                 "provider request timed out (root=%s agent=%s stage=%s round=%d duration_ms=%d)",
                 context.root_execution_id,
@@ -497,15 +575,34 @@ class AgentRunner:
                 round_index,
                 int((asyncio.get_running_loop().time() - started_at) * 1000),
             )
-            yield event(
-                AgentEventType.ERROR,
-                error=(
-                    "模型服务读取超时，本轮未能完成。系统没有把不完整的模型回复保存为"  # noqa: RUF001
-                    "成功结果；若本轮此前已经出现工具执行结果，请先检查账本状态再重试。"  # noqa: RUF001
-                ),
-                is_error=True,
+            final = await persist_provider_checkpoint(
+                error=exc,
+                failure_code="timeout",
             )
-            yield event(AgentEventType.DONE, is_error=True)
+            yield event(
+                AgentEventType.CONTENT,
+                content=final.content,
+                message=final,
+            )
+            yield event(AgentEventType.DONE, message=final)
+        except httpx.TransportError as exc:
+            logger.warning(
+                "provider transport failed (root=%s agent=%s stage=%s round=%d "
+                "error=%s duration_ms=%d)",
+                context.root_execution_id,
+                context.agent_id,
+                current_stage,
+                round_index,
+                type(exc).__name__,
+                int((asyncio.get_running_loop().time() - started_at) * 1000),
+            )
+            final = await persist_provider_checkpoint(error=exc, failure_code="transport")
+            yield event(
+                AgentEventType.CONTENT,
+                content=final.content,
+                message=final,
+            )
+            yield event(AgentEventType.DONE, message=final)
         except Exception as exc:
             yield event(
                 AgentEventType.ERROR,
@@ -534,8 +631,18 @@ class AgentRunner:
         )
 
     @staticmethod
-    def _recovery_messages(history: list[ChatMessage]) -> tuple[ChatMessage, ...]:
+    def _recovery_messages(
+        history: list[ChatMessage], successful_tool_results: list[str]
+    ) -> tuple[ChatMessage, ...]:
         recovered = list(history)
+        checkpoint = ""
+        if successful_tool_results:
+            names = ", ".join(dict.fromkeys(successful_tool_results))
+            checkpoint = (
+                "Runtime checkpoint: successful tool results from this turn are already "
+                f"retained ({names}). Continue from those results; do not claim that no "
+                "tool result exists."
+            )
         for index in range(len(recovered) - 1, -1, -1):
             message = recovered[index]
             if message.role is not MessageRole.USER:
@@ -544,21 +651,49 @@ class AgentRunner:
             recovered[index] = message.model_copy(
                 update={
                     "content": f"{original}\n\n{_EMPTY_RESPONSE_RECOVERY_INSTRUCTION}"
+                    + (f"\n\n{checkpoint}" if checkpoint else "")
                 }
             )
             break
         return tuple(recovered)
 
     @classmethod
-    def _incomplete_response_message(cls, response: ChatResponse) -> str:
+    def _incomplete_response_message(
+        cls, response: ChatResponse, successful_tool_results: list[str]
+    ) -> str:
         if cls._is_token_limited(response):
             reason = "模型输出达到长度上限"
         else:
             reason = "模型未生成可见答复或可执行工具调用"
+        if successful_tool_results:
+            names = ", ".join(dict.fromkeys(successful_tool_results))
+            return (
+                f"本轮未完成：{reason}。系统已自动进行一次精简重试，但仍未完成；"  # noqa: RUF001
+                f"本轮工具结果已保留（completed: {names}），后续模型步骤仍为 pending。"  # noqa: RUF001
+                "可继续本会话完成剩余步骤。"
+            )
         return (
             f"本轮未完成：{reason}。系统已自动进行一次精简重试，但仍未完成；"  # noqa: RUF001
             "本轮没有可确认的工具执行结果，请将大批量任务拆分后重试。"  # noqa: RUF001
         )
+
+    @staticmethod
+    def _incomplete_response_metadata(
+        response: ChatResponse,
+        successful_tool_results: list[str],
+        recovery_attempted: bool,
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "providerFailure": "output_incomplete",
+            "finishReason": response.finish_reason or "missing",
+            "recoveryAttempted": recovery_attempted,
+        }
+        if successful_tool_results:
+            metadata["checkpoint"] = {
+                "completed": list(dict.fromkeys(successful_tool_results)),
+                "pending": "provider_followup",
+            }
+        return metadata
 
     @staticmethod
     def _failed_tool_message(
@@ -785,7 +920,10 @@ class AgentRunner:
                 if stored is not None and stored.title
                 else AgentRunner._clean_title(request.message)
             ),
-            messages=[message.model_dump(by_alias=True, mode="json") for message in history],
+            messages=[
+                message.model_dump(by_alias=True, mode="json")
+                for message in ensure_context_message_ids(history, session_id=context.session_id)
+            ],
             message_count=len(history),
             chatter_user_id=stored.chatter_user_id if stored else context.user_id,
             created_at=stored.created_at if stored else now,

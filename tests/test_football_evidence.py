@@ -350,6 +350,188 @@ async def test_data_role_can_query_results_for_ledger_settlement_review() -> Non
 
 
 @pytest.mark.asyncio
+async def test_settlement_results_reject_date_only_queries() -> None:
+    fetcher = FixtureFetcher(fixture_responses())
+    execution = context()
+    execution.shared_state.football_settlement_review = True
+    tool = FootballDataTool(fetcher, role_mode="data")
+
+    result = await tool.execute(
+        {
+            "action": "results",
+            "competition": "瑞典超",
+            "season": "2026",
+            "date": "2026-08-10",
+        },
+        execution,
+    )
+
+    assert result.is_error
+    assert result.metadata["errorCode"] == "football_settlement_target_required"
+    assert "team_a" in result.content and "team_b" in result.content
+    assert fetcher.urls == []
+    assert execution.shared_state.football_settlement_errors
+
+
+def _espn_results_event(
+    event_id: str,
+    home: str,
+    away: str,
+    home_score: str,
+    away_score: str,
+) -> dict[str, object]:
+    return {
+        "id": event_id,
+        "name": f"{home} vs {away}",
+        "date": "2026-08-22T15:15Z",
+        "status": {"type": {"description": "Full Time"}},
+        "competitions": [
+            {
+                "competitors": [
+                    {
+                        "homeAway": "home",
+                        "team": {"id": "lens-espn", "displayName": home},
+                        "score": home_score,
+                    },
+                    {
+                        "homeAway": "away",
+                        "team": {"id": "auxerre-espn", "displayName": away},
+                        "score": away_score,
+                    },
+                ]
+            }
+        ],
+    }
+
+
+def _truncated_french_results_responses(
+    *, espn_events: list[dict[str, object]]
+) -> dict[str, object]:
+    return {
+        "search_all_leagues.php": {
+            "countries": [
+                {
+                    "idLeague": "4334",
+                    "strLeague": "French Ligue 1",
+                    "strLeagueAlternate": "Ligue 1",
+                    "strCountry": "France",
+                }
+            ]
+        },
+        "eventsday.php": {
+            "events": [
+                {
+                    "idEvent": "2489464",
+                    "strLeague": "French Ligue 1",
+                    "strSeason": "2026-2027",
+                    "strEvent": "Nice vs Lorient",
+                    "strHomeTeam": "Nice",
+                    "strAwayTeam": "Lorient",
+                    "dateEvent": "2026-08-22",
+                    "strStatus": "FT",
+                    "intHomeScore": "0",
+                    "intAwayScore": "0",
+                },
+                {
+                    "idEvent": "2489466",
+                    "strLeague": "French Ligue 1",
+                    "strSeason": "2026-2027",
+                    "strEvent": "Toulouse vs Lyon",
+                    "strHomeTeam": "Toulouse",
+                    "strAwayTeam": "Lyon",
+                    "dateEvent": "2026-08-22",
+                    "strStatus": "FT",
+                    "intHomeScore": "1",
+                    "intAwayScore": "2",
+                },
+                {
+                    "idEvent": "2489467",
+                    "strLeague": "French Ligue 1",
+                    "strSeason": "2026-2027",
+                    "strEvent": "Troyes vs Paris FC",
+                    "strHomeTeam": "Troyes",
+                    "strAwayTeam": "Paris FC",
+                    "dateEvent": "2026-08-22",
+                    "strStatus": "FT",
+                    "intHomeScore": "1",
+                    "intAwayScore": "1",
+                },
+            ]
+        },
+        "scoreboard": {
+            "leagues": [{"slug": "fra.1"}],
+            "events": espn_events,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_results_fall_back_to_espn_when_tsdb_day_omits_requested_fixture() -> None:
+    fetcher = FixtureFetcher(
+        _truncated_french_results_responses(
+            espn_events=[_espn_results_event("401999", "Lens", "Auxerre", "2", "1")]
+        )
+    )
+    tool = FootballDataTool(fetcher, espn_fetcher=fetcher, role_mode="data")
+
+    result = await tool.execute(
+        {
+            "action": "results",
+            "competition": "法甲",
+            "season": "2026-2027",
+            "date": "2026-08-22",
+            "team_a": "RC Lens",
+            "team_b": "AJ Auxerre",
+        },
+        context(),
+    )
+
+    payload = json.loads(result.content)
+    assert not result.is_error
+    assert payload["source"] == "espn:primary_results"
+    assert payload["fallback"] == "thesportsdb_to_espn"
+    assert payload["count"] == 1
+    assert payload["rows"][0]["match"] == "Lens vs Auxerre"
+    assert payload["rows"][0]["home_score"] == "2"
+    assert not any(
+        row["match"] == "Nice vs Lorient" for row in payload["rows"]
+    )
+    assert any("eventsday.php" in url for url in fetcher.urls)
+    assert any("fra.1/scoreboard" in url for url in fetcher.urls)
+
+
+@pytest.mark.asyncio
+async def test_results_can_force_espn_without_calling_tsdb_day_endpoint() -> None:
+    fetcher = FixtureFetcher(
+        _truncated_french_results_responses(
+            espn_events=[_espn_results_event("401999", "Lens", "Auxerre", "2", "1")]
+        )
+    )
+    tool = FootballDataTool(fetcher, espn_fetcher=fetcher, role_mode="data")
+
+    result = await tool.execute(
+        {
+            "action": "results",
+            "competition": "法甲",
+            "source": "espn",
+            "season": "2026-2027",
+            "date": "2026-08-22",
+            "team_a": "Lens",
+            "team_b": "Auxerre",
+        },
+        context(),
+    )
+
+    payload = json.loads(result.content)
+    assert not result.is_error
+    assert payload["source"] == "espn:primary_results"
+    assert payload["fallback"] == "explicit_espn"
+    assert payload["rows"][0]["match"] == "Lens vs Auxerre"
+    assert not any("eventsday.php" in url for url in fetcher.urls)
+    assert any("fra.1/scoreboard" in url for url in fetcher.urls)
+
+
+@pytest.mark.asyncio
 async def test_uel_results_fall_back_to_reviewed_espn_qualifying_feed() -> None:
     def event(
         event_id: str,
@@ -416,6 +598,8 @@ async def test_uel_results_fall_back_to_reviewed_espn_qualifying_feed() -> None:
             "competition": "UEFA Europa League",
             "season": "2026-2027",
             "date": "2026-08-20",
+            "team_a": "Kairat Almaty",
+            "team_b": "Anderlecht",
         },
         execution,
     )
@@ -424,7 +608,7 @@ async def test_uel_results_fall_back_to_reviewed_espn_qualifying_feed() -> None:
     assert not result.is_error
     assert payload["source"] == "espn:qualifying_results"
     assert payload["fallback"] == "thesportsdb_to_espn"
-    assert payload["count"] == 2
+    assert payload["count"] == 1
     assert payload["rows"][0]["status"] == "FT"
     assert payload["rows"][0]["home_score"] == "1"
     assert payload["rows"][0]["away_score"] == "2"

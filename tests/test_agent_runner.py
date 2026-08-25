@@ -104,6 +104,24 @@ class ScriptedProvider:
         return ProviderStream(source())
 
 
+class FailingAfterToolProvider(ScriptedProvider):
+    def __init__(self) -> None:
+        super().__init__([tool_round()])
+
+    def stream(self, request: ChatRequest) -> ProviderStream:
+        if self.requests:
+            self.requests.append(request)
+
+            async def source() -> AsyncIterator[ProviderEvent]:
+                raise httpx.RemoteProtocolError(
+                    "peer closed connection without sending complete message body"
+                )
+                yield  # pragma: no cover
+
+            return ProviderStream(source())
+        return super().stream(request)
+
+
 def tool_round() -> tuple[ProviderEvent, ...]:
     return (
         ProviderEvent(
@@ -301,11 +319,59 @@ async def test_repeated_empty_length_response_returns_visible_failure() -> None:
         AgentEventType.DONE,
     ]
     assert persistence.saved[0].messages[-1]["content"] == result.content
-    assert persistence.saved[0].messages[-1]["metadata"] == {
+    metadata = persistence.saved[0].messages[-1]["metadata"]
+    assert {key: value for key, value in metadata.items() if key != "contextMessageId"} == {
         "providerFailure": "output_incomplete",
         "finishReason": "length",
         "recoveryAttempted": True,
     }
+    assert str(metadata["contextMessageId"]).startswith("ctx_")
+
+
+@pytest.mark.asyncio
+async def test_length_recovery_reports_existing_tool_results_in_checkpoint() -> None:
+    provider = ScriptedProvider([tool_round(), empty_length_round(), empty_length_round()])
+    persistence = StubPersistence()
+    stream = AgentRunner(provider, ToolRegistry([EchoTool()]), persistence).stream(
+        AgentRunRequest(model="fixture", message="process a large football batch"),
+        run_context(),
+    )
+
+    _ = [event async for event in stream]
+
+    result = stream.result()
+    assert "工具结果已保留" in result.content
+    assert "没有可确认的工具执行结果" not in result.content
+    assert "completed" in result.content
+    assert "pending" in result.content
+
+
+@pytest.mark.asyncio
+async def test_provider_transport_failure_persists_resumable_tool_checkpoint() -> None:
+    provider = FailingAfterToolProvider()
+    persistence = StubPersistence()
+    stream = AgentRunner(provider, ToolRegistry([EchoTool()]), persistence).stream(
+        AgentRunRequest(model="fixture", message="process a football batch"),
+        run_context(),
+    )
+
+    events = [event async for event in stream]
+
+    result = stream.result()
+    assert "工具结果已保留" in result.content
+    assert "不等同于数据源缺失" in result.content
+    assert [event.type for event in events] == [
+        AgentEventType.TOOL_CALL,
+        AgentEventType.TOOL_RESULT,
+        AgentEventType.CONTENT,
+        AgentEventType.DONE,
+    ]
+    assert result.metadata["providerFailure"] == "transport"
+    assert result.metadata["checkpoint"] == {
+        "completed": ["echo"],
+        "pending": "provider_followup",
+    }
+    assert persistence.saved[0].messages[-1]["metadata"]["providerFailure"] == "transport"
 
 
 @pytest.mark.asyncio
@@ -466,10 +532,15 @@ async def test_provider_read_timeout_returns_safe_visible_error() -> None:
 
     events = [event async for event in stream]
 
-    error = next(event for event in events if event.type is AgentEventType.ERROR)
-    assert "模型服务读取超时" in error.error
-    assert "ReadTimeout" not in error.error
-    assert persistence.saved == []
+    result = stream.result()
+    assert "模型服务不可用" in result.content
+    assert result.metadata["providerFailure"] == "timeout"
+    assert result.metadata["errorType"] == "ReadTimeout"
+    assert [event.type for event in events] == [
+        AgentEventType.CONTENT,
+        AgentEventType.DONE,
+    ]
+    assert persistence.saved[0].messages[-1]["metadata"]["providerFailure"] == "timeout"
 
 
 class FailingTool(EchoTool):

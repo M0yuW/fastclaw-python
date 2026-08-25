@@ -3,7 +3,7 @@
 import { useEffect, useState, useRef, useCallback, useId, useMemo } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Button } from "@/components/ui/button";
-import { getAgent, getChatHistory, getChatSessions, listAgentFiles, renameChatSession, sendChatStream, stopChat, uploadAgentFiles, getAuthToken, getSkills, type ChatHistoryMessage, type SkillInfo, type ToolResultMetadata } from "@/lib/api";
+import { getAgent, getChatContextStatus, getChatHistory, getChatSessions, listAgentFiles, renameChatSession, sendChatStream, stopChat, uploadAgentFiles, getAuthToken, getSkills, type ChatContextStatus, type ChatHistoryMessage, type SkillInfo, type ToolResultMetadata } from "@/lib/api";
 import { createChatStreamBatcher, reduceChatStreamEvents, type StreamMessage } from "@/lib/chat-stream";
 import { formatToolSummary } from "@/lib/tool-summary";
 import { useAgentIdFromURL } from "@/hooks/use-agent-id";
@@ -282,6 +282,7 @@ export default function AgentChatPage() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
+  const [contextStatus, setContextStatus] = useState<ChatContextStatus | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const currentSession = sessions.find((session) => session.id === sessionId);
   const sessionTitle = currentSession?.title || currentSession?.preview || "";
@@ -497,13 +498,16 @@ export default function AgentChatPage() {
   // sidebar toggle). Re-fires whenever the title changes.
   const headerSlot = useMemo(
     () => (
-      <ChatHeaderTitle
-        title={sessionTitle}
-        fallback={`Chat with ${agentName || selectedAgent}`}
-        onSave={handleRenameTitle}
-      />
+      <div className="flex min-w-0 items-center gap-2">
+        <ChatHeaderTitle
+          title={sessionTitle}
+          fallback={`Chat with ${agentName || selectedAgent}`}
+          onSave={handleRenameTitle}
+        />
+        <ContextStatusBadge status={contextStatus} />
+      </div>
     ),
-    [sessionTitle, agentName, selectedAgent, handleRenameTitle],
+    [sessionTitle, agentName, selectedAgent, handleRenameTitle, contextStatus],
   );
   usePageHeader(headerSlot, [headerSlot]);
 
@@ -546,6 +550,13 @@ export default function AgentChatPage() {
       })
       .catch(() => {
         if (!controller.signal.aborted) setMessages([]);
+      });
+    getChatContextStatus(selectedAgent, sessionId, controller.signal)
+      .then((status) => {
+        if (!controller.signal.aborted) setContextStatus(status);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setContextStatus(null);
       });
     return () => {
       if (historyAbortRef.current === controller) historyAbortRef.current = null;
@@ -797,6 +808,9 @@ export default function AgentChatPage() {
         });
       }
       loadSessions(selectedAgent);
+      getChatContextStatus(selectedAgent, sessionId)
+        .then(setContextStatus)
+        .catch(() => setContextStatus(null));
       // First-turn of a brand-new session just got persisted — tell the
       // global sidebar to refetch its Chats list so the new title shows
       // up without a full page reload.
@@ -1370,6 +1384,50 @@ function ChatHeaderTitle({ title, fallback, onSave }: ChatHeaderTitleProps) {
       <span className="truncate">{title || fallback}</span>
       <Pencil className="h-3 w-3 shrink-0 text-muted-foreground/50 opacity-0 transition-opacity group-hover:opacity-100" />
     </button>
+  );
+}
+
+function ContextStatusBadge({ status }: { status: ChatContextStatus | null }) {
+  const [open, setOpen] = useState(false);
+  if (!status) return null;
+  const percent = Math.max(0, Math.round(status.savingsRatio * 100));
+  const label =
+    status.status === "not_triggered"
+      ? "未触发"
+      : status.status === "failed"
+        ? "压缩失败"
+        : status.status === "degraded"
+          ? "压缩降级"
+          : status.mode === "shadow"
+            ? `影子压缩 · ${percent}%`
+            : `已压缩 · ${percent}%`;
+  const tone =
+    status.status === "failed"
+      ? "border-red-500/40 text-red-600"
+      : status.status === "degraded"
+        ? "border-amber-500/40 text-amber-600"
+        : "border-border text-muted-foreground";
+  return (
+    <div className="relative shrink-0">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        className={`rounded-full border px-2 py-0.5 text-[11px] ${tone}`}
+        aria-expanded={open}
+      >
+        {label}
+      </button>
+      {open && (
+        <div className="absolute left-0 top-7 z-50 w-64 rounded-lg border bg-popover p-3 text-xs text-popover-foreground shadow-lg">
+          <div>策略：{status.strategy} / {status.profile}</div>
+          <div>体积：{status.before.bytes.toLocaleString()} → {status.after.bytes.toLocaleString()} bytes</div>
+          <div>估算：{status.before.tokens.toLocaleString()} → {status.after.tokens.toLocaleString()} tokens</div>
+          <div>消息：压缩 {status.compactedMessages}，保留 {status.retainedMessages}</div>
+          {status.lastCompactedAt && <div>时间：{new Date(status.lastCompactedAt).toLocaleString()}</div>}
+          {status.failureCode && <div className="mt-1 text-red-600">原因：{status.failureCode}</div>}
+        </div>
+      )}
+    </div>
   );
 }
 

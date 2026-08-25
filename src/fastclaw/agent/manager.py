@@ -867,9 +867,16 @@ class AgentRuntimeManager:
                     f"{task}\n\n## Runtime settlement-review requirement\n"
                     "This is a ledger settlement review, not a new prediction. Read the "
                     "pending ledger rows supplied by the coordinator, group them by reviewed "
-                    "competition and season, and call football_data with action=results and "
-                    "the exact YYYY-MM-DD date for each group. Match rows by date and "
-                    "home/away identity. Return only "
+                    "competition and season, and call football_data with action=results. "
+                    "For every named pending fixture, include the exact YYYY-MM-DD date, "
+                    "team_a, and team_b in the tool arguments; preserve home/away order and "
+                    "never use a competition/date-only response to decide that a specific "
+                    "fixture has no result. The Runtime rejects date-only settlement queries; "
+                    "if exact pending rows are not present in this task, report that the "
+                    "coordinator must first provide them instead of querying adjacent dates. "
+                    "If the user or coordinator requests ESPN, pass source=espn; "
+                    "otherwise use source=auto so a missing target in TheSportsDB falls back "
+                    "to ESPN. Match rows by date and home/away identity. Return only "
                     "machine-readable verified results with final score, result, source, and "
                     "status; distinguish not_finished, no_match, and unavailable. Return a "
                     "verified_matches list for every row whose status is FT/final and whose "
@@ -1227,10 +1234,13 @@ class AgentRuntimeManager:
                 "view the ledger, call football_ledger with operation=report and show its "
                 "fixed Markdown table directly; never export or offer the ledger JSON to the "
                 "customer. If the user only asks to review or 复盘 the ledger without a named "
-                "fixture, call report first and do not request fixture scope. For 复盘, then "
-                "delegate the data analyst to query competition results, settle only verified "
-                "finished matches, and call report again; leave future, unfinished, unmatched, "
-                "or unavailable matches pending."
+                "fixture, call report first and do not request fixture scope. For 复盘, first "
+                "call report with pending_only=true, then include every target row's exact "
+                "competition, season, YYYY-MM-DD date, home team, and away team in the data "
+                "analyst delegation task. Never delegate a generic 'finished matches' query "
+                "without those identities. Then delegate the data analyst to query competition "
+                "results, settle only verified finished matches, and call report again; leave "
+                "future, unfinished, unmatched, or unavailable matches pending."
             )
         system_prompt = "\n\n".join(prompt_parts).replace(
             str(self.config.legacy_data_root), str(self.config.data_root)
@@ -1329,6 +1339,11 @@ class AgentRuntimeManager:
             delegation_timeout=float(config.get("delegationTimeoutSeconds") or 120),
             max_failed_tool_rounds=default_max_failed_tool_rounds,
             scope_guard=str(config.get("scopeGuard") or ""),
+            context_compaction=(
+                dict(config.get("contextCompaction") or {})
+                if isinstance(config.get("contextCompaction"), dict)
+                else {}
+            ),
         )
 
     @staticmethod
