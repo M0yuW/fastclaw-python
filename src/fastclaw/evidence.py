@@ -19,6 +19,12 @@ class TaskEvidence:
     events: list[dict[str, Any]] = field(default_factory=list)
     inputs: list[dict[str, Any]] = field(default_factory=list)
 
+    final_rounds: dict[str, int] = field(default_factory=dict)
+
+    def record_model_reply(self, context: ExecutionContext, round_number: int) -> None:
+        if self.matches(context) and len(context.call_path) > 1 and context.task_id:
+            self.final_rounds[context.task_id] = round_number
+
     def matches(self, context: ExecutionContext) -> bool:
         return (context.user_id, context.root_execution_id) == (self.owner, self.root)
 
@@ -74,12 +80,26 @@ class TaskEvidence:
                 )
             )
         elif self.events and history and history[-1].role == "tool":
+            replies = []
+            for message in history:
+                if message.role != "tool" or message.name != "spawn_subagent":
+                    continue
+                task_id = message.metadata.get("correlationId")
+                if isinstance(task_id, str) and task_id in self.final_rounds:
+                    replies.append(
+                        {
+                            "toolCallId": message.tool_call_id,
+                            "correlationId": task_id,
+                            "round": self.final_rounds[task_id],
+                        }
+                    )
             summary = json.dumps(
                 dict(
                     root=self.root,
                     cutoff=len(self.events) + 1,
                     evidence=self.events,
                     specialistInputs=self.inputs,
+                    modelReplies=replies,
                 )
             )
             last = history[-1].model_copy(

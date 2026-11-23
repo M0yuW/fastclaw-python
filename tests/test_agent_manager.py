@@ -285,7 +285,8 @@ async def test_root_and_nested_runs_share_queue_without_deadlock(tmp_path: Path)
         assert coordinator_requests[0].max_tokens == 8192
         assert coordinator_requests[0].temperature == 0.1
         assert {tool.function.name for tool in coordinator_requests[0].tools} == {
-            "spawn_subagent", "request_clarification"
+            "spawn_subagent",
+            "request_clarification",
         }
         assert "emit several ordinary `spawn_subagent` tool calls" in str(
             coordinator_requests[0].messages[0].content
@@ -899,5 +900,19 @@ async def test_evidence_published_while_peer_call_is_in_flight(tmp_path: Path) -
             for item in summary["specialistInputs"]
         }
         assert seen == {("a", 1): [], ("b", 1): [], ("a", 2): [2]}
+        inputs = {
+            (item["correlationId"], item["round"]): item for item in summary["specialistInputs"]
+        }
+        results = {
+            msg.tool_call_id: msg
+            for msg in final.messages
+            if msg.name == "spawn_subagent" and msg.role == MessageRole.TOOL
+        }
+        assert len(summary["modelReplies"]) == len(results) == 2
+        for reply in summary["modelReplies"]:
+            source = inputs[reply["correlationId"], reply["round"]]
+            result = results[reply["toolCallId"]]
+            assert str(result.content).startswith(f"fixture/{source['agent']}")
+            assert source["eventVersions"] == ([2] if source["agent"] == "a" else [])
     finally:
         await close_manager(manager, runtime, database)

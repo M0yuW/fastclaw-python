@@ -311,6 +311,8 @@ class AgentRunner:
                         await self._persistence.save(
                             self._session_record(request, context, history, stored)
                         )
+                        if context.evidence is not None:
+                            context.evidence.record_model_reply(context, current_round + 1)
                         yield event(
                             AgentEventType.CONTENT,
                             content=response.content,
