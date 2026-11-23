@@ -68,7 +68,8 @@ session, root execution, and call-path identity are injected by the Runtime and
 must not be supplied by the model. To delegate several independent tasks in
 parallel, emit several ordinary `spawn_subagent` tool calls in the same
 assistant turn. Do not use legacy `delegations`, `sharedContext`, or `agentId`
-wrapper fields.
+wrapper fields. Before delegation, optionally submit delivery alone to select summary, targeted,
+or broadcast updates and an asOf public-information cutoff. Seal before final synthesis.
 """
 
 
@@ -491,6 +492,8 @@ class AgentRuntimeManager:
                     await ticket.release(cancel=True)
                 raise
             finally:
+                if context.evidence is not None:
+                    context.evidence.sealed = True
                 if ticket is not None:
                     await ticket.release()
 

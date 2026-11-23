@@ -84,3 +84,62 @@ async def test_review_only_selected_claim(status: str) -> None:
         assert calls == {"risk": 2, "accounts": 1}
     finally:
         await bus.shutdown()
+
+
+@pytest.mark.parametrize("mode", ["summary", "targeted", "broadcast"])
+async def test_delivery_boundary(mode: str) -> None:
+    import asyncio
+    import json
+
+    evidence = TaskEvidence("owner", "r")
+    root = ExecutionContext("owner", "coord", "s", "r", ("coord",), evidence=evidence)
+
+    def child(agent: str) -> ExecutionContext:
+        return replace(root, call_path=("coord", agent), agent_id=agent, task_id=agent)
+
+    evidence.configure(
+        root,
+        {
+            "mode": mode,
+            "targets": ["b"] if mode == "targeted" else [],
+            "asOf": "2020-01-01T00:00:00Z",
+        },
+    )
+    base = (ChatMessage(role=MessageRole.TOOL, content="original"),)
+    sent = evidence.prepare(child("b"), base, 1)
+    fact = {
+        "key": "first",
+        "content": "announcement",
+        "source": "fixture",
+        "publishedAt": "2019-12-31T23:59:59Z",
+    }
+    for invalid in (
+        {k: v for k, v in fact.items() if k != "publishedAt"},
+        {**fact, "publishedAt": "2020-01-01T00:00:01Z"},
+    ):
+        with pytest.raises(ValueError, match="research cutoff"):
+            evidence.publish(child("a"), invalid)
+    gate = asyncio.Event()
+
+    async def publish(key: str) -> str:
+        await gate.wait()
+        return evidence.publish(child("a"), {**fact, "key": key})
+
+    cancelled = asyncio.create_task(publish("cancelled"))
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    tasks = [asyncio.create_task(publish(k)) for k in ("first", "second", "first")]
+    gate.set()
+    a, b, duplicate = await asyncio.gather(*tasks)
+    assert a == duplicate and {json.loads(a)["version"], json.loads(b)["version"]} == {2, 3}
+    assert sent[-1].content == "original"
+    for agent in ("b", "c"):
+        included = mode == "broadcast" or (mode == "targeted" and agent == "b")
+        updated = evidence.prepare(child(agent), base, 2)
+        assert ("announcement" in str(updated[-1].content)) == included
+        assert evidence.inputs[-1]["eventVersions"] == ([2, 3] if included else [])
+    assert json.loads(evidence.configure(root, {"mode": "seal"})) == {"cutoff": 3}
+    with pytest.raises(ValueError, match="cutoff"):
+        evidence.publish(child("a"), {**fact, "key": "late"})
+    assert evidence.publish(child("a"), fact) == a

@@ -816,7 +816,8 @@ async def test_agent_database_scope_overrides_stale_agent_json(tmp_path: Path) -
         await close_manager(manager, runtime, database)
 
 
-async def test_evidence_published_while_peer_call_is_in_flight(tmp_path: Path) -> None:
+@pytest.mark.parametrize("live", [False, True])
+async def test_evidence_published_while_peer_call_is_in_flight(tmp_path: Path, live: bool) -> None:
     import json
 
     started = asyncio.Event()
@@ -828,7 +829,22 @@ async def test_evidence_published_while_peer_call_is_in_flight(tmp_path: Path) -
 
             async def events() -> AsyncIterator[ProviderEvent]:
                 last = request.messages[-1]
-                if request.model == "fixture/coordinator" and last.role == MessageRole.USER:
+                if (
+                    live
+                    and request.model == "fixture/coordinator"
+                    and last.role == MessageRole.USER
+                ):
+                    yield ProviderEvent(
+                        type=ProviderEventType.TOOL_CALL_DELTA,
+                        tool_index=0,
+                        tool_name="spawn_subagent",
+                        tool_arguments='{"delivery":{"mode":"targeted","targets":["b"]}}',
+                    )
+                    yield ProviderEvent(type=ProviderEventType.DONE, finish_reason="tool_calls")
+                    return
+                if request.model == "fixture/coordinator" and (
+                    last.role == MessageRole.USER or last.content == "Evidence delivery configured"
+                ):
                     for index, target in enumerate(("a", "b")):
                         yield ProviderEvent(
                             type=ProviderEventType.TOOL_CALL_DELTA,
@@ -853,13 +869,24 @@ async def test_evidence_published_while_peer_call_is_in_flight(tmp_path: Path) -
                 if request.model == "fixture/a":
                     assert "unique announcement" in str(last.content)
                     published.set()
-                if request.model == "fixture/b":
+                if request.model == "fixture/b" and last.role == MessageRole.TOOL:
+                    assert "unique announcement" in str(last.content)
+                if request.model == "fixture/b" and last.role == MessageRole.USER:
                     assert last.content == "initial v1"
                     assert all(
                         "unique announcement" not in str(msg.content) for msg in request.messages
                     )
                     started.set()
                     await published.wait()
+                    if live:
+                        yield ProviderEvent(
+                            type=ProviderEventType.TOOL_CALL_DELTA,
+                            tool_index=0,
+                            tool_name="read_file",
+                            tool_arguments='{"path":"fixture.txt"}',
+                        )
+                        yield ProviderEvent(type=ProviderEventType.DONE, finish_reason="tool_calls")
+                        return
                 yield ProviderEvent(type=ProviderEventType.CONTENT_DELTA, content=request.model)
                 yield ProviderEvent(type=ProviderEventType.DONE, finish_reason="stop")
 
@@ -899,20 +926,25 @@ async def test_evidence_published_while_peer_call_is_in_flight(tmp_path: Path) -
             (item["agent"], item["round"]): item["eventVersions"]
             for item in summary["specialistInputs"]
         }
-        assert seen == {("a", 1): [], ("b", 1): [], ("a", 2): [2]}
+        expected = {("a", 1): [], ("b", 1): [], ("a", 2): [2]}
+        if live:
+            expected["b", 2] = [2]
+        assert seen == expected
         inputs = {
             (item["correlationId"], item["round"]): item for item in summary["specialistInputs"]
         }
         results = {
             msg.tool_call_id: msg
             for msg in final.messages
-            if msg.name == "spawn_subagent" and msg.role == MessageRole.TOOL
+            if msg.name == "spawn_subagent"
+            and msg.role == MessageRole.TOOL
+            and msg.metadata.get("correlationId")
         }
         assert len(summary["modelReplies"]) == len(results) == 2
         for reply in summary["modelReplies"]:
             source = inputs[reply["correlationId"], reply["round"]]
             result = results[reply["toolCallId"]]
             assert str(result.content).startswith(f"fixture/{source['agent']}")
-            assert source["eventVersions"] == ([2] if source["agent"] == "a" else [])
+            assert source["eventVersions"] == ([2] if live or source["agent"] == "a" else [])
     finally:
         await close_manager(manager, runtime, database)

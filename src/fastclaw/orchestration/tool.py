@@ -29,6 +29,16 @@ class SpawnSubagentTool:
                 parameters={
                     "type": "object",
                     "properties": {
+                        "delivery": {
+                            "type": "object",
+                            "required": ["mode"],
+                            "description": "Configure before delegation; seal before synthesis.",
+                            "properties": {
+                                "mode": {"enum": ["summary", "targeted", "broadcast", "seal"]},
+                                "targets": {"type": "array", "items": {"type": "string"}},
+                                "asOf": {"type": "string", "format": "date-time"},
+                            },
+                        },
                         "review": {
                             "type": "object",
                             "description": "Quote a claim from resultsForReview; submit alone.",
@@ -44,12 +54,29 @@ class SpawnSubagentTool:
                         "agent_id": agent_id,
                         "task": {"type": "string"},
                     },
-                    "anyOf": [{"required": ["agent_id", "task"]}, {"required": ["review"]}],
+                    "anyOf": [
+                        {"required": ["agent_id", "task"]},
+                        {"required": ["review"]},
+                        {"required": ["delivery"]},
+                    ],
                 },
             )
         )
 
     async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
+        if "delivery" in arguments:
+            if (
+                set(arguments) != {"delivery"}
+                or not isinstance(arguments["delivery"], dict)
+                or context.evidence is None
+            ):
+                return ToolResult(content="submit delivery alone in a team task", is_error=True)
+            try:
+                return ToolResult(
+                    content=context.evidence.configure(context, arguments["delivery"])
+                )
+            except ValueError as exc:
+                return ToolResult(content=str(exc), is_error=True)
         if "review" in arguments:
             return await self._review(arguments, context)
         agent_id = arguments.get("agent_id")
@@ -58,6 +85,8 @@ class SpawnSubagentTool:
             return ToolResult(content="invalid delegation arguments", is_error=True)
         if self._target_agent_ids is not None and agent_id not in self._target_agent_ids:
             return ToolResult(content="delegation target is not allowed", is_error=True)
+        if context.evidence:
+            context.evidence.started = True
         result = await self._bus.request(
             context,
             target_agent_id=agent_id,
@@ -157,6 +186,12 @@ class SpawnSubagentTool:
         arguments: tuple[dict[str, Any], ...],
         context: ExecutionContext,
     ) -> tuple[ToolResult, ...]:
+        if any("delivery" in item for item in arguments):
+            if len(arguments) != 1:
+                return tuple(
+                    ToolResult(content="submit delivery alone", is_error=True) for _ in arguments
+                )
+            return (await self.execute(arguments[0], context),)
         if any("review" in item for item in arguments):
             ordinary = tuple(item for item in arguments if "review" not in item)
             reviews = tuple(item for item in arguments if "review" in item)
@@ -192,6 +227,8 @@ class SpawnSubagentTool:
             request_indexes.append(index)
 
         try:
+            if requests and context.evidence:
+                context.evidence.started = True
             outcomes = await self._bus.batch(context, requests)
         except asyncio.CancelledError:
             logger.warning(

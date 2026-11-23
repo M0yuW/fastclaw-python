@@ -40,7 +40,7 @@ def test_spawn_subagent_schema_exposes_only_delegation_arguments() -> None:
 
     properties = tool.definition.function.parameters["properties"]
     assert isinstance(properties, dict)
-    assert set(properties) == {"agent_id", "task", "review"}
+    assert set(properties) == {"agent_id", "task", "review", "delivery"}
 
 
 @pytest.mark.asyncio
