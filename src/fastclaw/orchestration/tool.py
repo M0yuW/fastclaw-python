@@ -93,3 +93,27 @@ class SpawnSubagentTool:
                 },
             )
         return tuple(result for result in results if result is not None)
+
+
+class PublishEvidenceTool:
+    definition = ToolDefinition(
+        function=ToolFunction(
+            name="publish_evidence",
+            description="Share a sourced fact with the coordinator for this task.",
+            parameters={
+                "type": "object",
+                "required": ["key", "content", "source"],
+                "properties": {
+                    k: {"type": "string"} for k in ("key", "content", "source", "publishedAt")
+                },
+            },
+        )
+    )
+
+    async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
+        if context.evidence is None:
+            return ToolResult(content="missing delegated task", is_error=True)
+        try:
+            return ToolResult(content=context.evidence.publish(context, arguments))
+        except ValueError as exc:
+            return ToolResult(content=str(exc), is_error=True)

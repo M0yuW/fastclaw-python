@@ -25,6 +25,7 @@ from sqlalchemy import text
 from fastclaw.agent.models import AgentEvent, AgentEventType, AgentRunError, AgentRunRequest
 from fastclaw.agent.persistence import DatabaseSessionPersistence
 from fastclaw.agent.runner import AgentRunner
+from fastclaw.evidence import TaskEvidence
 from fastclaw.execution import ExecutionContext
 from fastclaw.orchestration import (
     AsyncTaskQueue,
@@ -34,6 +35,7 @@ from fastclaw.orchestration import (
     TaskSnapshot,
     WaitTicket,
 )
+from fastclaw.orchestration.tool import PublishEvidenceTool
 from fastclaw.plugin import PluginManager
 from fastclaw.providers import ChatMessage, Provider, create_provider
 from fastclaw.runtime import Runtime, RuntimeState
@@ -141,6 +143,7 @@ def _default_tools(
         WriteFileTool(workspace),
         WebFetchTool(runtime.web_http_client),
         SpawnSubagentTool(bus, team_targets),
+        PublishEvidenceTool(),
         WorldCupLedgerTool(data_root),
     ]
     if profile.skills:
@@ -412,11 +415,13 @@ class AgentRuntimeManager:
         if not await self._agent_accepts_tasks(agent_id, user_id):
             raise AgentRunError("agent team is archived")
         selection = await self.provider_selection(profile, requested_model)
+        root_id = root_execution_id or f"run_{uuid4().hex}"
         context = ExecutionContext(
             user_id=user_id,
             agent_id=agent_id,
             session_id=session_id,
-            root_execution_id=root_execution_id or f"run_{uuid4().hex}",
+            root_execution_id=root_id,
+            evidence=TaskEvidence(user_id, root_id),
             call_path=(agent_id,),
         )
         request = self._request(profile, selection.model, message)
@@ -817,7 +822,9 @@ class AgentRuntimeManager:
                     coordinator_tools.add("worldcup_ledger")
                 allowed_tools = frozenset(coordinator_tools)
             else:
-                allowed_tools = frozenset({"read_file", "web_fetch", "list_dir", "write_file"})
+                allowed_tools = frozenset(
+                    {"read_file", "web_fetch", "list_dir", "write_file", "publish_evidence"}
+                )
         if allowed_tools is None or "spawn_subagent" in allowed_tools:
             prompt_parts.append(_DELEGATION_TOOL_PROMPT.strip())
         for team, members in team_members:

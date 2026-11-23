@@ -151,9 +151,12 @@ class AgentRunner:
                                 0,
                                 ChatMessage(role=MessageRole.SYSTEM, content=CLARIFICATION_PROMPT),
                             )
+                    messages = tuple(provider_history)
+                    if context.evidence is not None:
+                        messages = context.evidence.prepare(context, messages, current_round + 1)
                     provider_stream = self._provider.stream(
                         ChatRequest(
-                            messages=tuple(provider_history),
+                            messages=messages,
                             model=request.model,
                             tools=definitions,
                             max_tokens=request.max_tokens,

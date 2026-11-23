@@ -141,6 +141,7 @@ class InProcessMessageBus:
         child_context = replace(
             context,
             agent_id=target_agent_id,
+            correlation_id=correlation_id,
             call_path=(*context.call_path, target_agent_id),
         )
 
