@@ -61,7 +61,9 @@ _STANDARD_PROVIDERS: dict[str, tuple[str, str]] = {
 
 _DELEGATION_TOOL_PROMPT = """## Runtime delegation contract
 
-`spawn_subagent` accepts exactly two arguments: `agent_id` and `task`. Tenant,
+`spawn_subagent` accepts `agent_id` and `task` for ordinary delegation. To revisit a claim after
+new evidence, pass only `review` with the original result ID, exact quote, period and event version.
+Tenant,
 session, root execution, and call-path identity are injected by the Runtime and
 must not be supplied by the model. To delegate several independent tasks in
 parallel, emit several ordinary `spawn_subagent` tool calls in the same

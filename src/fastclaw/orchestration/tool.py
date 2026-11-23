@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -28,15 +29,29 @@ class SpawnSubagentTool:
                 parameters={
                     "type": "object",
                     "properties": {
+                        "review": {
+                            "type": "object",
+                            "description": "Quote a claim from resultsForReview; submit alone.",
+                            "properties": {
+                                **{
+                                    key: {"type": "string"}
+                                    for key in ("resultId", "claim", "period")
+                                },
+                                "eventVersion": {"type": "integer"},
+                            },
+                            "required": ["resultId", "claim", "period", "eventVersion"],
+                        },
                         "agent_id": agent_id,
                         "task": {"type": "string"},
                     },
-                    "required": ["agent_id", "task"],
+                    "anyOf": [{"required": ["agent_id", "task"]}, {"required": ["review"]}],
                 },
             )
         )
 
     async def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
+        if "review" in arguments:
+            return await self._review(arguments, context)
         agent_id = arguments.get("agent_id")
         task = arguments.get("task")
         if not isinstance(agent_id, str) or not agent_id or not isinstance(task, str):
@@ -48,16 +63,113 @@ class SpawnSubagentTool:
             target_agent_id=agent_id,
             task=task,
         )
+        self._remember(context, result.correlation_id, agent_id, result.value)
         return ToolResult(
             content=result.value,
             metadata={"correlationId": result.correlation_id},
         )
+
+    @staticmethod
+    def _remember(context: ExecutionContext, result_id: str, agent: str, result: str) -> None:
+        evidence = context.evidence
+        if (
+            evidence
+            and evidence.matches(context)
+            and len(context.call_path) == 1
+            and result.strip()
+        ):
+            evidence.results[result_id] = {"agent": agent, "result": result}
+
+    async def _review(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
+        evidence = context.evidence
+        req = arguments["review"]
+        if (
+            evidence is None
+            or not evidence.matches(context)
+            or len(context.call_path) != 1
+            or set(arguments) != {"review"}
+            or not isinstance(req, dict)
+            or set(req) != {"resultId", "period", "claim", "eventVersion"}
+        ):
+            return ToolResult(content="invalid review request", is_error=True)
+        if not all(
+            isinstance(req[k], str) and req[k].strip() for k in ("resultId", "period", "claim")
+        ):
+            return ToolResult(content="invalid claim or period", is_error=True)
+        source = evidence.results.get(req["resultId"])
+        version = req["eventVersion"]
+        if (
+            not source
+            or req["claim"] not in source["result"]
+            or type(version) is not int
+            or not 2 <= version < len(evidence.events) + 2
+            or (
+                self._target_agent_ids is not None and source["agent"] not in self._target_agent_ids
+            )
+        ):
+            return ToolResult(content="unknown original result, claim or event", is_error=True)
+        key = json.dumps(req, sort_keys=True)
+        async with evidence.review_locks.setdefault(key, asyncio.Lock()):
+            if key not in evidence.reviews:
+                packet = json.dumps({"review": req, "evidence": evidence.events[version - 2]})
+                task = (
+                    "Review the quoted claim for the specified period using the supplied evidence. "
+                    "Return JSON with status (unchanged, revised, or pending), "
+                    "conclusion and reason. "
+                    "For unchanged repeat the original claim exactly.\n" + packet
+                )
+                evidence.review_inputs[task] = version
+                try:
+                    reply = await self._bus.request(
+                        context, target_agent_id=source["agent"], task=task
+                    )
+                    parsed = json.loads(reply.value)
+                    if not isinstance(parsed, dict):
+                        raise ValueError("invalid review response")
+                    status, conclusion, reason = (
+                        parsed.get(k) for k in ("status", "conclusion", "reason")
+                    )
+                    if not (
+                        isinstance(reason, str)
+                        and reason.strip()
+                        and (
+                            status == "pending"
+                            or (status == "unchanged" and conclusion == req["claim"])
+                            or (
+                                status == "revised"
+                                and isinstance(conclusion, str)
+                                and conclusion.strip()
+                                and conclusion != req["claim"]
+                            )
+                        )
+                    ):
+                        raise ValueError("invalid review response")
+                    decision = {"status": status, "conclusion": conclusion, "reason": reason}
+                except (ValueError, RuntimeError, TimeoutError) as exc:
+                    decision = {"status": "pending", "reason": str(exc)}
+                evidence.reviews[key] = json.dumps(
+                    {"review": req, "agent": source["agent"], "decision": decision}
+                )
+            return ToolResult(content=evidence.reviews[key])
 
     async def execute_many(
         self,
         arguments: tuple[dict[str, Any], ...],
         context: ExecutionContext,
     ) -> tuple[ToolResult, ...]:
+        if any("review" in item for item in arguments):
+            ordinary = tuple(item for item in arguments if "review" not in item)
+            reviews = tuple(item for item in arguments if "review" in item)
+            normal_results, review_results = await asyncio.gather(
+                self.execute_many(ordinary, context),
+                asyncio.gather(*(self.execute(item, context) for item in reviews)),
+            )
+            normal_iter, review_iter = iter(normal_results), iter(review_results)
+            return tuple(
+                next(review_iter if "review" in item else normal_iter) for item in arguments
+            )
+        if not arguments:
+            return ()
         requests: list[DelegationRequest] = []
         request_indexes: list[int] = []
         results: list[ToolResult | None] = [None] * len(arguments)
@@ -91,6 +203,12 @@ class SpawnSubagentTool:
             raise
         for index, outcome in zip(request_indexes, outcomes, strict=True):
             if outcome.result is not None:
+                self._remember(
+                    context,
+                    outcome.result.correlation_id,
+                    outcome.request.agent_id,
+                    outcome.result.value,
+                )
                 results[index] = ToolResult(
                     content=outcome.result.value,
                     metadata={"correlationId": outcome.result.correlation_id},

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -19,6 +20,10 @@ class TaskEvidence:
     events: list[dict[str, Any]] = field(default_factory=list)
     inputs: list[dict[str, Any]] = field(default_factory=list)
 
+    results: dict[str, dict[str, str]] = field(default_factory=dict)
+    review_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    reviews: dict[str, str] = field(default_factory=dict)
+    review_inputs: dict[str, int] = field(default_factory=dict)
     final_rounds: dict[str, int] = field(default_factory=dict)
 
     def record_model_reply(self, context: ExecutionContext, round_number: int) -> None:
@@ -70,13 +75,20 @@ class TaskEvidence:
                 and msg.name == "publish_evidence"
                 and isinstance(msg.content, str)
             }
-            seen = [e["version"] for e in self.events if json.dumps(e) in receipts]
+            seen = {e["version"] for e in self.events if json.dumps(e) in receipts}
+            for msg in history:
+                if (
+                    msg.role == "user"
+                    and isinstance(msg.content, str)
+                    and msg.content in self.review_inputs
+                ):
+                    seen.add(self.review_inputs[msg.content])
             self.inputs.append(
                 dict(
                     agent=context.agent_id,
                     correlationId=context.task_id,
                     round=round_number,
-                    eventVersions=seen,
+                    eventVersions=sorted(seen),
                 )
             )
         elif self.events and history and history[-1].role == "tool":
@@ -100,6 +112,7 @@ class TaskEvidence:
                     evidence=self.events,
                     specialistInputs=self.inputs,
                     modelReplies=replies,
+                    resultsForReview=self.results,
                 )
             )
             last = history[-1].model_copy(
