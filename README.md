@@ -57,8 +57,14 @@ Open `http://127.0.0.1:18954/`. On a new database the Web UI redirects to
 are created atomically. Health and readiness probes remain available at
 `/healthz` and `/readyz`.
 
-Provider credentials are supplied centrally by environment variables. The
-database stores only non-sensitive endpoint, model, and scope configuration:
+Provider credentials can be entered in the Web UI. They are encrypted with
+AES-GCM before persistence; API responses expose only a mask. A local
+`master.key` is created under the data root with mode `0600` and must be backed
+up separately from the database. `FASTCLAW_MASTER_KEY` can supply the same
+32-byte URL-safe-base64 master key in managed deployments.
+
+Environment variables remain available as higher-priority operational
+overrides:
 
 ```bash
 FASTCLAW_PROVIDER_DEEPSEEK_API_KEY=... \
@@ -73,8 +79,9 @@ required Agent Provider and prepared Skill environment is usable.
 
 Cookie sessions are used by the Web UI. Programmatic clients can use a
 SHA-256-backed `Bearer fc_...` API key created under `/apikeys`; agent-type keys
-can access only their explicit Agent ACL. Provider create/update APIs reject
-plaintext credentials and identify the required environment variable.
+can access only their explicit Agent ACL. Provider create/update APIs accept a
+key over HTTPS, persist only authenticated ciphertext, and never return the
+plaintext value.
 
 ## Implementing a provider
 

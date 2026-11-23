@@ -26,12 +26,11 @@ retains its filesystem assets for audit and recovery.
 
 ## Credential boundary
 
-Provider CRUD stores endpoints, API type, model catalogs, and scope only. It
-rejects plaintext API keys and reports the corresponding
-`FASTCLAW_PROVIDER_<NAME>_API_KEY` environment variable. `/api/test-provider`
-may use a submitted key for one transient request, but never persists it. Bulk
-configuration similarly rejects plaintext Provider, channel, tool, and Skill
-credentials.
+Provider CRUD stores endpoints, API type, model catalogs, scope, and an optional
+AES-GCM encrypted API key. Reads return only a mask; the Runtime decrypts the
+key only when constructing a Provider. `/api/test-provider` may also use a
+submitted key for one transient request. Bulk configuration continues to reject
+plaintext channel, tool, and Skill credentials.
 
 ## Browser and provenance gates
 

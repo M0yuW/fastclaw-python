@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
 
 from fastclaw.execution import ExecutionContext
 from fastclaw.orchestration.bus import DelegationRequest, MessageBus
 from fastclaw.providers import ToolDefinition, ToolFunction
 from fastclaw.tools import ToolResult
+
+logger = logging.getLogger(__name__)
 
 
 class SpawnSubagentTool:
@@ -75,7 +79,16 @@ class SpawnSubagentTool:
             requests.append(DelegationRequest(agent_id=agent_id, task=task))
             request_indexes.append(index)
 
-        outcomes = await self._bus.batch(context, requests)
+        try:
+            outcomes = await self._bus.batch(context, requests)
+        except asyncio.CancelledError:
+            logger.warning(
+                "delegation batch cancelled (root=%s source=%s targets=%s)",
+                context.root_execution_id,
+                context.agent_id,
+                ",".join(request.agent_id for request in requests),
+            )
+            raise
         for index, outcome in zip(request_indexes, outcomes, strict=True):
             if outcome.result is not None:
                 results[index] = ToolResult(

@@ -15,7 +15,9 @@ config = context.config
 if database_url := os.environ.get("FASTCLAW_DATABASE_URL"):
     config.set_main_option("sqlalchemy.url", database_url)
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # Alembic must not disable application loggers that were registered before
+    # schema startup; the Gateway relies on them for correlated execution stages.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

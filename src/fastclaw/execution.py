@@ -17,7 +17,7 @@ class ExecutionContext:
     session_id: str
     root_execution_id: str
     call_path: tuple[str, ...] = ()
-    correlation_id: str = ""
+    task_id: str = ""
     evidence: TaskEvidence | None = field(default=None, compare=False, repr=False)
 
 

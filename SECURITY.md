@@ -15,6 +15,16 @@ mitigation.
 Maintainers will acknowledge a complete report within five business days and
 will coordinate remediation and disclosure with the reporter.
 
+## Provider credential storage
+
+Provider API keys are encrypted with AES-GCM and bound to their stable config
+record ID. The database contains only versioned ciphertext. The master key is
+loaded from `FASTCLAW_MASTER_KEY` or a data-root `master.key` file restricted to
+mode `0600`; it must never be committed or stored beside database backups.
+Browser/API responses contain only masked credentials, and production browser
+traffic must use HTTPS. Environment-provided Provider keys override stored
+credentials without copying them into the database.
+
 ## Outbound web fetch policy
 
 The built-in `web_fetch` tool accepts only HTTP(S) URLs without embedded

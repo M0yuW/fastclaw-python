@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from collections.abc import Sequence
@@ -17,14 +18,37 @@ from fastclaw.network import (
     pinned_network_target,
 )
 from fastclaw.tools import (
+    FOOTBALL_COMPETITIONS,
     ExecTool,
+    FootballDataTool,
+    FootballLedgerTool,
     ListDirTool,
     ReadFileTool,
     ToolRegistry,
+    ToolResult,
     WebFetchTool,
     WorldCupLedgerTool,
     WriteFileTool,
+    resolve_football_competition,
 )
+from fastclaw.tools.football_data import EspnPublicFetcher
+
+
+class FixtureFetcher:
+    def __init__(self, responses: dict[str, object]) -> None:
+        self.responses = responses
+        self.urls: list[str] = []
+
+    async def execute(
+        self, arguments: dict[str, object], execution: ExecutionContext
+    ) -> ToolResult:
+        del execution
+        url = str(arguments["url"])
+        self.urls.append(url)
+        for marker, payload in self.responses.items():
+            if marker in url:
+                return ToolResult(content=json.dumps(payload))
+        return ToolResult(content="fixture URL not found", is_error=True)
 
 
 def context() -> ExecutionContext:
@@ -34,6 +58,243 @@ def context() -> ExecutionContext:
         session_id="session-1",
         root_execution_id="run-1",
     )
+
+
+@pytest.mark.asyncio
+async def test_espn_fetcher_rejects_non_fixed_origin_without_starting_process() -> None:
+    result = await EspnPublicFetcher().execute({"url": "https://example.com/scoreboard"}, context())
+
+    assert result.is_error
+    assert "fixed soccer API origin" in result.content
+
+
+def test_football_competition_catalog_resolves_reviewed_aliases() -> None:
+    sweden = resolve_football_competition("瑞典超", country="瑞典")
+    champions_league = resolve_football_competition("UCL", country="Europe")
+
+    assert sweden is not None and sweden.espn_slug == "swe.1"
+    assert champions_league is not None
+    assert champions_league.espn_slug == "uefa.champions"
+    assert len({item.espn_slug for item in FOOTBALL_COMPETITIONS}) == len(FOOTBALL_COMPETITIONS)
+    assert resolve_football_competition("瑞典超", country="挪威") is None
+
+
+@pytest.mark.asyncio
+async def test_football_data_exposes_only_trusted_provider_mapping() -> None:
+    fetcher = FixtureFetcher({})
+    tool = FootballDataTool(fetcher, espn_fetcher=fetcher)
+
+    resolved = await tool.execute(
+        {"action": "competition_resolve", "competition": "瑞典超级联赛"}, context()
+    )
+    rejected = await tool.execute(
+        {"action": "competition_resolve", "competition": "swe.2"}, context()
+    )
+
+    assert json.loads(resolved.content)["mapping"] == {
+        "key": "swedish-allsvenskan",
+        "competition": "Swedish Allsvenskan",
+        "country": "Sweden",
+        "espn_slug": "swe.1",
+    }
+    assert rejected.is_error
+    assert fetcher.urls == []
+
+
+@pytest.mark.asyncio
+async def test_football_data_espn_queries_use_and_validate_trusted_mapping() -> None:
+    fetcher = FixtureFetcher(
+        {
+            "scoreboard": {
+                "leagues": [{"slug": "swe.1", "name": "Swedish Allsvenskan"}],
+                "events": [
+                    {
+                        "id": "401842783",
+                        "name": "IF Brommapojkarna at IK Sirius",
+                        "date": "2026-08-10T17:00Z",
+                        "status": {"type": {"description": "Scheduled"}},
+                        "competitions": [
+                            {
+                                "competitors": [
+                                    {
+                                        "homeAway": "home",
+                                        "team": {"id": "1", "displayName": "IK Sirius"},
+                                    },
+                                    {
+                                        "homeAway": "away",
+                                        "team": {
+                                            "id": "2",
+                                            "displayName": "IF Brommapojkarna",
+                                        },
+                                    },
+                                ]
+                            }
+                        ],
+                    }
+                ],
+            },
+            "summary": {
+                "header": {
+                    "league": {"slug": "swe.1"},
+                    "competitions": [
+                        {
+                            "date": "2026-08-10T17:00Z",
+                            "status": {"type": {"description": "Scheduled"}},
+                            "competitors": [
+                                {
+                                    "homeAway": "home",
+                                    "team": {"id": "1", "displayName": "IK Sirius"},
+                                },
+                                {
+                                    "homeAway": "away",
+                                    "team": {
+                                        "id": "2",
+                                        "displayName": "IF Brommapojkarna",
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                }
+            },
+        }
+    )
+    tool = FootballDataTool(fetcher, espn_fetcher=fetcher)
+
+    schedule = await tool.execute(
+        {
+            "action": "espn_schedule",
+            "competition": "瑞典超",
+            "date": "2026-08-10",
+        },
+        context(),
+    )
+    summary = await tool.execute(
+        {
+            "action": "espn_summary",
+            "competition": "瑞典超",
+            "event_id": "401842783",
+        },
+        context(),
+    )
+
+    assert json.loads(schedule.content)["matches"][0]["teams"]["home"]["name"] == ("IK Sirius")
+    assert json.loads(summary.content)["mapping"]["espn_slug"] == "swe.1"
+    assert "/swe.1/scoreboard?dates=20260810" in fetcher.urls[0]
+    assert "/swe.1/summary?event=401842783" in fetcher.urls[1]
+
+
+@pytest.mark.asyncio
+async def test_football_data_espn_rejects_mismatched_response_league() -> None:
+    fetcher = FixtureFetcher({"scoreboard": {"leagues": [{"slug": "fifa.world"}], "events": []}})
+
+    result = await FootballDataTool(fetcher, espn_fetcher=fetcher).execute(
+        {
+            "action": "espn_schedule",
+            "competition": "瑞典超",
+            "date": "2026-08-10",
+        },
+        context(),
+    )
+
+    assert result.is_error
+    assert "does not match" in json.loads(result.content)["error"]
+
+
+@pytest.mark.asyncio
+async def test_football_data_resolves_non_world_cup_competition_and_schedule() -> None:
+    fetcher = FixtureFetcher(
+        {
+            "search_all_leagues.php": {
+                "countries": [
+                    {
+                        "idLeague": "4429",
+                        "strLeague": "FIFA World Cup",
+                        "strLeagueAlternate": "",
+                        "strCountry": "Worldwide",
+                    },
+                    {
+                        "idLeague": "4613",
+                        "strLeague": "Swedish Allsvenskan",
+                        "strLeagueAlternate": "Allsvenskan",
+                        "strCountry": "Sweden",
+                    },
+                ]
+            },
+            "eventsday.php": {"events": [{"strEvent": "IK Sirius vs IF Brommapojkarna"}]},
+        }
+    )
+    tool = FootballDataTool(fetcher)
+
+    resolved = await tool.execute(
+        {
+            "action": "competition_search",
+            "competition": "Allsvenskan",
+            "country": "Sweden",
+        },
+        context(),
+    )
+    scheduled = await tool.execute(
+        {
+            "action": "schedule",
+            "competition": "Allsvenskan",
+            "country": "Sweden",
+            "date": "2026-08-10",
+        },
+        context(),
+    )
+
+    assert json.loads(resolved.content)["competitions"] == [
+        {
+            "league_id": "4613",
+            "competition": "Swedish Allsvenskan",
+            "alternate": "Allsvenskan",
+            "country": "Sweden",
+        }
+    ]
+    assert json.loads(scheduled.content)["rows"][0]["match"] == ("IK Sirius vs IF Brommapojkarna")
+    assert "l=4613" in fetcher.urls[-1]
+    assert "c=Sweden" in fetcher.urls[0]
+
+
+@pytest.mark.asyncio
+async def test_football_data_sporttery_match_is_not_world_cup_filtered() -> None:
+    fetcher = FixtureFetcher(
+        {
+            "getMatchCalculatorV1": {
+                "value": {
+                    "matchInfoList": [
+                        {
+                            "subMatchList": [
+                                {
+                                    "matchId": "swe-1",
+                                    "leagueAllName": "瑞典超级联赛",
+                                    "homeTeamAllName": "天狼星",
+                                    "homeTeamAbbEnName": "IK Sirius",
+                                    "awayTeamAllName": "布洛马波卡纳",
+                                    "awayTeamAbbEnName": "IF Brommapojkarna",
+                                    "had": {"h": "2.10", "d": "3.20", "a": "3.05"},
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+    )
+
+    result = await FootballDataTool(fetcher).execute(
+        {
+            "action": "sporttery_match",
+            "team_a": "Sirius",
+            "team_b": "Brommapojkarna",
+        },
+        context(),
+    )
+
+    payload = json.loads(result.content)
+    assert payload["competition"] == "瑞典超级联赛"
+    assert payload["match_id"] == "swe-1"
 
 
 @pytest.mark.asyncio
@@ -98,6 +359,59 @@ async def test_worldcup_ledger_is_atomic_unique_and_reports_directly(tmp_path: P
     assert report.direct_return is True
     assert "France vs Sweden" in report.content
     assert "2-1" in report.content
+
+
+async def test_football_ledger_scopes_entries_by_competition(tmp_path: Path) -> None:
+    tool = FootballLedgerTool(tmp_path)
+    premier_league = {
+        "competition": "Premier League",
+        "season": "2026/27",
+        "date": "2026-08-15",
+        "match": "Team A vs Team B",
+        "our_pred": "Team A",
+        "our_confidence": "mid",
+        "actual_result": None,
+    }
+    fa_cup = {**premier_league, "competition": "FA Cup", "season": "2026/27"}
+
+    await tool.execute({"operation": "append", "entry": premier_league}, context())
+    await tool.execute({"operation": "append", "entry": fa_cup}, context())
+    with pytest.raises(ValueError, match="already contains"):
+        await tool.execute(
+            {
+                "operation": "append",
+                "entry": {
+                    **premier_league,
+                    "competition": " premier  league ",
+                    "match": "team a VS team b",
+                },
+            },
+            context(),
+        )
+
+    await tool.execute(
+        {
+            "operation": "settle",
+            "competition": "Premier League",
+            "date": "2026-08-15",
+            "match": "Team A vs Team B",
+            "actual_result": "draw",
+            "actual_score": "1-1",
+        },
+        context(),
+    )
+    premier_report = await tool.execute(
+        {"operation": "report", "competition": "Premier League"}, context()
+    )
+    pending_report = await tool.execute({"operation": "report", "pending_only": True}, context())
+
+    assert premier_report.direct_return is True
+    assert "Premier League" in premier_report.content
+    assert "FA Cup" not in premier_report.content
+    assert "1-1" in premier_report.content
+    assert "FA Cup" in pending_report.content
+    assert "Premier League" not in pending_report.content
+    assert (tmp_path / "workspaces" / "agent-1" / "football" / "ledger.json").is_file()
 
 
 @pytest.mark.asyncio

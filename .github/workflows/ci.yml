@@ -115,6 +115,7 @@ jobs:
           "${{ runner.temp }}/wheel-smoke/bin/pip" install dist/*.whl
           cd "${{ runner.temp }}"
           "${{ runner.temp }}/wheel-smoke/bin/python" -c "from importlib.resources import files; import fastclaw; assert files('fastclaw').joinpath('bundled_plugins/finance-tools/plugin.json').is_file()"
+          "${{ runner.temp }}/wheel-smoke/bin/python" -c "from importlib.resources import files; import fastclaw; assert files('fastclaw').joinpath('bundled_skills/match-data-toolkit/scripts/espn_data.py').is_file()"
 
   docker:
     runs-on: ubuntu-latest

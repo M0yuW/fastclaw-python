@@ -63,6 +63,7 @@ def create_app(
             default_provider_api_base=app_settings.provider_api_base,
             default_provider_api_type=app_settings.provider_api_type,
             default_model=app_settings.default_model,
+            master_key=app_settings.master_key,
         ),
     )
     gateway = Gateway(app_settings, app_database, app_runtime, agent_manager)

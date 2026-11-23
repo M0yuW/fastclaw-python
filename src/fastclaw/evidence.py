@@ -68,7 +68,7 @@ class TaskEvidence:
             self.inputs.append(
                 dict(
                     agent=context.agent_id,
-                    correlationId=context.correlation_id,
+                    correlationId=context.task_id,
                     round=round_number,
                     eventVersions=seen,
                 )
