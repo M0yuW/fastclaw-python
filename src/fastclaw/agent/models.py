@@ -34,6 +34,7 @@ class AgentRunRequest(AgentModel):
     thinking_budget_tokens: int | None = Field(default=None, gt=0)
     tool_timeout: float = Field(default=30.0, gt=0)
     system_prompt: str = ""
+    clarification_enabled: bool = True
 
 
 class AgentEventType(StrEnum):
