@@ -252,22 +252,21 @@ class AgentRunner:
                     ]
                     if clarification_enabled and clarification_calls:
                         arguments, error = self._parse_arguments(clarification_calls[0])
-                        question = arguments.get("question")
+                        raw_question = arguments.get("question")
+                        question = raw_question.strip() if isinstance(raw_question, str) else ""
                         valid = (
                             not error
                             and set(arguments) == {"question"}
-                            and isinstance(question, str)
-                            and bool(question.strip())
-                            and len(question) <= 2000
+                            and isinstance(raw_question, str)
+                            and bool(question)
+                            and len(raw_question) <= 2000
                         )
                         if not valid:
                             question = "Please clarify the intended task scope and desired outcome."
-                        else:
-                            question = question.strip()
                         # Handle before both batch and serial execution: no sibling side effects.
                         for call in assistant.tool_calls:
                             yield event(AgentEventType.TOOL_CALL, tool_call=call)
-                            result = json.dumps(
+                            pause_result = json.dumps(
                                 {
                                     "status": "awaiting_clarification",
                                     "executed": False,
@@ -277,7 +276,7 @@ class AgentRunner:
                             history.append(
                                 ChatMessage(
                                     role=MessageRole.TOOL,
-                                    content=result,
+                                    content=pause_result,
                                     tool_call_id=call.id,
                                     name=call.function.name,
                                 )
@@ -285,7 +284,7 @@ class AgentRunner:
                             yield event(
                                 AgentEventType.TOOL_RESULT,
                                 tool_call=call,
-                                tool_result=result,
+                                tool_result=pause_result,
                                 tool_metadata={
                                     "status": "awaiting_clarification",
                                     "executed": False,
