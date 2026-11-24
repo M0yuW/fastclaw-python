@@ -21,6 +21,7 @@ from fastclaw.migration import import_go_database
 from fastclaw.providers import (
     ChatRequest,
     ChatResponse,
+    MessageRole,
     ProviderEvent,
     ProviderEventType,
     ProviderStream,
@@ -522,7 +523,9 @@ async def test_locked_go_session_can_continue_and_preserve_raw_thinking(tmp_path
         await database.close()
 
     assert response.content == "finished"
-    imported_assistant = provider.requests[0].messages[1]
+    imported_assistant = next(
+        msg for msg in provider.requests[0].messages if msg.role is MessageRole.ASSISTANT
+    )
     assert imported_assistant.raw_assistant is not None
     raw_content = cast(list[dict[str, Any]], imported_assistant.raw_assistant["content"])
     assert raw_content[0]["signature"] == "fixture-signature"

@@ -5,7 +5,9 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from fastclaw.evidence import TaskEvidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +18,7 @@ class ExecutionContext:
     root_execution_id: str
     call_path: tuple[str, ...] = ()
     task_id: str = ""
+    evidence: TaskEvidence | None = field(default=None, compare=False, repr=False)
 
 
 _execution: ContextVar[ExecutionContext | None] = ContextVar("fastclaw_execution", default=None)

@@ -11,6 +11,11 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
+from fastclaw.agent.clarification import (
+    CLARIFICATION_DEFINITION,
+    CLARIFICATION_PROMPT,
+    CLARIFICATION_TOOL,
+)
 from fastclaw.agent.models import AgentEvent, AgentEventType, AgentRunError, AgentRunRequest
 from fastclaw.agent.normalizer import normalize_messages
 from fastclaw.agent.persistence import SessionPersistence
@@ -147,9 +152,35 @@ class AgentRunner:
                 )
                 yield event(AgentEventType.DONE, message=final)
                 return
+            clarification_enabled = request.clarification_enabled and len(context.call_path) <= 1
+            definitions = self._tools.definitions(request.allowed_tools)
+            if clarification_enabled:
+                # Reserved control tool: not a business-tool permission grant.
+                definitions = (
+                    *(item for item in definitions if item.function.name != CLARIFICATION_TOOL),
+                    CLARIFICATION_DEFINITION,
+                )
             with use_execution(context):
                 for current_round in range(request.max_rounds):
                     round_index = current_round
+                    provider_history = list(history)
+                    if clarification_enabled:
+                        for index, item in enumerate(provider_history):
+                            if item.role is MessageRole.SYSTEM:
+                                provider_history[index] = item.model_copy(
+                                    update={
+                                        "content": f"{item.content or ''}\n\n{CLARIFICATION_PROMPT}"
+                                    }
+                                )
+                                break
+                        else:
+                            provider_history.insert(
+                                0,
+                                ChatMessage(role=MessageRole.SYSTEM, content=CLARIFICATION_PROMPT),
+                            )
+                    messages = tuple(provider_history)
+                    if context.evidence is not None:
+                        messages = context.evidence.prepare(context, messages, current_round + 1)
                     current_stage = "provider_stream"
                     provider_started_at = asyncio.get_running_loop().time()
                     provider_name = request.model.split("/", 1)[0]
@@ -162,9 +193,9 @@ class AgentRunner:
                     try:
                         provider_stream = self._provider.stream(
                             ChatRequest(
-                                messages=tuple(history),
+                                messages=messages,
                                 model=request.model,
-                                tools=self._tools.definitions(request.allowed_tools),
+                                tools=definitions,
                                 max_tokens=request.max_tokens,
                                 temperature=request.temperature,
                                 thinking_budget_tokens=request.thinking_budget_tokens,
@@ -214,10 +245,73 @@ class AgentRunner:
                     )
                     history.append(assistant)
 
+                    clarification_calls = [
+                        call
+                        for call in assistant.tool_calls
+                        if call.function.name == CLARIFICATION_TOOL
+                    ]
+                    if clarification_enabled and clarification_calls:
+                        arguments, error = self._parse_arguments(clarification_calls[0])
+                        raw_question = arguments.get("question")
+                        question = raw_question.strip() if isinstance(raw_question, str) else ""
+                        valid = (
+                            not error
+                            and set(arguments) == {"question"}
+                            and isinstance(raw_question, str)
+                            and bool(question)
+                            and len(raw_question) <= 2000
+                        )
+                        if not valid:
+                            question = "Please clarify the intended task scope and desired outcome."
+                        # Handle before both batch and serial execution: no sibling side effects.
+                        for call in assistant.tool_calls:
+                            yield event(AgentEventType.TOOL_CALL, tool_call=call)
+                            pause_result = json.dumps(
+                                {
+                                    "status": "awaiting_clarification",
+                                    "executed": False,
+                                    "reason": "turn_paused_for_user_input",
+                                }
+                            )
+                            history.append(
+                                ChatMessage(
+                                    role=MessageRole.TOOL,
+                                    content=pause_result,
+                                    tool_call_id=call.id,
+                                    name=call.function.name,
+                                )
+                            )
+                            yield event(
+                                AgentEventType.TOOL_RESULT,
+                                tool_call=call,
+                                tool_result=pause_result,
+                                tool_metadata={
+                                    "status": "awaiting_clarification",
+                                    "executed": False,
+                                },
+                            )
+                        final = ChatMessage(
+                            role=MessageRole.ASSISTANT,
+                            content=question,
+                            metadata={
+                                "status": "awaiting_clarification",
+                                "clarification_arguments_valid": valid,
+                            },
+                        )
+                        history.append(final)
+                        await self._persistence.save(
+                            self._session_record(request, context, history, stored)
+                        )
+                        yield event(AgentEventType.CONTENT, content=question, message=final)
+                        yield event(AgentEventType.DONE, message=final)
+                        return
+
                     if not assistant.tool_calls:
                         await self._persistence.save(
                             self._session_record(request, context, history, stored)
                         )
+                        if context.evidence is not None:
+                            context.evidence.record_model_reply(context, current_round + 1)
                         yield event(
                             AgentEventType.CONTENT,
                             content=response.content,

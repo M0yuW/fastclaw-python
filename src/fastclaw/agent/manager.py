@@ -26,6 +26,7 @@ from fastclaw.agent.models import AgentEvent, AgentEventType, AgentRunError, Age
 from fastclaw.agent.persistence import DatabaseSessionPersistence
 from fastclaw.agent.runner import AgentRunner
 from fastclaw.credentials import CredentialCipher
+from fastclaw.evidence import TaskEvidence
 from fastclaw.execution import ExecutionContext
 from fastclaw.orchestration import (
     AsyncTaskQueue,
@@ -35,6 +36,7 @@ from fastclaw.orchestration import (
     TaskSnapshot,
     WaitTicket,
 )
+from fastclaw.orchestration.tool import PublishEvidenceTool
 from fastclaw.plugin import PluginManager
 from fastclaw.providers import ChatMessage, Provider, create_provider
 from fastclaw.runtime import Runtime, RuntimeState
@@ -59,12 +61,15 @@ _STANDARD_PROVIDERS: dict[str, tuple[str, str]] = {
 
 _DELEGATION_TOOL_PROMPT = """## Runtime delegation contract
 
-`spawn_subagent` accepts exactly two arguments: `agent_id` and `task`. Tenant,
+`spawn_subagent` accepts `agent_id` and `task` for ordinary delegation. To revisit a claim after
+new evidence, pass only `review` with the original result ID, exact quote, period and event version.
+Tenant,
 session, root execution, and call-path identity are injected by the Runtime and
 must not be supplied by the model. To delegate several independent tasks in
 parallel, emit several ordinary `spawn_subagent` tool calls in the same
 assistant turn. Do not use legacy `delegations`, `sharedContext`, or `agentId`
-wrapper fields.
+wrapper fields. Before delegation, optionally submit delivery alone to select summary, targeted,
+or broadcast updates and an asOf public-information cutoff. Seal before final synthesis.
 """
 
 
@@ -147,6 +152,7 @@ def _default_tools(
         web_fetch,
         FootballDataTool(web_fetch),
         SpawnSubagentTool(bus, team_targets),
+        PublishEvidenceTool(),
         FootballLedgerTool(data_root),
         WorldCupLedgerTool(data_root),
     ]
@@ -454,11 +460,13 @@ class AgentRuntimeManager:
         if not await self._agent_accepts_tasks(agent_id, user_id):
             raise AgentRunError("agent team is archived")
         selection = await self.provider_selection(profile, requested_model)
+        root_id = root_execution_id or f"run_{uuid4().hex}"
         context = ExecutionContext(
             user_id=user_id,
             agent_id=agent_id,
             session_id=session_id,
-            root_execution_id=root_execution_id or f"run_{uuid4().hex}",
+            root_execution_id=root_id,
+            evidence=TaskEvidence(user_id, root_id),
             call_path=(agent_id,),
         )
         request = self._request(profile, selection.model, message)
@@ -484,6 +492,8 @@ class AgentRuntimeManager:
                     await ticket.release(cancel=True)
                 raise
             finally:
+                if context.evidence is not None:
+                    context.evidence.sealed = True
                 if ticket is not None:
                     await ticket.release()
 
@@ -872,7 +882,9 @@ class AgentRuntimeManager:
                     coordinator_tools.add("worldcup_ledger")
                 allowed_tools = frozenset(coordinator_tools)
             else:
-                allowed_tools = frozenset({"read_file", "web_fetch", "list_dir", "write_file"})
+                allowed_tools = frozenset(
+                    {"read_file", "web_fetch", "list_dir", "write_file", "publish_evidence"}
+                )
         if allowed_tools is None or "spawn_subagent" in allowed_tools:
             prompt_parts.append(_DELEGATION_TOOL_PROMPT.strip())
         for team, members in team_members:

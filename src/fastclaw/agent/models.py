@@ -41,6 +41,7 @@ class AgentRunRequest(AgentModel):
     )
     scope_guard: str = ""
     system_prompt: str = ""
+    clarification_enabled: bool = True
 
 
 class AgentEventType(StrEnum):
