@@ -8,6 +8,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 
 from fastclaw.evidence import TaskEvidence
+from fastclaw.steering import TaskSteering
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +20,7 @@ class ExecutionContext:
     call_path: tuple[str, ...] = ()
     task_id: str = ""
     evidence: TaskEvidence | None = field(default=None, compare=False, repr=False)
+    steering: TaskSteering | None = field(default=None, compare=False, repr=False)
 
 
 _execution: ContextVar[ExecutionContext | None] = ContextVar("fastclaw_execution", default=None)

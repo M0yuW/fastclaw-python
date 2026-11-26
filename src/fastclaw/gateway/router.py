@@ -38,6 +38,7 @@ from fastclaw.gateway.models import (
     ProviderUpdate,
     ProviderWrite,
     SessionUpdate,
+    SteeringInput,
     StoredProviderTest,
     SystemFileWrite,
     TeamCreate,
@@ -2093,6 +2094,24 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
         )
         return {"reply": str(message.content or "")}
 
+    @router.post("/api/tasks/{root_id}/steering")
+    async def steer_task(
+        root_id: str, payload: SteeringInput, auth: AuthContext = auth_dependency
+    ) -> dict[str, int]:
+        if auth.identity.read_only:
+            raise HTTPException(403, "actAs is read-only")
+        manager = gateway.agent_manager
+        state = manager.steerable.get(root_id) or manager.finished_steering.get(root_id)
+        if state is None or state.owner != auth.identity.effective_user_id:
+            raise HTTPException(404, "Task not found")
+        await service.require_agent(auth, state.agent_id)
+        if not payload.text.strip() or not payload.request_id.strip():
+            raise HTTPException(422, "Text and request ID are required")
+        try:
+            return {"revision": state.add(payload.request_id, payload.text)}
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     @router.post("/api/chat/stream")
     async def chat_stream(
         payload: ChatInput, auth: AuthContext = auth_dependency
@@ -2105,10 +2124,14 @@ def create_gateway_router(gateway: Gateway) -> APIRouter:
             agent_id=payload.agent_id,
             session_id=payload.session_id,
             message=payload.message,
+            accept_steering=True,
         )
 
         async def events() -> AsyncIterator[str]:
             try:
+                yield _sse(
+                    {"type": "task_started", "data": {"taskId": stream.context.root_execution_id}}
+                )
                 async for event in stream:
                     yield _sse(_web_event(event))
             finally:

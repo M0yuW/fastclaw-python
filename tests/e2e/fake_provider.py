@@ -74,6 +74,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 return
             chunks = ["slow "] * 40 if "slow" in prompt.lower() else ["hello ", "world"]
+            if prompt == "answer with the new instructions":
+                chunks = ["updated answer"]
             for index, content in enumerate(chunks):
                 payload = {
                     "choices": [
