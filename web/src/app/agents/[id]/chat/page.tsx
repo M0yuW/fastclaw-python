@@ -3,7 +3,7 @@
 import { useEffect, useState, useRef, useCallback, useId, useMemo } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Button } from "@/components/ui/button";
-import { getAgent, getChatHistory, getChatSessions, listAgentFiles, renameChatSession, sendChatStream, uploadAgentFiles, getAuthToken, getSkills, type ChatHistoryMessage, type SkillInfo, type ToolResultMetadata } from "@/lib/api";
+import { getAgent, getChatHistory, getChatSessions, listAgentFiles, renameChatSession, sendChatStream, supplementTask, uploadAgentFiles, getAuthToken, getSkills, type ChatHistoryMessage, type SkillInfo, type ToolResultMetadata } from "@/lib/api";
 import { createChatStreamBatcher, reduceChatStreamEvents, type StreamMessage } from "@/lib/chat-stream";
 import { useAgentIdFromURL } from "@/hooks/use-agent-id";
 import { Bot, Send, Copy, Check, Pencil, Wrench, ChevronDown, ChevronRight, Download, X, File, FileText, Image as ImageIcon, FileCode, Film, Music, Puzzle, SlidersHorizontal, ShieldCheck, Paperclip, Square } from "lucide-react";
@@ -280,6 +280,7 @@ export default function AgentChatPage() {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
+  const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const currentSession = sessions.find((session) => session.id === sessionId);
@@ -316,6 +317,7 @@ export default function AgentChatPage() {
   }, []);
   const invalidateStream = useCallback(() => {
     streamGenerationRef.current++;
+    setActiveTaskId(null);
     abortRef.current?.abort();
   }, []);
 
@@ -595,6 +597,7 @@ export default function AgentChatPage() {
     const controller = new AbortController();
     abortRef.current = controller;
     const generation = ++streamGenerationRef.current;
+    setActiveTaskId(null);
     setSending(true);
     const finishSending = () => {
       if (abortRef.current !== controller) return;
@@ -712,6 +715,10 @@ export default function AgentChatPage() {
     try {
       await sendChatStream(selectedAgent, sessionId, fullText, (evt) => {
         if (streamGenerationRef.current !== generation) return;
+        if (evt.type === "task_started" && evt.data?.taskId) {
+          setActiveTaskId(evt.data.taskId);
+          return;
+        }
         if (evt.type === "content" && evt.data?.content === "__NEW_SESSION__") {
           handleNewChat();
           loadSessions(selectedAgent);
@@ -1203,6 +1210,9 @@ export default function AgentChatPage() {
                     );
                   })}
                 </div>
+              )}
+              {sending && activeTaskId && (
+                <TaskSupplement key={activeTaskId} taskId={activeTaskId} />
               )}
               <div className="flex items-center gap-2">
                 <label
@@ -1751,4 +1761,37 @@ function SlashMenu({
       </Link>
     </div>
   );
+}
+
+function TaskSupplement({taskId}: {taskId: string}) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState("");
+  const attempt = useRef<{id: string; text: string} | null>(null);
+  async function submit() {
+    if (!text.trim() || busy) return;
+    if (!attempt.current || attempt.current.text !== text) {
+      attempt.current = {id: crypto.randomUUID(), text};
+    }
+    setBusy(true);
+    try {
+      const revision = await supplementTask(taskId, attempt.current.id, text);
+      setStatus(`Supplement ${revision} received`);
+      setText("");
+      attempt.current = null;
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : "Supplement failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+  return <div className="mb-2">
+    <div className="flex items-center gap-2">
+      <input className="min-w-0 flex-1 bg-transparent" aria-label="Supplement this task"
+        placeholder="Add instructions to this task" value={text} disabled={busy}
+        onChange={(event) => setText(event.target.value)} />
+      <Button type="button" disabled={busy || !text.trim()} onClick={submit}>Send supplement</Button>
+    </div>
+    <span role="status" className="text-xs">{status}</span>
+  </div>;
 }

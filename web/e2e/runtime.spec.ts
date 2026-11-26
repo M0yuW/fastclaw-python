@@ -63,6 +63,17 @@ test("login, Agent, chat, Stop, history, files and skills", async ({ page, reque
   await page.getByRole("button", { name: /^read_file \.\.\/outside$/ }).click();
   await expect(page.getByText("Error", { exact: true })).toBeVisible();
 
+  await composer.fill("slow response for supplement");
+  await page.getByRole("button", { name: "Send message" }).click();
+  await page.getByRole("textbox", { name: "Supplement this task" }).fill("answer with the new instructions");
+  const accepted = page.waitForResponse(response => response.url().endsWith("/steering"));
+  await page.getByRole("button", { name: "Send supplement" }).click();
+  const receipt = await accepted;
+  expect(await receipt.json()).toEqual({ revision: 1 });
+  const retry = await page.request.post(receipt.url(), { data: receipt.request().postDataJSON() });
+  expect(await retry.json()).toEqual({ revision: 1 });
+  await expect(page.getByRole("paragraph").filter({ hasText: /^updated answer$/ })).toBeVisible();
+
   await composer.fill("slow response");
   await page.getByRole("button", { name: "Send message" }).click();
   const stop = page.getByRole("button", { name: "Stop generating" });

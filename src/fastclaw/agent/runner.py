@@ -134,8 +134,21 @@ class AgentRunner:
                 )
             history.append(ChatMessage(role=MessageRole.USER, content=request.message))
             history = list(normalize_messages(tuple(history)))
-            clarification = self._scope_clarification(request.scope_guard, history)
+            steering = context.steering if len(context.call_path) <= 1 else None
+            initial_updates = (
+                [
+                    ChatMessage(role=MessageRole.USER, content=text)
+                    for _, text in steering.updates.values()
+                ]
+                if steering
+                else []
+            )
+            clarification = self._scope_clarification(
+                request.scope_guard, history + initial_updates
+            )
             if clarification:
+                if steering:
+                    steering.closed = True
                 final = ChatMessage(
                     role=MessageRole.ASSISTANT,
                     content=clarification,
@@ -161,7 +174,10 @@ class AgentRunner:
                     CLARIFICATION_DEFINITION,
                 )
             with use_execution(context):
-                for current_round in range(request.max_rounds):
+                current_round = -1
+                discarded = 0
+                while current_round + 1 < request.max_rounds + discarded:
+                    current_round += 1
                     round_index = current_round
                     provider_history = list(history)
                     if clarification_enabled:
@@ -181,6 +197,12 @@ class AgentRunner:
                     messages = tuple(provider_history)
                     if context.evidence is not None:
                         messages = context.evidence.prepare(context, messages, current_round + 1)
+                    version = len(steering.updates) if steering else 0
+                    if steering:
+                        messages += tuple(
+                            ChatMessage(role=MessageRole.USER, content=text)
+                            for _, text in steering.updates.values()
+                        )
                     current_stage = "provider_stream"
                     provider_started_at = asyncio.get_running_loop().time()
                     provider_name = request.model.split("/", 1)[0]
@@ -243,6 +265,21 @@ class AgentRunner:
                         thinking_signature=response.thinking_signature or None,
                         raw_assistant=response.raw_assistant,
                     )
+                    if steering and len(steering.updates) != version:
+                        discarded += 1
+                        yield event(AgentEventType.CONTENT, content="")
+                        continue
+                    if steering and (
+                        not assistant.tool_calls
+                        or (
+                            clarification_enabled
+                            and any(
+                                call.function.name == CLARIFICATION_TOOL
+                                for call in assistant.tool_calls
+                            )
+                        )
+                    ):
+                        steering.closed = True
                     history.append(assistant)
 
                     clarification_calls = [
@@ -433,7 +470,13 @@ class AgentRunner:
                             tool_metadata=result_metadata,
                             is_error=is_error,
                         )
-                        if direct_return and not is_error:
+                        if (
+                            direct_return
+                            and not is_error
+                            and (not steering or version == len(steering.updates))
+                        ):
+                            if steering:
+                                steering.closed = True
                             final = ChatMessage(
                                 role=MessageRole.ASSISTANT,
                                 content=result_content,
@@ -450,6 +493,9 @@ class AgentRunner:
                             yield event(AgentEventType.DONE, message=final)
                             return
 
+                    if steering and len(steering.updates) != version:
+                        discarded += 1
+                        continue
                     if round_results and all(round_results):
                         failed_tool_rounds += 1
                     else:
@@ -458,6 +504,8 @@ class AgentRunner:
                         request.max_failed_tool_rounds
                         and failed_tool_rounds >= request.max_failed_tool_rounds
                     ):
+                        if steering:
+                            steering.closed = True
                         final = ChatMessage(
                             role=MessageRole.ASSISTANT,
                             content=request.failed_tool_message,

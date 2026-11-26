@@ -78,6 +78,11 @@ class PluginUpdate(WireModel):
     restart: bool = False
 
 
+class SteeringInput(WireModel):
+    request_id: str = Field(min_length=1, max_length=128)
+    text: str = Field(min_length=1, max_length=16000)
+
+
 class ChatInput(WireModel):
     agent_id: str
     session_id: str

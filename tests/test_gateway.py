@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -645,7 +646,9 @@ async def test_chat_stream_and_history_use_configured_provider(tmp_path: Path) -
             for line in response.text.splitlines()
             if line.startswith("data: ")
         ]
+        assert events[0]["data"]["taskId"].startswith("run_")
         assert [event["type"] for event in events] == [
+            "task_started",
             "content_delta",
             "content_delta",
             "content",
@@ -841,3 +844,136 @@ async def test_plugin_enablement_persists_across_gateway_restart(tmp_path: Path)
         assert response.status_code == 200
         assert response.json()[0]["enabled"] is False
         assert response.json()[0]["status"] == "stopped"
+
+
+async def test_concurrent_web_task_supplements(tmp_path: Path) -> None:
+    from starlette.types import Message, Receive, Scope, Send
+
+    task_ids: asyncio.Queue[str] = asyncio.Queue()
+    release = asyncio.Event()
+    started = asyncio.Event()
+    inputs: list[list[str]] = []
+
+    async def provider(request: httpx.Request) -> httpx.Response:
+        users = [
+            m["content"] for m in json.loads(request.content)["messages"] if m["role"] == "user"
+        ]
+        inputs.append(users)
+        answer = next((s for s in users if s in {"Alice only", "Bob only", "second tab"}), "stale")
+        started.set()
+        await asyncio.wait_for(release.wait(), 10)
+        chunk = {"choices": [{"index": 0, "delta": {"content": answer}, "finish_reason": "stop"}]}
+        return httpx.Response(
+            200,
+            text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+            headers={"content-type": "text/event-stream"},
+        )
+
+    async with gateway_client(
+        tmp_path / "steering.db", transport=httpx.MockTransport(provider)
+    ) as (client, database, app):
+        alice = await onboard(client)
+        await login(client)
+        now = datetime.now(UTC)
+        async with UnitOfWork(database) as unit:
+            store = unit.require_store()
+            await store.save_user(
+                UserRecord(
+                    id="bob",
+                    username="bob",
+                    email="bob@test.local",
+                    password_hash=hash_password("bob password"),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+            await store.save_agent(
+                AgentRecord(
+                    id="bob-agent",
+                    user_id="bob",
+                    name="Analyst",
+                    config={"model": "fixture/model-1"},
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+        # Observe the actual first SSE frame before HTTPX buffers the completed response.
+        async def observe(scope: Scope, receive: Receive, send: Send) -> None:
+            async def forward(message: Message) -> None:
+                body = message.get("body", b"")
+                if body.startswith(b"data: "):
+                    evt = json.loads(body[6:])
+                    if evt["type"] == "task_started":
+                        task_ids.put_nowait(evt["data"]["taskId"])
+                await send(message)
+
+            await app(scope, receive, forward)
+
+        async with (
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=observe),
+                base_url="http://test",
+                cookies=client.cookies,
+            ) as a,
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=observe), base_url="http://test"
+            ) as b,
+        ):
+            assert (
+                await b.post("/api/login", json={"login": "bob", "password": "bob password"})
+            ).status_code == 200
+            question = {"sessionId": "same-session", "message": "same question"}
+            async with asyncio.TaskGroup() as group:
+                ra = group.create_task(
+                    a.post("/api/chat/stream", json={**question, "agentId": alice["agentId"]})
+                )
+                aid = await asyncio.wait_for(task_ids.get(), 5)
+                await asyncio.wait_for(started.wait(), 5)
+                rb = group.create_task(
+                    b.post("/api/chat/stream", json={**question, "agentId": "bob-agent"})
+                )
+                bid = await asyncio.wait_for(task_ids.get(), 5)
+                other_tab = group.create_task(
+                    a.post("/api/chat/stream", json={**question, "agentId": alice["agentId"]})
+                )
+                other_id = await asyncio.wait_for(task_ids.get(), 5)
+                assert len({aid, bid, other_id}) == 3
+                assert (
+                    await a.post(
+                        f"/api/tasks/{other_id}/steering",
+                        json={"requestId": "retry-1", "text": "second tab"},
+                    )
+                ).json() == {"revision": 1}
+                url_a, url_b = (f"/api/tasks/{tid}/steering" for tid in (aid, bid))
+                payload = {"requestId": "retry-1", "text": "Alice only"}
+                assert (await b.post(url_a, json=payload)).status_code == 404
+                one, two = await asyncio.gather(
+                    a.post(url_a, json=payload), a.post(url_a, json=payload)
+                )
+                assert one.json() == two.json() == {"revision": 1}
+                assert (
+                    await a.post(url_a, json={**payload, "text": "different"})
+                ).status_code == 409
+                assert (await b.post(url_b, json={**payload, "text": "Bob only"})).json() == {
+                    "revision": 1
+                }
+                release.set()
+            for reply, expected in [
+                (ra.result(), "Alice only"),
+                (rb.result(), "Bob only"),
+                (other_tab.result(), "second tab"),
+            ]:
+                frames = [
+                    json.loads(line[6:])
+                    for line in reply.text.splitlines()
+                    if line.startswith("data: ")
+                ]
+                final = [f for f in frames if f["type"] == "content"][-1]
+                assert final["data"]["content"] == expected
+            assert sum(u.count("Alice only") for u in inputs) == 1
+            assert sum(u.count("Bob only") for u in inputs) == 1
+            assert sum(u.count("second tab") for u in inputs) == 1
+            assert all(len(set(u) & {"Alice only", "Bob only", "second tab"}) <= 1 for u in inputs)
+            assert (await a.post(url_a, json=payload)).json() == {"revision": 1}
+            assert (await a.post(url_a, json={**payload, "requestId": "late"})).status_code == 409

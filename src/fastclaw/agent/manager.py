@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sys
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from functools import partial
@@ -41,6 +42,7 @@ from fastclaw.plugin import PluginManager
 from fastclaw.providers import ChatMessage, Provider, create_provider
 from fastclaw.runtime import Runtime, RuntimeState
 from fastclaw.skills import Skill, SkillCatalog, SkillError
+from fastclaw.steering import TaskSteering
 from fastclaw.storage import AgentRecord, ConfigRecord, Database, UnitOfWork
 from fastclaw.tools import (
     FootballDataTool,
@@ -320,6 +322,8 @@ class AgentRuntimeManager:
         self.bus = InProcessMessageBus(self._queue)
         self._tool_factory = tool_factory
         self._profiles: dict[str, AgentRuntimeProfile] = {}
+        self.steerable: dict[str, TaskSteering] = {}
+        self.finished_steering: OrderedDict[str, TaskSteering] = OrderedDict()
         self._agent_roots: dict[str, set[str]] = {}
         self.skill_catalog = SkillCatalog(config.data_root / "skills")
         package_plugins = Path(__file__).resolve().parents[1] / "bundled_plugins"
@@ -454,6 +458,7 @@ class AgentRuntimeManager:
         message: str,
         requested_model: str = "",
         root_execution_id: str = "",
+        accept_steering: bool = False,
     ) -> ManagedAgentStream:
         self._require_running()
         profile = await self.profile(agent_id, user_id)
@@ -461,7 +466,11 @@ class AgentRuntimeManager:
             raise AgentRunError("agent team is archived")
         selection = await self.provider_selection(profile, requested_model)
         root_id = root_execution_id or f"run_{uuid4().hex}"
+        steering = TaskSteering(user_id, agent_id) if accept_steering else None
+        if steering is not None:
+            self.steerable[root_id] = steering
         context = ExecutionContext(
+            steering=steering,
             user_id=user_id,
             agent_id=agent_id,
             session_id=session_id,
@@ -492,6 +501,12 @@ class AgentRuntimeManager:
                     await ticket.release(cancel=True)
                 raise
             finally:
+                if steering is not None:
+                    steering.closed = True
+                    self.steerable.pop(root_id, None)
+                    self.finished_steering[root_id] = steering
+                    if len(self.finished_steering) > 256:
+                        self.finished_steering.popitem(last=False)
                 if context.evidence is not None:
                     context.evidence.sealed = True
                 if ticket is not None:
@@ -504,8 +519,24 @@ class AgentRuntimeManager:
             producer=producer,
         )
 
-    async def chat(self, **values: str) -> ChatMessage:
-        stream = await self.stream(**values)
+    async def chat(
+        self,
+        *,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        message: str,
+        requested_model: str = "",
+        root_execution_id: str = "",
+    ) -> ChatMessage:
+        stream = await self.stream(
+            user_id=user_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            message=message,
+            requested_model=requested_model,
+            root_execution_id=root_execution_id,
+        )
         try:
             async for _ in stream:
                 pass

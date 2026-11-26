@@ -612,7 +612,7 @@ export interface ToolResultMetadata {
 
 export interface ChatStreamEvent {
   version?: number;
-  type: "content_delta" | "content" | "tool_call" | "tool_result" | "error" | "done";
+  type: "task_started" | "content_delta" | "content" | "tool_call" | "tool_result" | "error" | "done";
   data?: {
     content?: string;
     delta?: string;
@@ -623,11 +623,21 @@ export interface ChatStreamEvent {
     isError?: boolean;
     message?: string;
     metadata?: ToolResultMetadata;
+    taskId?: string;
     turnId?: string;
     messageId?: string;
     round?: number;
     seq?: number;
   };
+}
+
+export async function supplementTask(taskId: string, requestId: string, text: string): Promise<number> {
+  const response = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}/steering`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({requestId, text}),
+  });
+  if (!response.ok) throw new Error((await response.json()).detail || "Supplement failed");
+  return (await response.json()).revision;
 }
 
 export async function sendChatStream(
